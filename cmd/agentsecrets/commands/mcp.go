@@ -9,6 +9,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/The-17/agentsecrets/pkg/keychainauth"
 	agentmcp "github.com/The-17/agentsecrets/pkg/mcp"
 	"github.com/The-17/agentsecrets/pkg/ui"
 )
@@ -54,8 +55,16 @@ func init() {
 }
 
 func runMCPServe(cmd *cobra.Command, args []string) error {
+	// Connect to the keychain-auth daemon to resolve local OS keychain secrets
+	if err := keychainauth.Init(); err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: keychain-auth initialization failed: %v\n", err)
+	}
+
+	// Share the CLI-initialized services with the MCP package to avoid code/state duplication (DRY)
+	agentmcp.SetServices(apiClient, authService, workspaceService, secretsService)
+
 	// MCP uses stdio — only JSON-RPC messages should go to stdout.
-	if err := agentmcp.Serve(); err != nil {
+	if err := agentmcp.Serve(Version); err != nil {
 		fmt.Fprintf(os.Stderr, "MCP server error: %v\n", err)
 		return err
 	}

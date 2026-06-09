@@ -1,12 +1,12 @@
 package commands
 
 import (
+	"encoding/json"
 	"fmt"
 	"strings"
 
 	"github.com/spf13/cobra"
 
-	"github.com/The-17/agentsecrets/pkg/config"
 	"github.com/The-17/agentsecrets/pkg/proxy"
 )
 
@@ -16,6 +16,7 @@ var (
 	callBody       string
 	callBearer     string
 	callBasic      string
+	callToken      string
 	callHeaders    []string // "X-API-Key=SECRET_NAME"
 	callQueries    []string // "api_key=SECRET_NAME"
 	callBodyFields []string // "json.path=SECRET_NAME"
@@ -59,6 +60,7 @@ func init() {
 	callCmd.Flags().StringVar(&callBody, "body", "", "Request body (JSON string)")
 	callCmd.Flags().StringVar(&callBearer, "bearer", "", "Bearer token secret key name")
 	callCmd.Flags().StringVar(&callBasic, "basic", "", "Basic auth secret key name")
+	callCmd.Flags().StringVar(&callToken, "token", "", "Agent token (optional, or reads AS_AGENT_TOKEN)")
 	callCmd.Flags().StringArrayVar(&callHeaders, "header", nil, "Header injection: HeaderName=SECRET_KEY (repeatable)")
 	callCmd.Flags().StringArrayVar(&callQueries, "query", nil, "Query injection: param=SECRET_KEY (repeatable)")
 	callCmd.Flags().StringArrayVar(&callBodyFields, "body-field", nil, "Body injection: json.path=SECRET_KEY (repeatable)")
@@ -120,32 +122,37 @@ func runCall(cmd *cobra.Command, args []string) error {
 		)
 	}
 
-	// Load project config
-	project, err := config.LoadProjectConfig()
-	if err != nil || project.ProjectID == "" {
-		return fmt.Errorf("no project configured — run 'agentsecrets init' first")
-	}
-
-	// Create engine and execute
-	engine, err := proxy.NewEngine(project.ProjectID)
-	if err != nil {
-		return fmt.Errorf("failed to initialize engine: %w", err)
-	}
-
 	var body []byte
 	if callBody != "" {
 		body = []byte(callBody)
 	}
 
-	result, err := engine.Execute(proxy.CallRequest{
+	result, err := proxy.CallViaProxy(proxy.CallRequest{
 		TargetURL:  callURL,
 		Method:     callMethod,
 		Body:       body,
 		Injections: injections,
-		AgentID:    "cli",
+		AgentToken: callToken,
 	})
 	if err != nil {
 		return fmt.Errorf("API call failed: %w", err)
+	}
+
+	if result.StatusCode >= 400 {
+		var errData struct {
+			Error   string `json:"error"`
+			Message string `json:"message"`
+		}
+		if err := json.Unmarshal(result.Body, &errData); err == nil {
+			msg := errData.Message
+			if msg == "" {
+				msg = errData.Error
+			}
+			if msg != "" {
+				return fmt.Errorf("%s", msg)
+			}
+		}
+		return fmt.Errorf("API call failed with HTTP %d:\n%s", result.StatusCode, string(result.Body))
 	}
 
 	// Print response (clean stdout for piping)

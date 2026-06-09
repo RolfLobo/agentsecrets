@@ -4,9 +4,12 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"strings"
 	"testing"
+
+	"github.com/The-17/agentsecrets/pkg/capabilities"
 )
 
 // mockResolver returns a resolver that maps key names to values.
@@ -17,6 +20,16 @@ func mockResolver(secrets map[string]string) SecretResolver {
 			return "", fmt.Errorf("secret not found: %s", key)
 		}
 		return val, nil
+	}
+}
+
+// mockAllowlist returns a resolver that returns the given domains (or common test domains if empty).
+func mockAllowlist(domains ...string) AllowlistResolver {
+	return func(workspaceID string) ([]string, error) {
+		if len(domains) == 0 {
+			return []string{"127.0.0.1", "localhost", "api.example.com", "example.com", "blocked.com", "approved.com"}, nil
+		}
+		return domains, nil
 	}
 }
 
@@ -33,10 +46,10 @@ func TestEngineExecuteBearer(t *testing.T) {
 	defer upstream.Close()
 
 	engine := &Engine{
-		ProjectID:     "test-project",
-		Client:        upstream.Client(),
-		ResolveSecret: mockResolver(map[string]string{"STRIPE_KEY": "sk_test_123"}),
-		SkipAllowlist: true,
+		ProjectID:        "test-project",
+		Client:           upstream.Client(),
+		ResolveSecret:    mockResolver(map[string]string{"STRIPE_KEY": "sk_test_123"}),
+		ResolveAllowlist: mockAllowlist(),
 	}
 
 	result, err := engine.Execute(CallRequest{
@@ -79,7 +92,7 @@ func TestEngineExecuteMultipleInjections(t *testing.T) {
 			"ORG_ID":  "org-abc",
 			"API_KEY": "key-xyz",
 		}),
-		SkipAllowlist: true,
+		ResolveAllowlist: mockAllowlist(),
 	}
 
 	result, err := engine.Execute(CallRequest{
@@ -110,10 +123,10 @@ func TestEngineExecuteQueryInjection(t *testing.T) {
 	defer upstream.Close()
 
 	engine := &Engine{
-		ProjectID:     "test-project",
-		Client:        upstream.Client(),
-		ResolveSecret: mockResolver(map[string]string{"GMAP_KEY": "gmap-key-123"}),
-		SkipAllowlist: true,
+		ProjectID:        "test-project",
+		Client:           upstream.Client(),
+		ResolveSecret:    mockResolver(map[string]string{"GMAP_KEY": "gmap-key-123"}),
+		ResolveAllowlist: mockAllowlist(),
 	}
 
 	result, err := engine.Execute(CallRequest{
@@ -134,10 +147,10 @@ func TestEngineExecuteQueryInjection(t *testing.T) {
 
 func TestEngineExecuteMissingSecret(t *testing.T) {
 	engine := &Engine{
-		ProjectID:     "test-project",
-		Client:        http.DefaultClient,
-		ResolveSecret: mockResolver(map[string]string{}), // no secrets
-		SkipAllowlist: true,
+		ProjectID:        "test-project",
+		Client:           http.DefaultClient,
+		ResolveSecret:    mockResolver(map[string]string{}), // no secrets
+		ResolveAllowlist: mockAllowlist(),
 	}
 
 	_, err := engine.Execute(CallRequest{
@@ -155,10 +168,10 @@ func TestEngineExecuteMissingSecret(t *testing.T) {
 
 func TestEngineExecuteMissingURL(t *testing.T) {
 	engine := &Engine{
-		ProjectID:     "test-project",
-		Client:        http.DefaultClient,
-		ResolveSecret: mockResolver(map[string]string{}),
-		SkipAllowlist: true,
+		ProjectID:        "test-project",
+		Client:           http.DefaultClient,
+		ResolveSecret:    mockResolver(map[string]string{}),
+		ResolveAllowlist: mockAllowlist(),
 	}
 
 	_, err := engine.Execute(CallRequest{
@@ -174,10 +187,10 @@ func TestEngineExecuteMissingURL(t *testing.T) {
 
 func TestEngineExecuteNoInjections(t *testing.T) {
 	engine := &Engine{
-		ProjectID:     "test-project",
-		Client:        http.DefaultClient,
-		ResolveSecret: mockResolver(map[string]string{}),
-		SkipAllowlist: true,
+		ProjectID:        "test-project",
+		Client:           http.DefaultClient,
+		ResolveSecret:    mockResolver(map[string]string{}),
+		ResolveAllowlist: mockAllowlist(),
 	}
 
 	_, err := engine.Execute(CallRequest{
@@ -201,10 +214,10 @@ func TestEngineExecuteExtraHeaders(t *testing.T) {
 	defer upstream.Close()
 
 	engine := &Engine{
-		ProjectID:     "test-project",
-		Client:        upstream.Client(),
-		ResolveSecret: mockResolver(map[string]string{"KEY": "val"}),
-		SkipAllowlist: true,
+		ProjectID:        "test-project",
+		Client:           upstream.Client(),
+		ResolveSecret:    mockResolver(map[string]string{"KEY": "val"}),
+		ResolveAllowlist: mockAllowlist(),
 	}
 
 	result, err := engine.Execute(CallRequest{
@@ -248,11 +261,11 @@ func TestAuditNeverLogsSecretValues(t *testing.T) {
 	secretValue := "sk_live_SUPER_SECRET_VALUE_12345"
 
 	engine := &Engine{
-		ProjectID:     "test-project",
-		Client:        upstream.Client(),
-		Audit:         audit,
-		ResolveSecret: mockResolver(map[string]string{"STRIPE_KEY": secretValue}),
-		SkipAllowlist: true,
+		ProjectID:        "test-project",
+		Client:           upstream.Client(),
+		Audit:            audit,
+		ResolveSecret:    mockResolver(map[string]string{"STRIPE_KEY": secretValue}),
+		ResolveAllowlist: mockAllowlist(),
 	}
 
 	_, err = engine.Execute(CallRequest{
@@ -302,10 +315,10 @@ func TestEngineExecuteRedactBody(t *testing.T) {
 	defer upstream.Close()
 
 	engine := &Engine{
-		ProjectID:     "test-project",
-		SkipAllowlist: true,
-		Client:        upstream.Client(),
-		ResolveSecret: mockResolver(map[string]string{"STRIPE_KEY": secretValue}),
+		ProjectID:        "test-project",
+		ResolveAllowlist: mockAllowlist(),
+		Client:           upstream.Client(),
+		ResolveSecret:    mockResolver(map[string]string{"STRIPE_KEY": secretValue}),
 	}
 
 	result, err := engine.Execute(CallRequest{
@@ -333,3 +346,286 @@ func TestEngineExecuteRedactBody(t *testing.T) {
 		t.Error("expected response body to contain [REDACTED_BY_AGENTSECRETS]")
 	}
 }
+
+func TestEngineCapabilities(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(200)
+	}))
+	defer upstream.Close()
+
+	engine := &Engine{
+		ProjectID:        "test-project",
+		Client:           upstream.Client(),
+		ResolveSecret:    mockResolver(map[string]string{"SECRET_A": "val_a", "SECRET_B": "val_b"}),
+		ResolveAllowlist: mockAllowlist(),
+	}
+
+	// 1. Unrestricted agent capabilities
+	_, err := engine.Execute(CallRequest{
+		TargetURL:    upstream.URL,
+		Method:       "GET",
+		Injections:   []Injection{{Style: "bearer", SecretKey: "SECRET_A"}},
+		Capabilities: nil,
+	})
+	if err != nil {
+		t.Errorf("unrestricted agent failed: %v", err)
+	}
+
+	// 2. AllowedSecrets whitelist
+	res, err := engine.Execute(CallRequest{
+		TargetURL:  upstream.URL,
+		Method:     "GET",
+		Injections: []Injection{{Style: "bearer", SecretKey: "SECRET_B"}},
+		Capabilities: &capabilities.AgentCapabilities{
+			AllowedSecrets: []string{"SECRET_A"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Execute failed: %v", err)
+	}
+	if res.StatusCode != 403 {
+		t.Errorf("expected 403 for SECRET_B (not in whitelist), got %d", res.StatusCode)
+	}
+
+	// 3. DeniedSecrets blacklist
+	res, err = engine.Execute(CallRequest{
+		TargetURL:  upstream.URL,
+		Method:     "GET",
+		Injections: []Injection{{Style: "bearer", SecretKey: "SECRET_A"}},
+		Capabilities: &capabilities.AgentCapabilities{
+			DeniedSecrets: []string{"SECRET_A"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Execute failed: %v", err)
+	}
+	if res.StatusCode != 403 {
+		t.Errorf("expected 403 for SECRET_A (in blacklist), got %d", res.StatusCode)
+	}
+}
+
+type RoundTripFunc func(req *http.Request) (*http.Response, error)
+
+func (f RoundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f(req)
+}
+
+func TestEnginePolicies(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(200)
+	}))
+	defer upstream.Close()
+
+	u, _ := url.Parse(upstream.URL)
+	upstreamHost := u.Hostname()
+
+	engine := &Engine{
+		ProjectID: "test-project",
+		Client: &http.Client{
+			Transport: RoundTripFunc(func(req *http.Request) (*http.Response, error) {
+				target, _ := url.Parse(upstream.URL)
+				req.URL.Scheme = target.Scheme
+				req.URL.Host = target.Host
+				transport := upstream.Client().Transport
+				if transport == nil {
+					transport = http.DefaultTransport
+				}
+				return transport.RoundTrip(req)
+			}),
+		},
+		ResolveSecret: mockResolver(map[string]string{
+			"SECRET_A": "val_a",
+			"SECRET_B": "val_b",
+			"SECRET_C": "val_c",
+		}),
+		ResolvePolicy: func(key string) (*capabilities.SecretPolicy, error) {
+			if key == "SECRET_A" {
+				return &capabilities.SecretPolicy{
+					Domains: []string{upstreamHost},
+				}, nil
+			}
+			if key == "SECRET_B" {
+				return &capabilities.SecretPolicy{
+					Domains: []string{"approved.com"},
+					Methods: map[string]capabilities.Action{
+						"POST": capabilities.RequestPermission,
+					},
+				}, nil
+			}
+			return nil, nil
+		},
+		Approvals:        NewApprovalStore(),
+		ResolveAllowlist: mockAllowlist(upstreamHost, "blocked.com", "approved.com"),
+	}
+
+	// 1. Policy allow (no rules match block)
+	res, err := engine.Execute(CallRequest{
+		TargetURL:  upstream.URL,
+		Method:     "GET",
+		Injections: []Injection{{Style: "bearer", SecretKey: "SECRET_A"}},
+	})
+	if err != nil {
+		t.Fatalf("Execute failed: %v", err)
+	}
+	if res.StatusCode != 200 {
+		t.Errorf("expected 200, got %d", res.StatusCode)
+	}
+
+	// 2. Policy deny
+	// Set target domain to blocked.com (by rewriting target URL or using host)
+	res, err = engine.Execute(CallRequest{
+		TargetURL:  "http://blocked.com/v1",
+		Method:     "GET",
+		Injections: []Injection{{Style: "bearer", SecretKey: "SECRET_A"}},
+	})
+	if err != nil {
+		t.Fatalf("Execute failed: %v", err)
+	}
+	if res.StatusCode != 403 {
+		t.Errorf("expected 403 for blocked domain, got %d", res.StatusCode)
+	}
+
+	// 3. Policy request_permission (initially fails with 403)
+	res, err = engine.Execute(CallRequest{
+		TargetURL:  "http://approved.com/v1",
+		Method:     "POST",
+		Injections: []Injection{{Style: "bearer", SecretKey: "SECRET_B"}},
+		AgentID:    "agent-1",
+	})
+	if err != nil {
+		t.Fatalf("Execute failed: %v", err)
+	}
+	if res.StatusCode != 403 {
+		t.Errorf("expected 403 (needs approval), got %d", res.StatusCode)
+	}
+
+	// 4. Grant approval and verify it passes
+	engine.Approvals.Approve(ApprovalKey{
+		AgentID:   "agent-1",
+		SecretKey: "SECRET_B",
+		Domain:    "approved.com",
+		Method:    "POST",
+	})
+	res, err = engine.Execute(CallRequest{
+		TargetURL:  "http://approved.com/v1",
+		Method:     "POST",
+		Injections: []Injection{{Style: "bearer", SecretKey: "SECRET_B"}},
+		AgentID:    "agent-1",
+	})
+	if err != nil {
+		t.Fatalf("Execute failed: %v", err)
+	}
+	if res.StatusCode != 200 {
+		t.Errorf("expected 200 after approval, got %d", res.StatusCode)
+	}
+}
+
+func TestEngineCapabilitiesPriorityAndCaseInsensitivity(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(200)
+	}))
+	defer upstream.Close()
+
+	engine := &Engine{
+		ProjectID:        "test-project",
+		Client:           upstream.Client(),
+		ResolveSecret:    mockResolver(map[string]string{"SECRET_A": "val_a"}),
+		ResolveAllowlist: mockAllowlist(),
+	}
+
+	// 1. Blacklist priority: SECRET_A is in both allowed and denied lists. Deny should win.
+	res, err := engine.Execute(CallRequest{
+		TargetURL:  upstream.URL,
+		Method:     "GET",
+		Injections: []Injection{{Style: "bearer", SecretKey: "SECRET_A"}},
+		Capabilities: &capabilities.AgentCapabilities{
+			AllowedSecrets: []string{"SECRET_A"},
+			DeniedSecrets:  []string{"SECRET_A"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Execute failed: %v", err)
+	}
+	if res.StatusCode != 403 {
+		t.Errorf("expected 403 because blacklist takes priority, got %d", res.StatusCode)
+	}
+
+	// 2. Case insensitivity check: whitelist contains lowercase "secret_a"
+	res, err = engine.Execute(CallRequest{
+		TargetURL:  upstream.URL,
+		Method:     "GET",
+		Injections: []Injection{{Style: "bearer", SecretKey: "SECRET_A"}},
+		Capabilities: &capabilities.AgentCapabilities{
+			AllowedSecrets: []string{"secret_a"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Execute failed: %v", err)
+	}
+	if res.StatusCode != 200 {
+		t.Errorf("expected 200 (case-insensitive whitelist match), got %d", res.StatusCode)
+	}
+
+	// 3. Case insensitivity check: blacklist contains lowercase "secret_a"
+	res, err = engine.Execute(CallRequest{
+		TargetURL:  upstream.URL,
+		Method:     "GET",
+		Injections: []Injection{{Style: "bearer", SecretKey: "SECRET_A"}},
+		Capabilities: &capabilities.AgentCapabilities{
+			DeniedSecrets: []string{"secret_a"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Execute failed: %v", err)
+	}
+	if res.StatusCode != 403 {
+		t.Errorf("expected 403 (case-insensitive blacklist match), got %d", res.StatusCode)
+	}
+}
+
+func TestEngineAllowlistEnforcement(t *testing.T) {
+	engine := &Engine{
+		ProjectID:        "test-project",
+		Client:           http.DefaultClient,
+		ResolveSecret:    mockResolver(map[string]string{"SECRET_A": "val_a"}),
+		ResolveAllowlist: mockAllowlist("allowed.com"),
+	}
+
+	// 1. Blocked domain
+	res, err := engine.Execute(CallRequest{
+		TargetURL:  "https://unauthorized.com/v1",
+		Method:     "GET",
+		Injections: []Injection{{Style: "bearer", SecretKey: "SECRET_A"}},
+	})
+	if err != nil {
+		t.Fatalf("Execute failed: %v", err)
+	}
+	if res.StatusCode != 403 {
+		t.Errorf("expected 403 for unauthorized domain, got %d", res.StatusCode)
+	}
+
+	// 2. Allowed domain
+	// We mock the client transport to avoid actual network request
+	engine.Client = &http.Client{
+		Transport: RoundTripFunc(func(req *http.Request) (*http.Response, error) {
+			w := httptest.NewRecorder()
+			w.WriteHeader(200)
+			w.Write([]byte("allowed"))
+			return w.Result(), nil
+		}),
+	}
+	res, err = engine.Execute(CallRequest{
+		TargetURL:  "https://allowed.com/v1",
+		Method:     "GET",
+		Injections: []Injection{{Style: "bearer", SecretKey: "SECRET_A"}},
+	})
+	if err != nil {
+		t.Fatalf("Execute failed: %v", err)
+	}
+	if res.StatusCode != 200 {
+		t.Errorf("expected 200 for allowed domain, got %d", res.StatusCode)
+	}
+}
+
+
+

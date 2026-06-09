@@ -311,6 +311,37 @@ func GetWorkspaceAllowlist(workspaceID string) ([]string, error) {
 	return domains, nil
 }
 
+// SetSecretPolicy stores policy in the OS keychain via keychain-auth.
+func SetSecretPolicy(projectID, environment, key string, policy []byte) error {
+	target := formatTarget(projectID, environment, key) + ":policy"
+	_, err := sendRequest(request{
+		Type:    typeRequest,
+		Action:  actionWrite,
+		Service: serviceName,
+		Targets: []string{target},
+		Values:  []string{string(policy)},
+	})
+	return err
+}
+
+// GetSecretPolicy retrieves policy from the OS keychain via keychain-auth.
+func GetSecretPolicy(projectID, environment, key string) ([]byte, error) {
+	target := formatTarget(projectID, environment, key) + ":policy"
+	resp, err := sendRequest(request{
+		Type:    typeRequest,
+		Action:  actionRead,
+		Service: serviceName,
+		Targets: []string{target},
+	})
+	if err != nil {
+		return nil, err
+	}
+	if len(resp.Results) == 0 {
+		return nil, nil
+	}
+	return []byte(resp.Results[0].Value), nil
+}
+
 // --- Internal helpers ---
 
 // sendRequest sends a request to the daemon and reads the response.

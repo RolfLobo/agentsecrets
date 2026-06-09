@@ -20,6 +20,9 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"time"
+
+	"github.com/The-17/agentsecrets/pkg/keyring"
 )
 
 // GlobalConfig represents ~/.agentsecrets/config.json
@@ -199,8 +202,18 @@ func SaveGlobalConfig(config *GlobalConfig) error {
 	return writeJSON(paths.ConfigFile, config, 0600)
 }
 
-// LoadTokens reads ~/.agentsecrets/token.json
+// LoadTokens reads user tokens from the secure OS keychain, falling back to ~/.agentsecrets/token.json.
 func LoadTokens() (*TokenConfig, error) {
+	// 1. Try loading from OS keychain
+	tokensJSON, err := keyring.GetUserTokens()
+	if err == nil && tokensJSON != "" {
+		var tokens TokenConfig
+		if err := json.Unmarshal([]byte(tokensJSON), &tokens); err == nil && tokens.AccessToken != "" {
+			return &tokens, nil
+		}
+	}
+
+	// 2. Fall back to loading from token.json
 	paths, err := GetPaths()
 	if err != nil {
 		return nil, err
@@ -209,16 +222,39 @@ func LoadTokens() (*TokenConfig, error) {
 	if err := readJSON(paths.TokenFile, &tokens); err != nil {
 		return nil, err
 	}
+
+	// 3. Migrate to keyring if tokens were found in file
+	if tokens.AccessToken != "" {
+		jsonData, err := json.Marshal(&tokens)
+		if err == nil {
+			_ = keyring.SetUserTokens(string(jsonData))
+			// Purge sensitive details from token.json file but preserve file existence
+			_ = writeJSON(paths.TokenFile, &TokenConfig{}, 0600)
+		}
+	}
+
 	return &tokens, nil
 }
 
-// SaveTokens writes ~/.agentsecrets/token.json
+// SaveTokens writes user tokens to the secure OS keychain.
 func SaveTokens(tokens *TokenConfig) error {
-	paths, err := GetPaths()
+	jsonData, err := json.Marshal(tokens)
 	if err != nil {
+		return fmt.Errorf("failed to serialize tokens: %w", err)
+	}
+
+	// Store in secure keychain
+	if err := keyring.SetUserTokens(string(jsonData)); err != nil {
 		return err
 	}
-	return writeJSON(paths.TokenFile, tokens, 0600)
+
+	// Keep token.json file empty of secrets
+	paths, err := GetPaths()
+	if err != nil {
+		return nil
+	}
+	_ = writeJSON(paths.TokenFile, &TokenConfig{}, 0600)
+	return nil
 }
 
 // GetProjectRoot walks up the directory tree from the current working directory.
@@ -386,29 +422,65 @@ func SetSelectedProjectID(id string) error {
 	return SaveGlobalConfig(c)
 }
 
-// StoreWorkspaceCache saves decrypted workspace keys to global config.
+// StoreWorkspaceCache saves decrypted workspace keys to the secure OS keychain
+// and saves other workspace metadata to the global config with keys stripped out.
 func StoreWorkspaceCache(workspaces map[string]WorkspaceCacheEntry) error {
 	c, _ := LoadGlobalConfig()
 	if c == nil {
 		c = &GlobalConfig{}
 	}
-	c.Workspaces = workspaces
+
+	// Duplicate the map to avoid modifying the caller's map in-place
+	strippedWorkspaces := make(map[string]WorkspaceCacheEntry)
+
+	for id, ws := range workspaces {
+		if ws.Key != "" {
+			// Save workspace key in secure keychain
+			_ = keyring.SetWorkspaceKey(id, ws.Key)
+		}
+		// Save metadata with Key field stripped
+		strippedWorkspaces[id] = WorkspaceCacheEntry{
+			Name: ws.Name,
+			Key:  "", // Strip the key from config.json
+			Role: ws.Role,
+			Type: ws.Type,
+		}
+	}
+
+	c.Workspaces = strippedWorkspaces
 	return SaveGlobalConfig(c)
 }
 
 // GetWorkspaceKey returns the decrypted workspace key for a given workspace ID.
+// It looks up the key in the keyring first. For backward compatibility, if not
+// found in the keyring, it falls back to the config.json entry and migrates it.
 func GetWorkspaceKey(workspaceID string) ([]byte, error) {
-	config, err := LoadGlobalConfig()
-	if err != nil {
-		return nil, err
-	}
-	ws, ok := config.Workspaces[workspaceID]
-	if !ok || ws.Key == "" {
-		return nil, fmt.Errorf("workspace key not found for %s", workspaceID)
+	var keyB64 string
+
+	// 1. Try loading from secure OS keychain
+	if k, err := keyring.GetWorkspaceKey(workspaceID); err == nil && k != "" {
+		keyB64 = k
+	} else {
+		// 2. Fall back to loading from config.json
+		config, err := LoadGlobalConfig()
+		if err != nil {
+			return nil, err
+		}
+		ws, ok := config.Workspaces[workspaceID]
+		if !ok || ws.Key == "" {
+			return nil, fmt.Errorf("workspace key not found for %s", workspaceID)
+		}
+		keyB64 = ws.Key
+
+		// 3. Migrate to keyring and strip from config.json
+		_ = keyring.SetWorkspaceKey(workspaceID, ws.Key)
+		ws.Key = ""
+		config.Workspaces[workspaceID] = ws
+		_ = SaveGlobalConfig(config)
 	}
 
-	// First level of decoding (from config.json)
-	key, err := base64.StdEncoding.DecodeString(ws.Key)
+	// First level of decoding (from base64)
+	key, err := base64.StdEncoding.DecodeString(keyB64)
 	if err != nil {
 		return nil, fmt.Errorf("failed to decode workspace key: %w", err)
 	}
@@ -447,6 +519,17 @@ func IsAuthenticated() bool {
 // ClearSession removes all stored credentials (logout).
 // Does NOT clear project.json.
 func ClearSession() error {
+	// 1. Purge keychain credentials
+	_ = keyring.DeleteUserTokens()
+
+	config, err := LoadGlobalConfig()
+	if err == nil && config != nil {
+		for id := range config.Workspaces {
+			_ = keyring.DeleteWorkspaceKey(id)
+		}
+	}
+
+	// 2. Clear config files on disk
 	paths, err := GetPaths()
 	if err != nil {
 		return err
@@ -605,4 +688,20 @@ func SetSelectedEnvironment(env string) error {
 	}
 	c.SelectedEnvironment = env
 	return SaveGlobalConfig(c)
+}
+
+// IsTokenExpired returns true if the current access token is expired or close to expiring (within 5 minutes).
+func IsTokenExpired() bool {
+	tokens, err := LoadTokens()
+	if err != nil || tokens == nil || tokens.AccessToken == "" {
+		return true
+	}
+	if tokens.ExpiresAt == "" {
+		return false
+	}
+	exp, err := time.Parse(time.RFC3339, tokens.ExpiresAt)
+	if err != nil {
+		return true
+	}
+	return time.Until(exp) < 5*time.Minute
 }

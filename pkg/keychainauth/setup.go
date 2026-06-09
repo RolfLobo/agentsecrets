@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -407,18 +408,18 @@ func startDirect(keychainAuthPath string) error {
 	return waitForSocket()
 }
 
-// waitForSocket polls for the socket file to appear, with a short timeout.
+// waitForSocket polls for the socket file to appear and be dialable, with an 8-second timeout.
 func waitForSocket() error {
-	for i := 0; i < 30; i++ {
-		if IsAvailable() {
-			// Give the daemon a moment to finish its internal initialization
-			// after creating the socket before we hammer it with requests.
-			time.Sleep(500 * time.Millisecond)
+	sockPath := SocketPath()
+	for i := 0; i < 80; i++ {
+		c, err := net.Dial("unix", sockPath)
+		if err == nil {
+			c.Close()
 			return nil
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
-	return fmt.Errorf("keychain-auth daemon started but socket not available after 3 seconds")
+	return fmt.Errorf("keychain-auth daemon started but socket not available after 8 seconds")
 }
 
 // computeHash returns the SHA-256 hash of a file in "sha256:<hex>" format.

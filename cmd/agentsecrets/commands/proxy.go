@@ -1,12 +1,12 @@
 package commands
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
-	"path/filepath"
-	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -24,6 +24,7 @@ var (
 	logsSecretFlag string
 	logsLastFlag   int
 	logsEnvFlag    string
+	allowLocalHTTP bool
 )
 
 var proxyCmd = &cobra.Command{
@@ -64,8 +65,24 @@ var proxyLogsCmd = &cobra.Command{
 	RunE:  runProxyLogs,
 }
 
+var proxyApproveCmd = &cobra.Command{
+	Use:   "approve <SECRET_KEY> <METHOD> <DOMAIN>",
+	Short: "Grant a session-based approval for a policy-restricted secret",
+	Long: `When a secret's policy is set to 'request_permission' for a specific domain/method
+combination, the proxy blocks the request until the developer explicitly approves it.
+
+This command sends the approval to the running proxy. The approval lasts for the
+current proxy session (until the proxy is restarted).
+
+Example:
+  agentsecrets proxy approve STRIPE_KEY POST api.stripe.com`,
+	Args: cobra.ExactArgs(3),
+	RunE: runProxyApprove,
+}
+
 func init() {
 	proxyStartCmd.Flags().IntVar(&proxyPort, "port", 8765, "Port to listen on")
+	proxyStartCmd.Flags().BoolVar(&allowLocalHTTP, "allow-local-http", false, "Allow HTTP connections to local loopback destinations")
 
 	proxyLogsCmd.Flags().StringVar(&logsSecretFlag, "secret", "", "Filter logs by secret key name")
 	proxyLogsCmd.Flags().IntVar(&logsLastFlag, "last", 20, "Number of recent log entries to show")
@@ -76,75 +93,11 @@ func init() {
 	proxyCmd.AddCommand(proxyStopCmd)
 	proxyCmd.AddCommand(proxySyncCmd)
 	proxyCmd.AddCommand(proxyLogsCmd)
+	proxyCmd.AddCommand(proxyApproveCmd)
+	proxyCmd.AddCommand(proxyRotateSessionCmd)
 }
 
-// pidFilePath returns the path to the proxy PID file (~/.agentsecrets/proxy.pid).
-func pidFilePath() (string, error) {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return "", fmt.Errorf("cannot determine home directory: %w", err)
-	}
-	return filepath.Join(home, ".agentsecrets", "proxy.pid"), nil
-}
-
-// writePIDFile writes the current PID and start time to the PID file.
-func writePIDFile(port int) error {
-	path, err := pidFilePath()
-	if err != nil {
-		return err
-	}
-	data := fmt.Sprintf("%d\n%d\n%d", os.Getpid(), time.Now().Unix(), port)
-	return os.WriteFile(path, []byte(data), 0600)
-}
-
-// removePIDFile cleans up the PID file on shutdown.
-func removePIDFile() {
-	path, err := pidFilePath()
-	if err != nil {
-		return
-	}
-	os.Remove(path)
-}
-
-// readPIDFile reads the PID, start time, and port from the PID file.
-func readPIDFile() (pid int, startTime time.Time, port int, err error) {
-	path, err := pidFilePath()
-	if err != nil {
-		return 0, time.Time{}, 0, err
-	}
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return 0, time.Time{}, 0, err
-	}
-	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
-	if len(lines) < 3 {
-		return 0, time.Time{}, 0, fmt.Errorf("invalid PID file format")
-	}
-	pid, err = strconv.Atoi(lines[0])
-	if err != nil {
-		return 0, time.Time{}, 0, fmt.Errorf("invalid PID: %w", err)
-	}
-	ts, err := strconv.ParseInt(lines[1], 10, 64)
-	if err != nil {
-		return 0, time.Time{}, 0, fmt.Errorf("invalid timestamp: %w", err)
-	}
-	port, err = strconv.Atoi(lines[2])
-	if err != nil {
-		return 0, time.Time{}, 0, fmt.Errorf("invalid port: %w", err)
-	}
-	return pid, time.Unix(ts, 0), port, nil
-}
-
-// isProcessAlive checks if a process with the given PID is running.
-func isProcessAlive(pid int) bool {
-	p, err := os.FindProcess(pid)
-	if err != nil {
-		return false
-	}
-	// On Unix, FindProcess always succeeds; send signal 0 to probe.
-	err = p.Signal(syscall.Signal(0))
-	return err == nil
-}
+// Uptime format helper remains here.
 
 // formatUptime returns a human-readable uptime string from a start time.
 func formatUptime(start time.Time) string {
@@ -179,6 +132,7 @@ func runProxyStart(cmd *cobra.Command, args []string) error {
 
 	ui.StatusRow("Project:", project.ProjectName)
 	ui.StatusRow("Port:", fmt.Sprintf("%d", proxyPort))
+	ui.StatusRow("Local HTTP:", fmt.Sprintf("%t", allowLocalHTTP))
 	fmt.Println()
 
 	engine, err := proxy.NewEngine(project.ProjectID)
@@ -189,6 +143,11 @@ func runProxyStart(cmd *cobra.Command, args []string) error {
 			"Check if there are conflicts in your local configuration or storage.",
 		)
 		return nil
+	}
+
+	// Set allow local HTTP flag
+	if allowLocalHTTP {
+		engine.AllowLocalHTTP = true
 	}
 
 	// Inject apiClient for cloud log syncing
@@ -203,13 +162,27 @@ func runProxyStart(cmd *cobra.Command, args []string) error {
 		ui.StatusRowDim("Agent:", "(none — calls will be logged as anonymous)")
 	}
 
+	// Generate and write pre-shared session token to Keychain
+	sessionToken, err := proxy.GenerateSessionToken()
+	if err != nil {
+		ui.Error(fmt.Sprintf("Failed to generate session token: %v", err))
+		return nil
+	}
+	if err := proxy.WriteSessionToken(sessionToken); err != nil {
+		ui.Error(fmt.Sprintf("Failed to store session token securely in Keychain: %v", err))
+		return nil
+	}
+	ui.StatusRow("Session Token:", "Active (secured in OS Keychain)")
+
 	server := proxy.NewServer(proxyPort, engine)
+	server.APIClient = apiClient
+	server.SessionToken = sessionToken
 
 	// Write PID file for proxy status
-	if err := writePIDFile(proxyPort); err != nil {
+	if err := proxy.WritePIDFile(proxyPort); err != nil {
 		ui.Warning(fmt.Sprintf("Failed to write PID file: %v", err))
 	}
-	defer removePIDFile()
+	defer proxy.RemovePIDFile()
 
 	ui.Success(fmt.Sprintf("\nProxy listening on http://localhost:%d/proxy", proxyPort))
 	ui.Info("Press Ctrl+C to stop")
@@ -224,13 +197,13 @@ func runProxyStatus(cmd *cobra.Command, args []string) error {
 	ui.Divider()
 
 	// Read PID file for running state
-	pid, startTime, port, err := readPIDFile()
+	pid, startTime, port, err := proxy.ReadPIDFile()
 	if err != nil {
 		ui.StatusRow("Proxy status:", ui.ErrorStyle.Render("not running"))
-	} else if !isProcessAlive(pid) {
+	} else if !proxy.IsProcessAlive(pid) {
 		ui.StatusRow("Proxy status:", ui.ErrorStyle.Render("not running"))
 		ui.StatusRowDim("Last PID:", fmt.Sprintf("%d (exited)", pid))
-		removePIDFile()
+		proxy.RemovePIDFile()
 	} else {
 		ui.StatusRow("Proxy status:", ui.SuccessStyle.Render("running"))
 		ui.StatusRow("PID:", fmt.Sprintf("%d", pid))
@@ -293,15 +266,15 @@ func runProxyStatus(cmd *cobra.Command, args []string) error {
 }
 
 func runProxyStop(cmd *cobra.Command, args []string) error {
-	pid, _, _, err := readPIDFile()
+	pid, _, _, err := proxy.ReadPIDFile()
 	if err != nil {
 		ui.Info("No running proxy found (no PID file).")
 		return nil
 	}
 
-	if !isProcessAlive(pid) {
+	if !proxy.IsProcessAlive(pid) {
 		ui.Info(fmt.Sprintf("Proxy process %d is already dead.", pid))
-		removePIDFile()
+		proxy.RemovePIDFile()
 		return nil
 	}
 
@@ -313,8 +286,8 @@ func runProxyStop(cmd *cobra.Command, args []string) error {
 
 	// Wait up to 5 seconds for it to stop
 	for i := 0; i < 50; i++ {
-		if !isProcessAlive(pid) {
-			removePIDFile()
+		if !proxy.IsProcessAlive(pid) {
+			proxy.RemovePIDFile()
 			ui.Success("Proxy stopped.")
 			return nil
 		}
@@ -326,7 +299,7 @@ func runProxyStop(cmd *cobra.Command, args []string) error {
 	if err := p.Kill(); err != nil {
 		return fmt.Errorf("failed to kill proxy: %w", err)
 	}
-	removePIDFile()
+	proxy.RemovePIDFile()
 	ui.Success("Proxy force-killed.")
 	return nil
 }
@@ -334,7 +307,7 @@ func runProxyStop(cmd *cobra.Command, args []string) error {
 func runProxySync(cmd *cobra.Command, args []string) error {
 	// Determine port from PID file or default
 	port := 8765
-	_, _, pidPort, err := readPIDFile()
+	_, _, pidPort, err := proxy.ReadPIDFile()
 	if err == nil && pidPort > 0 {
 		port = pidPort
 	}
@@ -342,7 +315,17 @@ func runProxySync(cmd *cobra.Command, args []string) error {
 	url := fmt.Sprintf("http://localhost:%d/sync", port)
 	client := &http.Client{Timeout: 5 * time.Second}
 
-	resp, err := client.Get(url)
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return err
+	}
+
+	sessionToken, _ := proxy.ReadSessionToken()
+	if sessionToken != "" {
+		req.Header.Set("X-AS-Session-Token", sessionToken)
+	}
+
+	resp, err := client.Do(req)
 	if err != nil {
 		return fmt.Errorf("proxy not reachable on port %d: %w", port, err)
 	}
@@ -441,6 +424,120 @@ func runProxyLogs(cmd *cobra.Command, args []string) error {
 	fmt.Printf("%s\n", table)
 
 	ui.Info(fmt.Sprintf("Showing %d entries", len(events)))
+	fmt.Println()
+	return nil
+}
+
+func runProxyApprove(cmd *cobra.Command, args []string) error {
+	secretKey := strings.ToUpper(args[0])
+	method := strings.ToUpper(args[1])
+	domain := strings.ToLower(args[2])
+
+	// Read PID file to determine running proxy port
+	_, _, port, err := proxy.ReadPIDFile()
+	if err != nil {
+		return fmt.Errorf("proxy does not appear to be running — start it first with 'agentsecrets proxy start'")
+	}
+
+	payload := map[string]string{
+		"secret_key": secretKey,
+		"method":     method,
+		"domain":     domain,
+	}
+	body, _ := json.Marshal(payload)
+
+	url := fmt.Sprintf("http://localhost:%d/approve", port)
+	req, err := http.NewRequest("POST", url, bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	sessionToken, _ := proxy.ReadSessionToken()
+	if sessionToken != "" {
+		req.Header.Set("X-AS-Session-Token", sessionToken)
+	}
+
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to reach proxy at %s — is it running?", url)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		respBody, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("approval failed: %s", string(respBody))
+	}
+
+	ui.Success(fmt.Sprintf("Approved: %s can be used for %s requests to %s (this session only)", secretKey, method, domain))
+	return nil
+}
+
+var proxyRotateSessionCmd = &cobra.Command{
+	Use:   "rotate-session",
+	Short: "Rotate the local proxy session token",
+	Long:  `Generate a new session token, notify the running proxy daemon, and update the secure local session storage.`,
+	RunE:  runProxyRotateSession,
+}
+
+func runProxyRotateSession(cmd *cobra.Command, args []string) error {
+	fmt.Println()
+	ui.Banner("Rotate Session Token")
+	ui.Divider()
+
+	// Read current session token
+	oldToken, err := proxy.ReadSessionToken()
+	if err != nil {
+		return fmt.Errorf("failed to read current session token: %w", err)
+	}
+
+	// Generate new session token
+	newToken, err := proxy.GenerateSessionToken()
+	if err != nil {
+		return fmt.Errorf("failed to generate new session token: %w", err)
+	}
+
+	// Determine port from PID file or default
+	port := 8765
+	_, _, pidPort, err := proxy.ReadPIDFile()
+	if err == nil && pidPort > 0 {
+		port = pidPort
+	}
+
+	// Notify running proxy server
+	url := fmt.Sprintf("http://localhost:%d/rotate-session", port)
+	payload := map[string]string{
+		"new_token": newToken,
+	}
+	body, _ := json.Marshal(payload)
+
+	req, err := http.NewRequest("POST", url, bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("failed to build rotation request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-AS-Session-Token", oldToken)
+
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		ui.Warning("Proxy daemon is not currently running. Updating local token only.")
+	} else {
+		defer resp.Body.Close()
+		if resp.StatusCode != 200 {
+			respBody, _ := io.ReadAll(resp.Body)
+			return fmt.Errorf("proxy rejected session rotation: %s", string(respBody))
+		}
+		ui.Success("Running proxy daemon updated with new session token.")
+	}
+
+	// Update local keyring storage
+	if err := proxy.WriteSessionToken(newToken); err != nil {
+		return fmt.Errorf("failed to store new session token: %w", err)
+	}
+
+	ui.Success("Session token rotated successfully in secure OS Keychain.")
 	fmt.Println()
 	return nil
 }

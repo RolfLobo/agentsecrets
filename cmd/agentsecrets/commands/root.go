@@ -81,28 +81,13 @@ func Execute() error {
 }
 
 func init() {
-	// Create the API client with a token provider function.
-	apiClient = api.NewClient(func() string {
-		return config.GetAccessToken()
-	})
+	apiClient = auth.NewAuthenticatedClient()
 
 	// Create the shared services
 	authService = auth.NewService(apiClient)
 	workspaceService = workspaces.NewService(apiClient)
 	InitProjectService(apiClient)
 	InitSecretsService(apiClient)
-
-	// Set dynamic token refresh callback to prevent code duplication
-	apiClient.SetRefreshTokenCallback(func() (string, error) {
-		tokens, err := config.LoadTokens()
-		if err != nil || tokens.RefreshToken == "" {
-			return "", fmt.Errorf("no refresh token available")
-		}
-		if err := authService.RefreshSession(tokens.RefreshToken); err != nil {
-			return "", err
-		}
-		return config.GetAccessToken(), nil
-	})
 
 	// Register all subcommands
 	rootCmd.AddCommand(initCmd)

@@ -1,6 +1,6 @@
 # AgentSecrets
 
-> **Zero-Knowledge Credential Infrastructure for AI Agents (and Humans and Teams)**: Secure key orchestration, sandboxed execution capabilities, and runtime delegation without ever exposing secret values to agent reasoning loops.
+> **Zero-Knowledge Credential Infrastructure for AI Agents (and Humans and Teams)**: A unified enforcement pipeline—**store, inject, govern, audit**—that decouples credentials from the application runtime entirely, ensuring agents execute tasks using credentials by reference without ever holding or seeing the raw values.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Go Version](https://img.shields.io/badge/Go-1.21+-00ADD8?logo=go)](https://go.dev/)
@@ -460,7 +460,6 @@ agentsecrets environment clean
 ### Secrets
 ```bash
 agentsecrets secrets set KEY=value
-agentsecrets secrets get KEY
 agentsecrets secrets list
 agentsecrets secrets push
 agentsecrets secrets pull
@@ -472,9 +471,10 @@ agentsecrets secrets diff --from X --to Y
 ### Proxy and Calls
 ```bash
 agentsecrets call --url URL --bearer KEY
-agentsecrets proxy start [--port 8765]
+agentsecrets proxy start [--port 8765] [--allow-local-http]
 agentsecrets proxy status
 agentsecrets proxy stop
+agentsecrets proxy rotate-session
 agentsecrets proxy logs [--last N] [--watch] [--env ENV]
 agentsecrets mcp serve
 agentsecrets mcp install
@@ -484,10 +484,13 @@ agentsecrets env -- <command>
 
 ### Audit
 ```bash
-agentsecrets log list [--tail] [--agent NAME] [--identity anonymous]
+agentsecrets log [--tail] [--agent NAME] [--identity anonymous]
+agentsecrets log show <id>           # Detailed forensic audit trace
 agentsecrets log summary [--since 7d]
 agentsecrets log export --format csv
-agentsecrets log detail <id>
+agentsecrets log verify              # Verify log cryptographic chain integrity
+agentsecrets log replay <id>         # Step-by-step visual log playback
+agentsecrets log watch               # Live stream audit entries
 ```
 
 ### Agent Identity

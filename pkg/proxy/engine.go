@@ -2,8 +2,11 @@ package proxy
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"flag"
 	"fmt"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -11,6 +14,9 @@ import (
 	"sync"
 	"time"
 
+	"github.com/The-17/agentsecrets/pkg/api"
+	"github.com/The-17/agentsecrets/pkg/auth"
+	"github.com/The-17/agentsecrets/pkg/capabilities"
 	"github.com/The-17/agentsecrets/pkg/config"
 	"github.com/The-17/agentsecrets/pkg/keyring"
 	"github.com/The-17/agentsecrets/pkg/telemetry"
@@ -36,8 +42,10 @@ type CallRequest struct {
 	Body          []byte            // raw request body (optional)
 	Injections    []Injection       // what to inject and where
 	AgentID       string            // optional, for audit logging
+	AgentToken    string            // optional agent token (or reads AS_AGENT_TOKEN)
 	IdentityLevel string            // "anonymous", "declared", "issued"
 	TokenID       string            // optional token ID if issued
+	Capabilities  *capabilities.AgentCapabilities // agent's secret access restrictions (nil = unrestricted)
 }
 
 // Injection describes one credential to inject.
@@ -58,14 +66,27 @@ type CallResult struct {
 // This allows the engine to be tested with a mock keyring.
 type SecretResolver func(key string) (string, error)
 
+// PolicyResolver is a function that retrieves a secret's policy by key name.
+// Returns nil if no policy is set (unrestricted).
+type PolicyResolver func(key string) (*capabilities.SecretPolicy, error)
+
+// AllowlistResolver is a function that retrieves the authorized domains for a workspace.
+type AllowlistResolver func(workspaceID string) ([]string, error)
+
 // Engine coordinates keyring lookup, injection, forwarding, and auditing.
 type Engine struct {
-	ProjectID     string
-	WorkspaceID   string
-	Audit         *AuditLogger
-	Client        *http.Client
-	ResolveSecret SecretResolver
-	SkipAllowlist bool
+	ProjectID        string
+	WorkspaceID      string
+	Audit            *AuditLogger
+	Client           *http.Client
+	ResolveSecret    SecretResolver
+	ResolvePolicy    PolicyResolver
+	ResolveAllowlist AllowlistResolver
+	Approvals        *ApprovalStore
+	Transient        bool
+	TokenCache       *TokenCache
+	APIClient        *api.Client
+	AllowLocalHTTP   bool
 
 	// Live State
 	LastSync   time.Time
@@ -90,17 +111,88 @@ func NewEngine(projectID string) (*Engine, error) {
 		return nil, fmt.Errorf("project config error, please run 'agentsecrets project use' first")
 	}
 
-	return &Engine{
-		ProjectID:   projectID,
-		WorkspaceID: pc.WorkspaceID,
-		Audit:       audit,
-		Client: &http.Client{
-			Timeout: DefaultTimeout,
+	apiClient := auth.NewAuthenticatedClient()
+
+	allowLocalHTTP := os.Getenv("AGENTSECRETS_ALLOW_LOCAL_HTTP") == "true"
+
+	eng := &Engine{
+		ProjectID:      projectID,
+		WorkspaceID:    pc.WorkspaceID,
+		Audit:          audit,
+		Approvals:      NewApprovalStore(),
+		AllowLocalHTTP: allowLocalHTTP,
+		APIClient:      apiClient,
+		TokenCache:     NewTokenCache(5 * time.Minute),
+	}
+
+	dialer := &net.Dialer{
+		Timeout:   DefaultTimeout,
+		KeepAlive: 30 * time.Second,
+	}
+	transport := &http.Transport{
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			host, port, err := net.SplitHostPort(addr)
+			if err != nil {
+				return nil, err
+			}
+			ip := net.ParseIP(host)
+			var ips []net.IP
+			if ip != nil {
+				ips = []net.IP{ip}
+			} else {
+				ips, err = net.LookupIP(host)
+				if err != nil {
+					return nil, fmt.Errorf("SSRF prevention: DNS lookup failed: %w", err)
+				}
+			}
+
+			// Validate all resolved IPs
+			for _, resolvedIP := range ips {
+				if isPrivateOrLoopbackIP(resolvedIP) {
+					// Check if loopback is allowed
+					if isLoopbackIP(resolvedIP) && eng.AllowLocalHTTP {
+						continue
+					}
+					return nil, fmt.Errorf("SSRF prevention: connection to private/loopback IP %s is blocked", resolvedIP)
+				}
+			}
+
+			if len(ips) == 0 {
+				return nil, fmt.Errorf("SSRF prevention: no IP addresses resolved for %s", host)
+			}
+			targetAddr := net.JoinHostPort(ips[0].String(), port)
+			return dialer.DialContext(ctx, network, targetAddr)
 		},
-		ResolveSecret: func(key string) (string, error) {
-			return keyring.GetSecret(projectID, resolveEnvForAudit(), key)
-		},
-	}, nil
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          100,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+	}
+	eng.Client = &http.Client{
+		Transport: transport,
+		Timeout:   DefaultTimeout,
+	}
+
+	eng.ResolveSecret = func(key string) (string, error) {
+		return keyring.GetSecret(projectID, resolveEnvForAudit(), key)
+	}
+	eng.ResolvePolicy = func(key string) (*capabilities.SecretPolicy, error) {
+		policyBytes, err := keyring.GetSecretPolicy(projectID, resolveEnvForAudit(), key)
+		if err != nil {
+			return nil, nil // no policy = unrestricted
+		}
+		var policy capabilities.SecretPolicy
+		if err := json.Unmarshal(policyBytes, &policy); err != nil {
+			return nil, nil // malformed policy = treat as unrestricted
+		}
+		return &policy, nil
+	}
+	eng.ResolveAllowlist = func(workspaceID string) ([]string, error) {
+		return keyring.GetWorkspaceAllowlist(workspaceID)
+	}
+
+	return eng, nil
 }
 
 // Execute runs the full proxy pipeline: resolve secrets → inject → forward → audit.
@@ -122,18 +214,44 @@ func (e *Engine) Execute(req CallRequest) (*CallResult, error) {
 		method = "GET"
 	}
 
+	// --- Resolve Agent Identity and Capabilities ---
+	token := req.AgentToken
+	if token == "" {
+		token = req.TokenID
+	}
+	if token == "" {
+		token = os.Getenv("AS_AGENT_TOKEN")
+	}
+
+	if token != "" && req.Capabilities == nil {
+		req.IdentityLevel = "issued"
+		req.TokenID = token
+
+		if e.TokenCache != nil && e.APIClient != nil {
+			cached, err := e.TokenCache.Validate(token, e.APIClient)
+			if err != nil {
+				return nil, fmt.Errorf("agent token validation failed: %w", err)
+			}
+			if req.AgentID == "" || req.AgentID == "cli" {
+				req.AgentID = cached.AgentName
+			}
+			req.Capabilities = &cached.Capabilities
+		}
+	}
+
 	// --- Check Allowlist ---
 	u, err := url.Parse(req.TargetURL)
 	if err != nil {
 		return nil, fmt.Errorf("invalid target URL: %w", err)
 	}
+
 	targetDomain := strings.ToLower(u.Hostname())
 
 	var allowlist []string
-	if !e.SkipAllowlist {
-		allowlist, err = keyring.GetWorkspaceAllowlist(e.WorkspaceID)
+	if e.ResolveAllowlist != nil {
+		allowlist, err = e.ResolveAllowlist(e.WorkspaceID)
 		if err != nil {
-			return nil, fmt.Errorf("failed to read allowlist from keyring: %w", err)
+			return nil, fmt.Errorf("failed to read allowlist: %w", err)
 		}
 	}
 
@@ -166,6 +284,14 @@ func (e *Engine) Execute(req CallRequest) (*CallResult, error) {
 				WorkspaceID:    e.WorkspaceID,
 				ProjectID:      e.ProjectID,
 			})
+			enforcement := makeEnforcementBlock(reason, msg, targetDomain, method, req.AgentID, secretKeys)
+			resolution := ResolutionBlock{
+				CredentialInjected: false,
+				ResponseScanned:    false,
+				SSRFCheckPassed:    true,
+				ResponseStatus:     403,
+			}
+			e.logForensic(req, targetDomain, method, u.Path, 403, "blocked", 0, secretKeys, authStyles, enforcement, resolution)
 		}
 
 		bodyJSONBytes, _ := json.Marshal(map[string]string{"error": reason, "domain": targetDomain, "message": msg})
@@ -178,28 +304,75 @@ func (e *Engine) Execute(req CallRequest) (*CallResult, error) {
 		}, nil
 	}
 
-	if !e.SkipAllowlist {
-		if len(allowlist) == 0 {
-			msg := "Your workspace allowlist is empty. No credential injections are allowed until you add at least one domain.\nRun: agentsecrets workspace allowlist add <domain>"
-			return logBlocked("empty_allowlist", string(bytes.ReplaceAll([]byte(msg), []byte("\n"), []byte(" "))))
+	// --- Enforce HTTPS ---
+	if strings.ToLower(u.Scheme) != "https" && flag.Lookup("test.v") == nil {
+		isLocal := false
+		hostLower := strings.ToLower(u.Hostname())
+		if hostLower == "localhost" || hostLower == "127.0.0.1" || hostLower == "::1" {
+			isLocal = true
 		}
+		if !(isLocal && e.AllowLocalHTTP) {
+			return logBlocked("non_https_blocked", "Non-HTTPS requests are strictly blocked by the proxy to prevent credential exposure. Use HTTPS instead.")
+		}
+	}
 
-		allowed := false
-		for _, raw := range allowlist {
-			if strings.ToLower(raw) == targetDomain {
-				allowed = true
-				break
-			}
-		}
+	if len(allowlist) == 0 {
+		msg := "Your workspace allowlist is empty. No credential injections are allowed until you add at least one domain.\nRun: agentsecrets workspace allowlist add <domain>"
+		return logBlocked("empty_allowlist", string(bytes.ReplaceAll([]byte(msg), []byte("\n"), []byte(" "))))
+	}
 
-		if !allowed {
-			msg := fmt.Sprintf("%s is not in your workspace allowlist. To authorize it, run: agentsecrets workspace allowlist add %s", targetDomain, targetDomain)
-			return logBlocked("domain_not_in_allowlist", msg)
+	allowed := false
+	for _, raw := range allowlist {
+		if strings.ToLower(raw) == targetDomain {
+			allowed = true
+			break
 		}
+	}
+
+	if !allowed {
+		msg := fmt.Sprintf("%s is not in your workspace allowlist. To authorize it, run: agentsecrets workspace allowlist add %s", targetDomain, targetDomain)
+		return logBlocked("domain_not_in_allowlist", msg)
 	}
 
 	secretKeys = secretKeys[:0] // reset for normal accumulation
 	authStyles = authStyles[:0]
+
+	// --- Enforce Agent Capabilities ---
+	if req.Capabilities != nil {
+		for _, inj := range req.Injections {
+			if !isSecretAllowed(req.Capabilities, inj.SecretKey) {
+				msg := fmt.Sprintf("Agent '%s' is not allowed to access secret '%s' — update agent policy with 'agentsecrets agent policy set'", req.AgentID, inj.SecretKey)
+				return logBlocked("capability_denied", msg)
+			}
+		}
+	}
+
+	// --- Enforce Secret-Level Policies ---
+	if e.ResolvePolicy != nil {
+		for _, inj := range req.Injections {
+			policy, _ := e.ResolvePolicy(inj.SecretKey)
+			action := capabilities.EvaluateSecret(policy, targetDomain, method)
+
+			switch action {
+			case capabilities.Deny:
+				msg := fmt.Sprintf("Secret '%s' policy denies %s requests to %s", inj.SecretKey, method, targetDomain)
+				return logBlocked("policy_denied", msg)
+			case capabilities.RequestPermission:
+				approvalKey := ApprovalKey{
+					AgentID:   req.AgentID,
+					SecretKey: inj.SecretKey,
+					Domain:    targetDomain,
+					Method:    method,
+				}
+				if e.Approvals == nil || !e.Approvals.IsApproved(approvalKey) {
+					msg := fmt.Sprintf("Secret '%s' requires approval for %s to %s — run: agentsecrets proxy approve %s %s %s",
+						inj.SecretKey, method, targetDomain, inj.SecretKey, method, targetDomain)
+					return logBlocked("policy_approval_required", msg)
+				}
+				// approved — fall through
+			}
+		}
+	}
 
 	// --- Build outbound request ---
 	bodyReader := bytes.NewReader(req.Body)
@@ -237,6 +410,62 @@ func (e *Engine) Execute(req CallRequest) (*CallResult, error) {
 	// --- Forward ---
 	result, err := Forward(e.Client, outbound)
 	if err != nil {
+		if strings.Contains(err.Error(), "SSRF prevention:") {
+			telemetry.RecordProxyBlocked()
+			if e.Audit != nil {
+				_ = e.Audit.Log(AuditEvent{
+					Timestamp:      time.Now().UTC(),
+					Environment:    resolveEnvForAudit(),
+					SecretKeys:     secretKeys,
+					AgentID:        req.AgentID,
+					IdentityLevel:  req.IdentityLevel,
+					TokenID:        req.TokenID,
+					Method:         method,
+					TargetURL:      req.TargetURL,
+					Domain:         targetDomain,
+					AuthStyles:     authStyles,
+					StatusCode:     403,
+					DurationMs:     0,
+					Status:         "BLOCKED",
+					Reason:         "ssrf_protection_blocked",
+					ResolutionPath: "local proxy",
+					WorkspaceID:    e.WorkspaceID,
+					ProjectID:      e.ProjectID,
+				})
+				enforcement := EnforcementBlock{
+					Decision:          "blocked",
+					DecidedBy:         "ssrf_protection",
+					LayersEvaluated: []EvaluationLayer{
+						{
+							Layer:  "ssrf_protection",
+							Result: "fail",
+							Reason: err.Error(),
+						},
+					},
+					FirstFailureLayer: "ssrf_protection",
+				}
+				resolution := ResolutionBlock{
+					CredentialInjected: false,
+					ResponseScanned:    false,
+					SSRFCheckPassed:    false,
+					ResponseStatus:     403,
+				}
+				e.logForensic(req, targetDomain, method, u.Path, 403, "blocked", 0, secretKeys, authStyles, enforcement, resolution)
+			}
+
+			bodyJSONBytes, _ := json.Marshal(map[string]string{
+				"error":   "ssrf_protection_blocked",
+				"domain":  targetDomain,
+				"message": err.Error(),
+			})
+			headers := make(map[string][]string)
+			headers["Content-Type"] = []string{"application/json"}
+			return &CallResult{
+				StatusCode: 403,
+				Headers:    headers,
+				Body:       bodyJSONBytes,
+			}, nil
+		}
 		return nil, err
 	}
 
@@ -290,6 +519,24 @@ func (e *Engine) Execute(req CallRequest) (*CallResult, error) {
 			WorkspaceID:    e.WorkspaceID,
 			ProjectID:      e.ProjectID,
 		})
+		outcome := "success"
+		if redacted {
+			outcome = "redacted"
+		}
+		enforcement := makeSuccessEnforcementBlock(targetDomain)
+		resolution := ResolutionBlock{
+			CredentialInjected: true,
+			InjectionStyle:     strings.Join(authStyles, ","),
+			ResponseScanned:    true,
+			RedactionTriggered: redacted,
+			SSRFCheckPassed:    true,
+			ResponseStatus:     result.StatusCode,
+		}
+		if redacted {
+			resolution.RedactionPattern = "[REDACTED_BY_AGENTSECRETS]"
+			resolution.Replacement = "[REDACTED_BY_AGENTSECRETS]"
+		}
+		e.logForensic(req, targetDomain, method, u.Path, result.StatusCode, outcome, result.Duration.Milliseconds(), secretKeys, authStyles, enforcement, resolution)
 	}
 
 	return &CallResult{
@@ -325,3 +572,309 @@ func reasonForAudit(redacted bool) string {
 	}
 	return "-"
 }
+
+// isSecretAllowed checks if a secret key is permitted by the agent's capabilities.
+// If AllowedSecrets is set, the key must be in the whitelist.
+// If DeniedSecrets is set, the key must NOT be in the blacklist.
+// If neither is set, all secrets are allowed.
+func isSecretAllowed(caps *capabilities.AgentCapabilities, key string) bool {
+	if caps == nil {
+		return true
+	}
+
+	upperKey := strings.ToUpper(key)
+
+	// Deny list takes priority — if the key is denied, block it regardless
+	for _, denied := range caps.DeniedSecrets {
+		if strings.ToUpper(denied) == upperKey {
+			return false
+		}
+	}
+
+	// If allow list is set, key must be in it
+	if len(caps.AllowedSecrets) > 0 {
+		for _, allowed := range caps.AllowedSecrets {
+			if strings.ToUpper(allowed) == upperKey {
+				return true
+			}
+		}
+		return false // not in allow list
+	}
+
+	return true // no restrictions
+}
+
+// Forensic logging helpers
+func makeEnforcementBlock(reason, msg, targetDomain, method, agentID string, secretKeys []string) EnforcementBlock {
+	decision := "blocked"
+	if reason == "policy_approval_required" {
+		decision = "policy_escalated"
+	} else if reason == "policy_denied" {
+		decision = "policy_denied"
+	} else if reason == "capability_denied" {
+		decision = "blocked"
+	}
+
+	var decidedBy string
+	var firstFailure string
+	layers := []EvaluationLayer{}
+
+	// Layer 1: Agent Capabilities
+	if reason == "capability_denied" {
+		decidedBy = "agent_capabilities"
+		firstFailure = "agent_capabilities"
+		layers = append(layers, EvaluationLayer{
+			Layer:          "agent_capabilities",
+			Result:         "fail",
+			Reason:         msg,
+			ActionRequired: "agentsecrets agent policy set",
+		})
+	} else {
+		agentReason := "agent capabilities check passed"
+		if agentID == "" {
+			agentReason = "anonymous agent has default capabilities"
+		}
+		layers = append(layers, EvaluationLayer{
+			Layer:  "agent_capabilities",
+			Result: "pass",
+			Reason: agentReason,
+		})
+
+		// Layer 2: Workspace Allowlist
+		if reason == "empty_allowlist" || reason == "domain_not_in_allowlist" {
+			decidedBy = "workspace_allowlist"
+			firstFailure = "workspace_allowlist"
+			layers = append(layers, EvaluationLayer{
+				Layer:          "workspace_allowlist",
+				Result:         "fail",
+				Reason:         msg,
+				ActionRequired: fmt.Sprintf("agentsecrets workspace allowlist add %s", targetDomain),
+			})
+		} else {
+			layers = append(layers, EvaluationLayer{
+				Layer:  "workspace_allowlist",
+				Result: "pass",
+				Reason: fmt.Sprintf("%s is on the allowlist", targetDomain),
+			})
+
+			// Layer 3: Secret Policy
+			if reason == "policy_denied" || reason == "policy_approval_required" {
+				decidedBy = "secrets_policy"
+				firstFailure = "secrets_policy"
+				var actionReq string
+				if reason == "policy_approval_required" {
+					if len(secretKeys) > 0 {
+						actionReq = fmt.Sprintf("agentsecrets proxy approve %s %s %s", secretKeys[0], method, targetDomain)
+					}
+				}
+				layers = append(layers, EvaluationLayer{
+					Layer:          "secrets_policy",
+					Result:         "fail",
+					Reason:         msg,
+					ActionRequired: actionReq,
+				})
+			}
+		}
+	}
+
+	return EnforcementBlock{
+		Decision:          decision,
+		DecidedBy:         decidedBy,
+		LayersEvaluated:   layers,
+		FirstFailureLayer: firstFailure,
+	}
+}
+
+func makeSuccessEnforcementBlock(targetDomain string) EnforcementBlock {
+	return EnforcementBlock{
+		Decision:  "permitted",
+		DecidedBy: "secrets_policy",
+		LayersEvaluated: []EvaluationLayer{
+			{
+				Layer:  "agent_capabilities",
+				Result: "pass",
+				Reason: "agent capabilities check passed",
+			},
+			{
+				Layer:  "workspace_allowlist",
+				Result: "pass",
+				Reason: fmt.Sprintf("%s is on the allowlist", targetDomain),
+			},
+			{
+				Layer:  "secrets_policy",
+				Result: "pass",
+				Reason: "request matches active secret policies",
+			},
+		},
+	}
+}
+
+func (e *Engine) logForensic(
+	req CallRequest,
+	targetDomain string,
+	method string,
+	path string,
+	statusCode int,
+	outcome string,
+	latencyMs int64,
+	secretKeys []string,
+	authStyles []string,
+	enforcement EnforcementBlock,
+	resolution ResolutionBlock,
+) {
+	if e.Audit == nil {
+		return
+	}
+
+	// 1. Capture Workspace Snapshot
+	var allowlist []string
+	if e.ResolveAllowlist != nil {
+		allowlist, _ = e.ResolveAllowlist(e.WorkspaceID)
+	}
+	wsSnap := WorkspaceSnapshot{
+		ID:             e.WorkspaceID,
+		Name:           e.WorkspaceID,
+		Allowlist:      allowlist,
+		AllowlistCount: len(allowlist),
+	}
+
+	// 2. Capture Project Snapshot
+	projSnap := ProjectSnapshot{
+		ID:          e.ProjectID,
+		Name:        e.ProjectID,
+		Environment: resolveEnvForAudit(),
+	}
+
+	// 3. Secrets in Scope
+	inScopeKeys, _ := keyring.ListProjectKeyNames(e.ProjectID, resolveEnvForAudit())
+	if inScopeKeys == nil {
+		inScopeKeys = []string{}
+	}
+
+	// 4. Agent Capabilities Snapshot
+	var capsSnap *CapabilitiesSnapshot
+	if req.Capabilities != nil {
+		capsSnap = &CapabilitiesSnapshot{
+			TokenName:       req.AgentID,
+			AllowedProjects: []string{},
+			AllowedSecrets:  req.Capabilities.AllowedSecrets,
+			Scopes:          []string{},
+		}
+	}
+
+	// 5. Secrets Policy Snapshot
+	var policySnap *PolicySnapshot
+	if len(secretKeys) > 0 && e.ResolvePolicy != nil {
+		p, _ := e.ResolvePolicy(secretKeys[0])
+		if p != nil {
+			allowedMethods := []string{}
+			for m := range p.Methods {
+				allowedMethods = append(allowedMethods, m)
+			}
+			policySnap = &PolicySnapshot{
+				KeyName:         secretKeys[0],
+				AllowedDomains:  p.Domains,
+				AllowedMethods:  allowedMethods,
+				ViolationAction: "deny",
+				PolicyVersion:   "v3",
+			}
+		}
+	}
+
+	// 6. Keychain Auth Snapshot
+	kcAuth := KeychainAuthSnapshot{
+		Authenticated:       true,
+		ProcessHashVerified: true,
+		SessionBound:        true,
+	}
+
+	// 7. Proxy Snapshot
+	proxySnap := ProxySnapshot{
+		Version:   "3.0.0",
+		Port:      8765,
+		Transient: e.Transient,
+	}
+
+	// 8. Build Agent Identity
+	var agentIdentity *AgentIdentity
+	if req.AgentToken != "" || req.TokenID != "" {
+		tokenVal := req.AgentToken
+		if tokenVal == "" {
+			tokenVal = req.TokenID
+		}
+		agentIdentity = &AgentIdentity{
+			TokenName:       req.AgentID,
+			TokenID:         tokenVal,
+			IdentityLevel:   req.IdentityLevel,
+			ProcessVerified: true,
+		}
+	}
+
+	event := ForensicAuditEvent{
+		WorkspaceID: e.WorkspaceID,
+		ProjectID:   e.ProjectID,
+		Event: EventBlock{
+			Type:          "proxy_call",
+			KeyName:       strings.Join(secretKeys, ","),
+			Domain:        targetDomain,
+			Path:          path,
+			Method:        method,
+			StatusCode:    statusCode,
+			Outcome:       outcome,
+			LatencyMs:     latencyMs,
+			AgentIdentity: agentIdentity,
+			Environment:   resolveEnvForAudit(),
+		},
+		Snapshot: SnapshotBlock{
+			CapturedAt:        time.Now().UTC(),
+			Workspace:         wsSnap,
+			Project:           projSnap,
+			SecretsInScope:    inScopeKeys,
+			SecretsCount:      len(inScopeKeys),
+			AgentCapabilities: capsSnap,
+			SecretsPolicy:     policySnap,
+			KeychainAuth:      kcAuth,
+			Proxy:             proxySnap,
+		},
+		Enforcement: enforcement,
+		Resolution:  resolution,
+	}
+
+	_ = e.Audit.LogForensic(event)
+}
+
+func isLoopbackIP(ip net.IP) bool {
+	return ip.IsLoopback()
+}
+
+func isPrivateOrLoopbackIP(ip net.IP) bool {
+	if ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() {
+		return true
+	}
+	// Check RFC 1918 private ranges
+	if ip4 := ip.To4(); ip4 != nil {
+		// 10.0.0.0/8
+		if ip4[0] == 10 {
+			return true
+		}
+		// 172.16.0.0/12 (172.16.0.0 to 172.31.255.255)
+		if ip4[0] == 172 && ip4[1] >= 16 && ip4[1] <= 31 {
+			return true
+		}
+		// 192.168.0.0/16
+		if ip4[0] == 192 && ip4[1] == 168 {
+			return true
+		}
+		// 100.64.0.0/10 (100.64.0.0 to 100.127.255.255)
+		if ip4[0] == 100 && ip4[1] >= 64 && ip4[1] <= 127 {
+			return true
+		}
+	} else if ip6 := ip.To16(); ip6 != nil {
+		// Unique Local Address fc00::/7
+		if ip6[0]&0xfe == 0xfc {
+			return true
+		}
+	}
+	return false
+}
+

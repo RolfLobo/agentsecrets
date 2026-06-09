@@ -1,4 +1,4 @@
-// Package mcp implements a Model Context Protocol server exposing api_call and list_secrets tools for AI agents.
+// Package mcp implements a Model Context Protocol server exposing credential, audit, and context tools for AI agents.
 package mcp
 
 import (
@@ -8,32 +8,62 @@ import (
 	"strings"
 
 	"github.com/The-17/agentsecrets/pkg/api"
-	"github.com/The-17/agentsecrets/pkg/config"
+	"github.com/The-17/agentsecrets/pkg/auth"
 	"github.com/The-17/agentsecrets/pkg/proxy"
 	"github.com/The-17/agentsecrets/pkg/secrets"
+	"github.com/The-17/agentsecrets/pkg/workspaces"
+
 	"github.com/The-17/agentsecrets/pkg/telemetry"
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
 )
 
-// NewServer creates an MCP server with api_call and list_secrets tools.
-func NewServer() *server.MCPServer {
+// NewServer creates an MCP server with the full AgentSecrets tool surface.
+func NewServer(version string) *server.MCPServer {
 	s := server.NewMCPServer(
 		"AgentSecrets",
-		"1.0.0",
+		version,
 		server.WithToolCapabilities(false),
 	)
 
+	// --- Credential Operations ---
 	s.AddTool(apiCallTool(), handleAPICall)
-	s.AddTool(listSecretsTool(), handleListSecrets)
+	s.AddTool(listKeysTool(), handleListKeys)
+	s.AddTool(checkKeyTool(), handleCheckKey)
+	s.AddTool(getCoverageTool(), handleGetCoverage)
+
+	// --- Context Management ---
+	s.AddTool(getStatusTool(), handleGetStatus)
+	s.AddTool(getEnvironmentTool(), handleGetEnvironment)
+	s.AddTool(switchEnvironmentTool(), handleSwitchEnvironment)
+	s.AddTool(pullSecretsTool(), handlePullSecrets)
+	s.AddTool(diffSecretsTool(), handleDiffSecrets)
+	s.AddTool(diffEnvironmentsTool(), handleDiffEnvironments)
+
+	// --- Audit & Observability ---
+	s.AddTool(getProxyLogsTool(), handleGetProxyLogs)
+	s.AddTool(getBlockedRequestsTool(), handleGetBlockedRequests)
+	s.AddTool(getRedactionEventsTool(), handleGetRedactionEvents)
+	s.AddTool(getAuditSummaryTool(), handleGetAuditSummary)
+
+	// --- Agent Identity ---
+	s.AddTool(getAgentIdentityTool(), handleGetAgentIdentity)
+	s.AddTool(listAgentTokensTool(), handleListAgentTokens)
+
+	// --- Allowlist ---
+	s.AddTool(checkDomainTool(), handleCheckDomain)
+	s.AddTool(getAllowlistTool(), handleGetAllowlist)
+
+	// --- Key Rotation ---
+	s.AddTool(rotateKeyTool(), handleRotateKey)
 
 	return s
 }
 
 // Serve starts the MCP server on stdio (for Claude Desktop, Cursor, etc).
-func Serve() error {
+func Serve(version string) error {
 	telemetry.RecordIntegration("mcp")
-	s := NewServer()
+	s := NewServer(version)
 	return server.ServeStdio(s)
 }
 
@@ -44,7 +74,7 @@ func apiCallTool() mcp.Tool {
 		mcp.WithDescription(
 			"Make an authenticated API call. Credentials are injected from the OS keychain — "+
 				"you will NEVER see the actual secret values. "+
-				"Use list_secrets first to discover available key names.",
+				"Use list_keys first to discover available key names.",
 		),
 		mcp.WithString("url",
 			mcp.Required(),
@@ -70,15 +100,7 @@ func apiCallTool() mcp.Tool {
 	)
 }
 
-func listSecretsTool() mcp.Tool {
-	return mcp.NewTool("list_secrets",
-		mcp.WithDescription(
-			"List available secret key names in the current project. "+
-				"Returns ONLY key names, never the actual values. "+
-				"Use this to discover which keys are available before calling api_call.",
-		),
-	)
-}
+
 
 // --- Handlers ---
 
@@ -124,27 +146,14 @@ func handleAPICall(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolR
 		return mcp.NewToolResultError(fmt.Sprintf("invalid injections: %v", err)), nil
 	}
 
-	// Load project config for project ID
-	project, err := config.LoadProjectConfig()
-	if err != nil || project.ProjectID == "" {
-		return mcp.NewToolResultError("no project configured — run 'agentsecrets init' first"), nil
-	}
-
-	// Create engine
-	engine, err := proxy.NewEngine(project.ProjectID)
-	if err != nil {
-		return mcp.NewToolResultError(fmt.Sprintf("failed to initialize proxy engine: %v", err)), nil
-	}
-
-	// Execute
-	result, err := engine.Execute(proxy.CallRequest{
-		TargetURL:     url,
-		Method:        method,
-		Headers:       headers,
-		Body:          body,
-		Injections:    injections,
-		AgentID:       "mcp",
-		IdentityLevel: "issued",
+	// Execute via the proxy daemon
+	result, err := proxy.CallViaProxy(proxy.CallRequest{
+		TargetURL:  url,
+		Method:     method,
+		Headers:    headers,
+		Body:       body,
+		Injections: injections,
+		AgentID:    "mcp",
 	})
 	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("API call failed: %v", err)), nil
@@ -155,32 +164,51 @@ func handleAPICall(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolR
 	return mcp.NewToolResultText(response), nil
 }
 
-func handleListSecrets(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	// Create API client (same pattern as CLI)
-	apiClient := api.NewClient(func() string {
-		return config.GetAccessToken()
-	})
-	svc := secrets.NewService(apiClient)
+// --- Shared Helpers ---
 
-	// List keys only (no values)
-	list, err := svc.List()
+var (
+	apiClient        *api.Client
+	authService      *auth.Service
+	workspaceService *workspaces.Service
+	secretsService   *secrets.Service
+)
+
+// SetServices configures the MCP package to use the CLI's shared services.
+func SetServices(api *api.Client, auth *auth.Service, ws *workspaces.Service, sec *secrets.Service) {
+	apiClient = api
+	authService = auth
+	workspaceService = ws
+	secretsService = sec
+}
+
+func getAPIClient() *api.Client {
+	if apiClient != nil {
+		return apiClient
+	}
+	return auth.NewAuthenticatedClient()
+}
+
+func getWorkspaceService() *workspaces.Service {
+	if workspaceService != nil {
+		return workspaceService
+	}
+	return workspaces.NewService(getAPIClient())
+}
+
+func getSecretsService() *secrets.Service {
+	if secretsService != nil {
+		return secretsService
+	}
+	return secrets.NewService(getAPIClient())
+}
+
+// jsonResult marshals v to indented JSON and returns it as a tool result.
+func jsonResult(v interface{}) (*mcp.CallToolResult, error) {
+	data, err := json.MarshalIndent(v, "", "  ")
 	if err != nil {
-		return mcp.NewToolResultError(fmt.Sprintf("failed to list secrets: %v", err)), nil
+		return mcp.NewToolResultError(fmt.Sprintf("failed to marshal response: %v", err)), nil
 	}
-
-	if len(list) == 0 {
-		return mcp.NewToolResultText("No secrets found. Use 'agentsecrets secrets set KEY=VALUE' to add one."), nil
-	}
-
-	// Build response: just key names
-	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("Found %d secret(s):\n\n", len(list)))
-	for _, s := range list {
-		sb.WriteString(fmt.Sprintf("  • %s\n", s.Key))
-	}
-	sb.WriteString("\nUse these key names in api_call's injections parameter.")
-
-	return mcp.NewToolResultText(sb.String()), nil
+	return mcp.NewToolResultText(string(data)), nil
 }
 
 // parseInjections converts the agent's map format into proxy.Injection structs.

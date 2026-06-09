@@ -8,28 +8,52 @@ import (
 	"os"
 	"strings"
 	"time"
+
+	"github.com/The-17/agentsecrets/pkg/api"
+	"github.com/The-17/agentsecrets/pkg/capabilities"
 )
 
 // Server is the HTTP proxy server that wraps the Engine.
 // It listens for incoming requests with X-AS-* headers, builds
 // CallRequests, executes them through the engine, and returns responses.
 type Server struct {
-	Port   int
-	Engine *Engine
-	mux    *http.ServeMux
+	Port         int
+	Engine       *Engine
+	TokenCache   *TokenCache
+	APIClient    *api.Client
+	SessionToken string
+	mux          *http.ServeMux
 }
 
 // NewServer creates a proxy server bound to the given port and engine.
 func NewServer(port int, engine *Engine) *Server {
 	s := &Server{
-		Port:   port,
-		Engine: engine,
-		mux:    http.NewServeMux(),
+		Port:       port,
+		Engine:     engine,
+		TokenCache: NewTokenCache(5 * time.Minute),
+		mux:        http.NewServeMux(),
 	}
-	s.mux.HandleFunc("/proxy", s.handleProxy)
+	s.mux.HandleFunc("/proxy", s.validateSession(s.handleProxy))
 	s.mux.HandleFunc("/health", s.handleHealth)
-	s.mux.HandleFunc("/sync", s.handleSync)
+	s.mux.HandleFunc("/sync", s.validateSession(s.handleSync))
+	s.mux.HandleFunc("/approve", s.validateSession(s.handleApprove))
+	s.mux.HandleFunc("/rotate-session", s.validateSession(s.handleRotateSession))
 	return s
+}
+
+func (s *Server) validateSession(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if s.SessionToken == "" {
+			next(w, r)
+			return
+		}
+		token := r.Header.Get("X-AS-Session-Token")
+		if token == "" || token != s.SessionToken {
+			writeError(w, http.StatusUnauthorized, "Invalid or missing session token")
+			return
+		}
+		next(w, r)
+	}
 }
 
 // Start begins listening and serving. This blocks until the server is stopped.
@@ -113,12 +137,24 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 
 	identityLevel := "anonymous"
 	tokenID := ""
+	var callReqCaps *capabilities.AgentCapabilities
+
 	if agentToken != "" {
 		identityLevel = "issued"
-		tokenID = agentToken // or parsed token if identifiable
-		// If the token matches the environment token, that's what we use.
-		// For now, the backend will validate it; we just pass it along.
-		// If agentID is empty, backend will infer it from token.
+		tokenID = agentToken
+
+		// Validate token and extract capabilities
+		if s.TokenCache != nil && s.APIClient != nil {
+			cached, err := s.TokenCache.Validate(agentToken, s.APIClient)
+			if err != nil {
+				writeError(w, 401, fmt.Sprintf("Agent token validation failed: %v", err))
+				return
+			}
+			if agentID == "" {
+				agentID = cached.AgentName
+			}
+			callReqCaps = &cached.Capabilities
+		}
 	} else if agentID != "" {
 		identityLevel = "declared"
 	}
@@ -160,6 +196,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		AgentID:       agentID,
 		IdentityLevel: identityLevel,
 		TokenID:       tokenID,
+		Capabilities:  callReqCaps,
 	})
 
 	if err != nil {
@@ -220,5 +257,81 @@ func writeError(w http.ResponseWriter, statusCode int, message string) {
 	w.WriteHeader(statusCode)
 	json.NewEncoder(w).Encode(map[string]string{
 		"error": message,
+	})
+}
+
+// handleApprove grants a session-based approval for a secret+domain+method combination.
+func (s *Server) handleApprove(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, 405, "POST required")
+		return
+	}
+
+	var req struct {
+		SecretKey string `json:"secret_key"`
+		Method    string `json:"method"`
+		Domain    string `json:"domain"`
+		AgentID   string `json:"agent_id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, 400, "Invalid JSON body")
+		return
+	}
+
+	if req.SecretKey == "" || req.Method == "" || req.Domain == "" {
+		writeError(w, 400, "secret_key, method, and domain are required")
+		return
+	}
+
+	if s.Engine.Approvals == nil {
+		writeError(w, 500, "Approval store not initialized")
+		return
+	}
+
+	key := ApprovalKey{
+		AgentID:   req.AgentID,
+		SecretKey: strings.ToUpper(req.SecretKey),
+		Domain:    strings.ToLower(req.Domain),
+		Method:    strings.ToUpper(req.Method),
+	}
+	s.Engine.Approvals.Approve(key)
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(200)
+	json.NewEncoder(w).Encode(map[string]string{
+		"status":     "approved",
+		"secret_key": key.SecretKey,
+		"method":     key.Method,
+		"domain":     key.Domain,
+	})
+}
+
+// handleRotateSession handles rotating the server's session token.
+func (s *Server) handleRotateSession(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "POST required")
+		return
+	}
+
+	var req struct {
+		NewToken string `json:"new_token"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "Invalid JSON body")
+		return
+	}
+
+	if req.NewToken == "" {
+		writeError(w, http.StatusBadRequest, "new_token is required")
+		return
+	}
+
+	s.SessionToken = req.NewToken
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]string{
+		"status":  "ok",
+		"message": "session token rotated successfully",
 	})
 }

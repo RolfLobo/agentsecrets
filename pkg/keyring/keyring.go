@@ -30,6 +30,16 @@ const serviceName = "AgentSecrets"
 // useFileBackend is true when the OS keyring is unavailable (WSL, headless Linux, etc.)
 var useFileBackend bool
 
+// HomeDirHook is used to determine the home directory for file fallback.
+// It can be overridden in tests.
+var HomeDirHook = os.UserHomeDir
+
+// ForceFileBackend forces keyring functions to use file-based storage.
+// Exposing this allows tests to run without polluting the user's OS Keychain.
+func ForceFileBackend(force bool) {
+	useFileBackend = force
+}
+
 func init() {
 	// On Linux, test if the keyring actually works. If not, fall back to file storage.
 	// macOS and Windows have reliable keyring support.
@@ -113,7 +123,7 @@ type keyEntry struct {
 }
 
 func keyringFilePath() (string, error) {
-	home, err := os.UserHomeDir()
+	home, err := HomeDirHook()
 	if err != nil {
 		return "", err
 	}
@@ -337,12 +347,18 @@ func GetWorkspaceAllowlist(workspaceID string) ([]string, error) {
 	if useFileBackend {
 		v, err := fileGetKey(name, "private")
 		if err != nil {
+			if strings.Contains(err.Error(), "no keys found") {
+				return []string{}, nil
+			}
 			return nil, fmt.Errorf("get allowlist: %w", err)
 		}
 		val = string(v)
 	} else {
 		v, err := gokeyring.Get(serviceName, name)
 		if err != nil {
+			if err == gokeyring.ErrNotFound || strings.Contains(err.Error(), "not found") {
+				return []string{}, nil
+			}
 			return nil, fmt.Errorf("get allowlist: %w", err)
 		}
 		val = v
@@ -461,4 +477,164 @@ func GetAllProjectSecrets(projectID, environment string) (map[string]string, err
 		}
 	}
 	return res, nil
+}
+
+// SetSecretPolicy caches a secret's policy in the local keyring.
+func SetSecretPolicy(projectID, environment, key string, policy []byte) error {
+	if keychainauth.IsInitialized() {
+		return keychainauth.SetSecretPolicy(projectID, environment, key, policy)
+	}
+
+	name := fmt.Sprintf("%s:%s:%s:policy", projectID, environment, key)
+	if useFileBackend {
+		encoded := base64.StdEncoding.EncodeToString(policy)
+		return fileSet(name, encoded, "")
+	}
+
+	if err := gokeyring.Set(serviceName, name, string(policy)); err != nil {
+		return fmt.Errorf("set policy %s: %w", name, err)
+	}
+	return nil
+}
+
+// GetSecretPolicy retrieves the cached policy for a secret.
+func GetSecretPolicy(projectID, environment, key string) ([]byte, error) {
+	if keychainauth.IsInitialized() {
+		return keychainauth.GetSecretPolicy(projectID, environment, key)
+	}
+
+	name := fmt.Sprintf("%s:%s:%s:policy", projectID, environment, key)
+	if useFileBackend {
+		v, err := fileGetKey(name, "private")
+		if err != nil {
+			if strings.Contains(err.Error(), "no keys found") {
+				return nil, nil
+			}
+			return nil, fmt.Errorf("get policy: %w", err)
+		}
+		return v, nil
+	}
+
+	val, err := gokeyring.Get(serviceName, name)
+	if err != nil {
+		if err == gokeyring.ErrNotFound || strings.Contains(err.Error(), "not found") {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("get policy: %w", err)
+	}
+	return []byte(val), nil
+}
+
+// SetUserTokens stores the serialized user tokens in the OS keychain.
+func SetUserTokens(tokensJSON string) error {
+	if useFileBackend {
+		encoded := base64.StdEncoding.EncodeToString([]byte(tokensJSON))
+		return fileSet("user_tokens", encoded, "")
+	}
+	if err := gokeyring.Set(serviceName, "user_tokens", tokensJSON); err != nil {
+		return fmt.Errorf("failed to store user tokens in keychain: %w", err)
+	}
+	return nil
+}
+
+// GetUserTokens retrieves the serialized user tokens from the OS keychain.
+func GetUserTokens() (string, error) {
+	if useFileBackend {
+		v, err := fileGetKey("user_tokens", "private")
+		if err != nil {
+			return "", err
+		}
+		return string(v), nil
+	}
+	val, err := gokeyring.Get(serviceName, "user_tokens")
+	if err != nil {
+		return "", err
+	}
+	return val, nil
+}
+
+// DeleteUserTokens removes the user tokens from the OS keychain.
+func DeleteUserTokens() error {
+	if useFileBackend {
+		return fileDelete("user_tokens")
+	}
+	_ = gokeyring.Delete(serviceName, "user_tokens")
+	return nil
+}
+
+// SetWorkspaceKey stores the base64-encoded workspace key in the OS keychain.
+func SetWorkspaceKey(workspaceID, keyB64 string) error {
+	name := "workspace_key_" + workspaceID
+	if useFileBackend {
+		encoded := base64.StdEncoding.EncodeToString([]byte(keyB64))
+		return fileSet(name, encoded, "")
+	}
+	if err := gokeyring.Set(serviceName, name, keyB64); err != nil {
+		return fmt.Errorf("failed to store workspace key for %s in keychain: %w", workspaceID, err)
+	}
+	return nil
+}
+
+// GetWorkspaceKey retrieves the base64-encoded workspace key from the OS keychain.
+func GetWorkspaceKey(workspaceID string) (string, error) {
+	name := "workspace_key_" + workspaceID
+	if useFileBackend {
+		v, err := fileGetKey(name, "private")
+		if err != nil {
+			return "", err
+		}
+		return string(v), nil
+	}
+	val, err := gokeyring.Get(serviceName, name)
+	if err != nil {
+		return "", err
+	}
+	return val, nil
+}
+
+// DeleteWorkspaceKey removes a workspace key from the OS keychain.
+func DeleteWorkspaceKey(workspaceID string) error {
+	name := "workspace_key_" + workspaceID
+	if useFileBackend {
+		return fileDelete(name)
+	}
+	_ = gokeyring.Delete(serviceName, name)
+	return nil
+}
+
+// SetProxySessionToken stores the local proxy session token securely.
+func SetProxySessionToken(token string) error {
+	if useFileBackend {
+		encoded := base64.StdEncoding.EncodeToString([]byte(token))
+		return fileSet("proxy_session_token", encoded, "")
+	}
+	if err := gokeyring.Set(serviceName, "proxy_session_token", token); err != nil {
+		return fmt.Errorf("failed to store proxy session token: %w", err)
+	}
+	return nil
+}
+
+// GetProxySessionToken retrieves the local proxy session token securely.
+func GetProxySessionToken() (string, error) {
+	if useFileBackend {
+		v, err := fileGetKey("proxy_session_token", "private")
+		if err != nil {
+			return "", err
+		}
+		return string(v), nil
+	}
+	val, err := gokeyring.Get(serviceName, "proxy_session_token")
+	if err != nil {
+		return "", err
+	}
+	return val, nil
+}
+
+// DeleteProxySessionToken deletes the local proxy session token.
+func DeleteProxySessionToken() error {
+	if useFileBackend {
+		return fileDelete("proxy_session_token")
+	}
+	_ = gokeyring.Delete(serviceName, "proxy_session_token")
+	return nil
 }

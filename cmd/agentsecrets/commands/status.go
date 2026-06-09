@@ -9,6 +9,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/The-17/agentsecrets/pkg/config"
+	"github.com/The-17/agentsecrets/pkg/proxy"
 	"github.com/The-17/agentsecrets/pkg/ui"
 )
 
@@ -121,8 +122,8 @@ var statusCmd = &cobra.Command{
 			ui.StatusRow("Current Project:", projectDisplay)
 
 			// Proxy status
-			pid, _, port, err := readPIDFile()
-			if err != nil || !isProcessAlive(pid) {
+			pid, _, port, err := proxy.ReadPIDFile()
+			if err != nil || !proxy.IsProcessAlive(pid) {
 				ui.StatusRowDim("Proxy:", "Not running")
 			} else {
 				ui.StatusRow("Proxy:", fmt.Sprintf("Running (port %d)", port))

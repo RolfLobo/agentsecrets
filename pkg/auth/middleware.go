@@ -20,31 +20,15 @@ func (s *Service) EnsureAuth(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("you must be logged in to perform this action. Run 'agentsecrets login'")
 	}
 
-	var needsRefresh bool
-	var refreshToken string
-
-	// 1. Instantly check local token state
-	tokens, err := config.LoadTokens()
-	if err != nil || tokens == nil {
-		return fmt.Errorf("failed to load session tokens")
-	}
-
-	if tokens.ExpiresAt != "" {
-		exp, err := time.Parse(time.RFC3339, tokens.ExpiresAt)
-		if err == nil {
-			if time.Until(exp) < 5*time.Minute {
-				needsRefresh = true
-				refreshToken = tokens.RefreshToken
-			}
+	if config.IsTokenExpired() {
+		tokens, err := config.LoadTokens()
+		if err != nil || tokens == nil || tokens.RefreshToken == "" {
+			return fmt.Errorf("session expired, please run 'agentsecrets login' again")
 		}
-	}
-
-	// 2. Perform background HTTP network refresh if required
-	if needsRefresh {
 		if err := ui.Spinner("Refreshing expired session token...", func() error {
-			return s.RefreshSession(refreshToken)
+			return s.RefreshSession(tokens.RefreshToken)
 		}); err != nil {
-			ui.Warning("Session refresh failed, you may need to log in again: " + err.Error())
+			return fmt.Errorf("session refresh failed, you may need to log in again: %w", err)
 		}
 	}
 

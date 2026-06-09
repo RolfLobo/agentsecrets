@@ -175,9 +175,10 @@ func (s *Service) Get(key string) (string, error) {
 
 // SecretMetadata holds the secret metadata from the API.
 type SecretMetadata struct {
-	Key       string `json:"key"`
-	Value     string `json:"value,omitempty"` // Encrypted value
-	UpdatedAt string `json:"updated_at"`
+	Key       string                 `json:"key"`
+	Value     string                 `json:"value,omitempty"` // Encrypted value
+	UpdatedAt string                 `json:"updated_at"`
+	Policy    map[string]interface{} `json:"policy,omitempty"` // Secret-level target constraints
 }
 
 // List returns all secret keys for the project in the active environment.
@@ -257,6 +258,14 @@ func (s *Service) Pull(targetKeys []string) error {
 		}
 		secretsMap[s.Key] = plaintext
 		_ = keyring.SetSecret(project.ProjectID, env, s.Key, plaintext)
+
+		// Cache secret policy locally for proxy enforcement
+		if len(s.Policy) > 0 {
+			policyBytes, err := json.Marshal(s.Policy)
+			if err == nil {
+				_ = keyring.SetSecretPolicy(project.ProjectID, env, s.Key, policyBytes)
+			}
+		}
 	}
 
 	telemetry.RecordSecretCount(len(secretsMap))

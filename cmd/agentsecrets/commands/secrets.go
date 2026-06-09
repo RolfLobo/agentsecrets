@@ -129,6 +129,10 @@ func runSecretsSet(cmd *cobra.Command, args []string) error {
 			return nil
 		}
 
+		if err := verifyPasswordLocally(); err != nil {
+			return err
+		}
+
 		for _, env := range []string{"development", "staging", "production"} {
 			if err := ui.Spinner(fmt.Sprintf("Setting in %s...", env), func() error {
 				return secretsService.BatchSet(kv, env)
@@ -139,6 +143,13 @@ func runSecretsSet(cmd *cobra.Command, args []string) error {
 			ui.Success(fmt.Sprintf("Set in %s", env))
 		}
 		return nil
+	}
+
+	env := config.ResolveEnvironment()
+	if env == "production" {
+		if err := verifyPasswordLocally(); err != nil {
+			return err
+		}
 	}
 
 	if err := ui.Spinner(fmt.Sprintf("Encrypting and syncing %d secrets...", len(kv)), func() error {
@@ -341,7 +352,7 @@ func runSecretsPull(cmd *cobra.Command, args []string) error {
 		return nil
 	}
 
-	hasConflicts := len(diff.Changed) > 0 || len(diff.Removed) > 0
+	hasConflicts := len(diff.Changed) > 0
 	var targetKeys []string // nil means pull all
 
 	if hasConflicts && !pullForce {

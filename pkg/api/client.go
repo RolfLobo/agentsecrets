@@ -28,11 +28,13 @@ var endpointMap = map[string]map[string]string{
 		"refresh": "auth/refresh/",
 	},
 	"secrets": {
-		"list":   "secrets/{project_id}/",
-		"create": "secrets/",
-		"get":    "secrets/{project_id}/{environment}/{key}/",
-		"update": "secrets/{project_id}/{environment}/{key}/",
-		"delete": "secrets/{project_id}/{environment}/{key}/",
+		"list":            "secrets/{project_id}/",
+		"create":          "secrets/",
+		"get":             "secrets/{project_id}/{environment}/{key}/",
+		"update":          "secrets/{project_id}/{environment}/{key}/",
+		"delete":          "secrets/{project_id}/{environment}/{key}/",
+		"get_policy": "secrets/{project_id}/{environment}/{key}/policy/",
+		"set_policy": "secrets/{project_id}/{environment}/{key}/policy/",
 	},
 	"projects": {
 		"list":   "projects/",
@@ -66,6 +68,9 @@ var endpointMap = map[string]map[string]string{
 		"token_issue":      "workspaces/{workspace_id}/agents/{registration_id}/tokens/",
 		"token_list":       "workspaces/{workspace_id}/agents/{registration_id}/tokens/",
 		"token_revoke":     "workspaces/{workspace_id}/agents/{registration_id}/tokens/{token_id}/",
+		"get_capabilities": "workspaces/{workspace_id}/agents/{registration_id}/capabilities/",
+		"set_capabilities": "workspaces/{workspace_id}/agents/{registration_id}/capabilities/",
+		"token_validate":   "internal/agents/verify/",
 	},
 	"log": {
 		"list":    "audit/logs/",

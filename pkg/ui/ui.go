@@ -135,7 +135,13 @@ func ErrorWithSuggestions(err error, suggestions ...string) {
 				"Ensure the backend API service is reachable and not blocked by your firewall or proxy.",
 			)
 		}
-		if strings.Contains(errStr, "keychain-auth denied") || strings.Contains(errStr, "unregistered_binary") {
+		if strings.Contains(errStr, "not found") {
+			dynamicSuggestions = append(dynamicSuggestions,
+				"Verify the secret name is spelled correctly (keys are case-sensitive).",
+				"Ensure you are working in the correct environment (run 'agentsecrets env switch').",
+				"Sync your workspace by running 'agentsecrets secrets pull' or 'agentsecrets secrets push'.",
+			)
+		} else if strings.Contains(errStr, "keychain-auth denied") || strings.Contains(errStr, "unregistered_binary") {
 			dynamicSuggestions = append(dynamicSuggestions,
 				"This binary is not approved to access your secrets.",
 				"Run 'agentsecrets' in your terminal to trigger the auto-approval setup flow.",
@@ -163,7 +169,7 @@ func ErrorWithSuggestions(err error, suggestions ...string) {
 	}
 
 	if strings.Contains(errStr, "status 500") {
-		cmdStr := strings.Join(os.Args, " ")
+		cmdStr := scrubCmdArgs(os.Args)
 		nowStr := time.Now().UTC().Format(time.RFC3339)
 		fmt.Println(BrandStyle.Render("📋 Copy-paste report for engineering@theseventeen.co:"))
 		fmt.Println(DimStyle.Render("--------------------------------------------------"))
@@ -175,6 +181,31 @@ func ErrorWithSuggestions(err error, suggestions ...string) {
 		fmt.Println(DimStyle.Render("--------------------------------------------------"))
 		fmt.Println()
 	}
+}
+
+func scrubCmdArgs(args []string) string {
+	scrubbed := make([]string, len(args))
+	copy(scrubbed, args)
+
+	isSecretsSet := false
+	for i, arg := range args {
+		lower := strings.ToLower(arg)
+		if lower == "set" && i > 0 && strings.ToLower(args[i-1]) == "secrets" {
+			isSecretsSet = true
+			break
+		}
+	}
+
+	if isSecretsSet {
+		for i, arg := range scrubbed {
+			if strings.Contains(arg, "=") {
+				parts := strings.SplitN(arg, "=", 2)
+				scrubbed[i] = parts[0] + "=[REDACTED]"
+			}
+		}
+	}
+
+	return strings.Join(scrubbed, " ")
 }
 
 // SuccessWithSuggestions prints a success message and a list of next steps.
