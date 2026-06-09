@@ -21,6 +21,14 @@ var workspaceCmd = &cobra.Command{
 	RunE: runWorkspaceList,
 }
 
+var workspaceSwitchCmd = &cobra.Command{
+	Use:   "switch [name]",
+	Short: "Switch active workspace",
+	Args:  cobra.MaximumNArgs(1),
+	RunE:  runWorkspaceSwitch,
+	ValidArgsFunction: autocompleteWorkspaces,
+}
+
 func init() {
 	workspaceCmd.AddCommand(
 		&cobra.Command{
@@ -29,12 +37,7 @@ func init() {
 			Short:   "List all workspaces",
 			RunE:    runWorkspaceList,
 		},
-		&cobra.Command{
-			Use:   "switch [name]",
-			Short: "Switch active workspace",
-			Args:  cobra.MaximumNArgs(1),
-			RunE:  runWorkspaceSwitch,
-		},
+		workspaceSwitchCmd,
 		&cobra.Command{
 			Use:   "create [name]",
 			Short: "Create a new workspace",
@@ -445,4 +448,22 @@ func firstArg(args []string) string {
 		return args[0]
 	}
 	return ""
+}
+
+func autocompleteWorkspaces(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
+	cfg, err := config.LoadGlobalConfig()
+	if err != nil || cfg == nil || len(cfg.Workspaces) == 0 {
+		return nil, cobra.ShellCompDirectiveNoFileComp
+	}
+	var completions []string
+	for _, ws := range cfg.Workspaces {
+		if strings.HasPrefix(strings.ToLower(ws.Name), strings.ToLower(toComplete)) {
+			completions = append(completions, ws.Name)
+		}
+		// Also allow completing "personal"
+		if strings.EqualFold(ws.Type, "personal") && strings.HasPrefix("personal", strings.ToLower(toComplete)) {
+			completions = append(completions, "personal")
+		}
+	}
+	return completions, cobra.ShellCompDirectiveNoFileComp
 }

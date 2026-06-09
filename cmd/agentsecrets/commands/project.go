@@ -2,6 +2,7 @@ package commands
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/charmbracelet/huh"
 	"github.com/charmbracelet/lipgloss"
@@ -69,6 +70,10 @@ var projectInviteCmd = &cobra.Command{
 }
 
 func init() {
+	projectUseCmd.ValidArgsFunction = autocompleteProjects
+	projectUpdateCmd.ValidArgsFunction = autocompleteProjects
+	projectDeleteCmd.ValidArgsFunction = autocompleteProjects
+
 	projectCmd.AddCommand(projectListCmd)
 	projectCmd.AddCommand(projectCreateCmd)
 	projectCmd.AddCommand(projectUseCmd)
@@ -364,4 +369,21 @@ func runProjectInvite(cmd *cobra.Command, args []string) error {
 
 	ui.Success(fmt.Sprintf("Invited %s to project!", email))
 	return nil
+}
+
+func autocompleteProjects(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
+	if projectService == nil {
+		return nil, cobra.ShellCompDirectiveNoFileComp
+	}
+	projs, err := projectService.List()
+	if err != nil {
+		return nil, cobra.ShellCompDirectiveNoFileComp
+	}
+	var completions []string
+	for _, p := range projs {
+		if strings.HasPrefix(strings.ToLower(p.Name), strings.ToLower(toComplete)) {
+			completions = append(completions, p.Name)
+		}
+	}
+	return completions, cobra.ShellCompDirectiveNoFileComp
 }

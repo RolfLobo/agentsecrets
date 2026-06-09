@@ -91,6 +91,12 @@ func init() {
 	secretsDiffCmd.Flags().StringVar(&diffFrom, "from", "", "Source environment for cross-environment diff")
 	secretsDiffCmd.Flags().StringVar(&diffTo, "to", "", "Target environment for cross-environment diff")
 
+	secretsGetCmd.ValidArgsFunction = autocompleteSecretKeys
+	secretsDeleteCmd.ValidArgsFunction = autocompleteSecretKeys
+
+	_ = secretsDiffCmd.RegisterFlagCompletionFunc("from", autocompleteEnvironments)
+	_ = secretsDiffCmd.RegisterFlagCompletionFunc("to", autocompleteEnvironments)
+
 	secretsCmd.AddCommand(
 		secretsSetCmd,
 		secretsGetCmd,
@@ -693,4 +699,24 @@ func upperFirst(s string) string {
 		return s
 	}
 	return strings.ToUpper(s[:1]) + s[1:]
+}
+
+func autocompleteSecretKeys(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
+	project, err := config.LoadProjectConfig()
+	if err != nil || project == nil || project.ProjectID == "" {
+		return nil, cobra.ShellCompDirectiveNoFileComp
+	}
+	env := config.ResolveEnvironment()
+	keys, err := keyring.ListProjectKeyNames(project.ProjectID, env)
+	if err != nil {
+		return nil, cobra.ShellCompDirectiveNoFileComp
+	}
+
+	var completions []string
+	for _, k := range keys {
+		if strings.HasPrefix(strings.ToLower(k), strings.ToLower(toComplete)) {
+			completions = append(completions, k)
+		}
+	}
+	return completions, cobra.ShellCompDirectiveNoFileComp
 }

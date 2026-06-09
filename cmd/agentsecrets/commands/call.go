@@ -66,6 +66,9 @@ func init() {
 	callCmd.Flags().StringArrayVar(&callBodyFields, "body-field", nil, "Body injection: json.path=SECRET_KEY (repeatable)")
 	callCmd.Flags().StringArrayVar(&callFormFields, "form-field", nil, "Form injection: field=SECRET_KEY (repeatable)")
 	_ = callCmd.MarkFlagRequired("url")
+
+	_ = callCmd.RegisterFlagCompletionFunc("bearer", autocompleteSecretKeys)
+	_ = callCmd.RegisterFlagCompletionFunc("basic", autocompleteSecretKeys)
 }
 
 func runCall(cmd *cobra.Command, args []string) error {

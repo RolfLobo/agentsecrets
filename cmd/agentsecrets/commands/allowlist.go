@@ -49,6 +49,8 @@ var allowlistLogCmd = &cobra.Command{
 }
 
 func init() {
+	allowlistRemoveCmd.ValidArgsFunction = autocompleteAllowlistDomains
+
 	workspaceAllowlistCmd.AddCommand(
 		allowlistAddCmd,
 		allowlistRemoveCmd,
@@ -260,4 +262,22 @@ func runAllowlistLog(_ *cobra.Command, _ []string) error {
 	renderedTable := ui.RenderTable(headers, rows)
 	fmt.Printf("\n%s\n%s\n\n", ui.BannerStr("Allowlist Logs"), renderedTable)
 	return nil
+}
+
+func autocompleteAllowlistDomains(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
+	workspaceID := config.GetSelectedWorkspaceID()
+	if workspaceID == "" {
+		return nil, cobra.ShellCompDirectiveNoFileComp
+	}
+	domains, err := keyring.GetWorkspaceAllowlist(workspaceID)
+	if err != nil {
+		return nil, cobra.ShellCompDirectiveNoFileComp
+	}
+	var completions []string
+	for _, d := range domains {
+		if strings.HasPrefix(strings.ToLower(d), strings.ToLower(toComplete)) {
+			completions = append(completions, d)
+		}
+	}
+	return completions, cobra.ShellCompDirectiveNoFileComp
 }

@@ -218,6 +218,22 @@ func ErrorWithSuggestions(err error, suggestions ...string) {
 		return
 	}
 
+	// Identify Cobra CLI parsing and validation errors to avoid overwhelming on typos
+	errStr := strings.ToLower(err.Error())
+	isCobraError := strings.Contains(errStr, "unknown command") ||
+		strings.Contains(errStr, "unknown flag") ||
+		strings.Contains(errStr, "accepts ") ||
+		strings.Contains(errStr, "invalid argument") ||
+		strings.Contains(errStr, "flag needs an argument") ||
+		strings.Contains(errStr, "required flag") ||
+		strings.Contains(errStr, "missing argument") ||
+		strings.Contains(errStr, "unknown shorthand flag")
+
+	if isCobraError {
+		fmt.Println(ErrorStyle.Render("x " + err.Error()))
+		return
+	}
+
 	cliErr := errors.FromError(err)
 
 	// Print primary error code and message
@@ -237,7 +253,7 @@ func ErrorWithSuggestions(err error, suggestions ...string) {
 
 	if len(allSuggestions) > 0 {
 		fmt.Println()
-		fmt.Println(BrandStyle.Render(fmt.Sprintf("💡 Actionable suggestions to resolve this (%s):", details.Title)))
+		fmt.Println(DimStyle.Render(fmt.Sprintf("💡 Actionable suggestions to resolve this (%s):", details.Title)))
 		if details.Description != "" {
 			fmt.Println(DimStyle.Render(fmt.Sprintf("  %s", details.Description)))
 			fmt.Println()
@@ -251,11 +267,12 @@ func ErrorWithSuggestions(err error, suggestions ...string) {
 		}
 	}
 
-	if cliErr.Code == errors.ErrServerInternal || cliErr.Code == errors.ErrUnknown {
+	// Only show the copy-paste report for internal server errors
+	if cliErr.Code == errors.ErrServerInternal {
 		cmdStr := scrubCmdArgs(os.Args)
 		nowStr := time.Now().UTC().Format(time.RFC3339)
 		fmt.Println()
-		fmt.Println(BrandStyle.Render("📋 Copy-paste report for engineering@theseventeen.co:"))
+		fmt.Println(DimStyle.Render("📋 Copy-paste report for engineering@theseventeen.co:"))
 		fmt.Println(DimStyle.Render("--------------------------------------------------"))
 		fmt.Printf("Command Run: %s\n", cmdStr)
 		fmt.Printf("CLI Version: %s\n", CLIVersion)
