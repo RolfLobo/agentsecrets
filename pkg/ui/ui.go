@@ -13,6 +13,8 @@ import (
 
 	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/lipgloss/table"
+
+	"github.com/The-17/agentsecrets/pkg/errors"
 )
 
 // CLIVersion is the version of the CLI tool, dynamically set on start.
@@ -98,85 +100,172 @@ func Info(msg string) {
 	fmt.Println(DimStyle.Render(msg))
 }
 
+// ErrorDetails defines structured error help text
+type ErrorDetails struct {
+	Title        string
+	Description  string
+	Suggestions  []string
+	QuickAction  string
+}
+
+// ErrorRegistry maps structured ErrorCodes to user remedies
+var ErrorRegistry = map[errors.ErrorCode]ErrorDetails{
+	errors.ErrSecretNotFound: {
+		Title:       "Secret Not Found",
+		Description: "The requested secret key does not exist in your active environment.",
+		Suggestions: []string{
+			"Verify the secret name is spelled correctly (keys are case-sensitive).",
+			"Ensure you are working in the correct environment (run 'agentsecrets env switch').",
+			"Sync your workspace by running 'agentsecrets secrets pull' or 'agentsecrets secrets push'.",
+		},
+		QuickAction: "agentsecrets secrets list",
+	},
+	errors.ErrKeychainLocked: {
+		Title:       "OS Keychain Locked",
+		Description: "The native OS Keychain or Credential Manager is currently locked and unreachable.",
+		Suggestions: []string{
+			"Unlock your system keyring/credential manager via your desktop manager or password prompt.",
+			"Restart the keychain daemon if it has hung.",
+		},
+	},
+	errors.ErrKeychainHeadless: {
+		Title:       "Headless Keyring Unconfigured",
+		Description: "The native keychain cannot be initialized in a headless, non-desktop SSH environment.",
+		Suggestions: []string{
+			"Configure DBus or start a local gnome-keyring/kwallet daemon session.",
+			"Unlock the keyring programmatically before running CLI commands.",
+		},
+	},
+	errors.ErrUnauthorized: {
+		Title:       "Session Expired / Unauthorized",
+		Description: "Your local session token is invalid, revoked, or has expired.",
+		Suggestions: []string{
+			"Run 'agentsecrets login' to re-authenticate this machine.",
+			"Check if your account has been deactivated in the workspace settings.",
+		},
+		QuickAction: "agentsecrets login",
+	},
+	errors.ErrForbidden: {
+		Title:       "Permission Denied (Forbidden)",
+		Description: "You do not have the required role or capabilities to perform this action.",
+		Suggestions: []string{
+			"Verify that your agent token or account has the required access policy set.",
+			"Check your role assignment in this workspace: 'agentsecrets workspace members'.",
+		},
+	},
+	errors.ErrServerInternal: {
+		Title:       "Internal Server Error",
+		Description: "The AgentSecrets Cloud service encountered an unexpected database or system failure.",
+		Suggestions: []string{
+			"Please wait a few moments and try your command again.",
+			"If this error persists, report it to our engineering support group.",
+		},
+	},
+	errors.ErrConnection: {
+		Title:       "Connection Failed",
+		Description: "Failed to connect to the remote AgentSecrets server.",
+		Suggestions: []string{
+			"Check your internet connection and DNS settings.",
+			"Verify that your local security proxy, VPN, or firewall is not blocking outbound API calls.",
+		},
+	},
+	errors.ErrConnectionTimeout: {
+		Title:       "Request Timeout",
+		Description: "The remote API call timed out before a response was received.",
+		Suggestions: []string{
+			"The API service or endpoint might be under heavy load. Retry in a few moments.",
+			"Increase your local client connection timeout if running on a slow network.",
+		},
+	},
+	errors.ErrPermissionDenied: {
+		Title:       "OS Permission Denied",
+		Description: "Operating system access permission was denied for a required configuration file or socket.",
+		Suggestions: []string{
+			"Check filesystem permissions for the ~/.agentsecrets directory.",
+			"Ensure the active user process has read/write privileges on local state paths.",
+		},
+	},
+	errors.ErrFileNotFound: {
+		Title:       "Config File Missing",
+		Description: "A required config, database, or socket path does not exist.",
+		Suggestions: []string{
+			"Run 'agentsecrets init' to regenerate missing workspace configurations.",
+			"Check if your ~/.agentsecrets state directory has been deleted or moved.",
+		},
+		QuickAction: "agentsecrets init",
+	},
+	errors.ErrBinaryUnapproved: {
+		Title:       "Binary Unapproved",
+		Description: "The calling binary is not approved to access your keychain secrets.",
+		Suggestions: []string{
+			"Run 'agentsecrets' in your terminal to trigger the auto-approval setup flow.",
+			"Verify the calling process name matches your approved shell / IDE binary path.",
+		},
+	},
+	errors.ErrUnknown: {
+		Title:       "Unexpected Error",
+		Description: "The command failed with an unhandled runtime error.",
+		Suggestions: []string{
+			"Check the exact error trace below for clues.",
+			"Submit a copy-paste report to engineering@theseventeen.co to help resolve this issue.",
+		},
+	},
+}
+
 // ErrorWithSuggestions prints an error message and a bulleted list of helpful suggestions.
 func ErrorWithSuggestions(err error, suggestions ...string) {
-	fmt.Println(ErrorStyle.Render("x " + err.Error()))
-
-	// Dynamically resolve additional helpful suggestions based on common error patterns
-	errStr := strings.ToLower(err.Error())
-	dynamicSuggestions := make([]string, 0, len(suggestions)+3)
-
-	// Add user-provided suggestions first
-	dynamicSuggestions = append(dynamicSuggestions, suggestions...)
-
-	// Skip dynamic suggestions for Cobra CLI parsing errors which might accidentally match keywords (like 'login' in 'Did you mean')
-	if !strings.Contains(errStr, "unknown command") && !strings.Contains(errStr, "unknown flag") {
-		if strings.Contains(errStr, "status 401") || strings.Contains(errStr, "unauthorized") {
-			dynamicSuggestions = append(dynamicSuggestions,
-				"Your active session may have expired. Try logging in again: 'agentsecrets login'.",
-				"Verify that you are targeting the correct workspace.",
-			)
-		}
-		if strings.Contains(errStr, "logged in") || strings.Contains(errStr, "login") || strings.Contains(errStr, "not authenticated") {
-			dynamicSuggestions = append(dynamicSuggestions,
-				"Run 'agentsecrets login' to authenticate your current terminal session.",
-				"If you do not have an account yet, run 'agentsecrets init' to create one.",
-			)
-		}
-		if strings.Contains(errStr, "status 403") || strings.Contains(errStr, "forbidden") {
-			dynamicSuggestions = append(dynamicSuggestions,
-				"You might not have sufficient permissions (Admin or Owner role) to perform this action.",
-				"Check your role assignment in this workspace: 'agentsecrets workspace members'.",
-			)
-		}
-		if strings.Contains(errStr, "connection refused") || strings.Contains(errStr, "no such host") || strings.Contains(errStr, "timeout") {
-			dynamicSuggestions = append(dynamicSuggestions,
-				"Verify that you have an active internet connection.",
-				"Ensure the backend API service is reachable and not blocked by your firewall or proxy.",
-			)
-		}
-		if strings.Contains(errStr, "not found") {
-			dynamicSuggestions = append(dynamicSuggestions,
-				"Verify the secret name is spelled correctly (keys are case-sensitive).",
-				"Ensure you are working in the correct environment (run 'agentsecrets env switch').",
-				"Sync your workspace by running 'agentsecrets secrets pull' or 'agentsecrets secrets push'.",
-			)
-		} else if strings.Contains(errStr, "keychain-auth denied") || strings.Contains(errStr, "unregistered_binary") {
-			dynamicSuggestions = append(dynamicSuggestions,
-				"This binary is not approved to access your secrets.",
-				"Run 'agentsecrets' in your terminal to trigger the auto-approval setup flow.",
-			)
-		} else if strings.Contains(errStr, "keyring") || strings.Contains(errStr, "keychain") || strings.Contains(errStr, "secret service") || strings.Contains(errStr, "dbus") {
-			dynamicSuggestions = append(dynamicSuggestions,
-				"Verify that your OS Keychain / Credential Manager is unlocked.",
-				"For SSH/headless Linux environments, configure dbus or gnome-keyring properly.",
-			)
-		}
-		if strings.Contains(errStr, "status 500") {
-			dynamicSuggestions = append(dynamicSuggestions,
-				"This indicates an internal server error on the AgentSecrets API service.",
-				"Please report this by emailing engineering@theseventeen.co with the template below.",
-			)
-		}
+	if err == nil {
+		return
 	}
 
-	if len(dynamicSuggestions) > 0 {
+	cliErr := errors.FromError(err)
+
+	// Print primary error code and message
+	fmt.Println(ErrorStyle.Render(fmt.Sprintf("x [%s] %s", cliErr.Code, cliErr.Message)))
+	if cliErr.Err != nil && cliErr.Err.Error() != cliErr.Message {
+		fmt.Println(DimStyle.Render(fmt.Sprintf("  Detail: %v", cliErr.Err)))
+	}
+
+	details, exists := ErrorRegistry[cliErr.Code]
+	if !exists {
+		details = ErrorRegistry[errors.ErrUnknown]
+	}
+
+	// Add dynamic suggestions if none are in the registry for unknown error
+	allSuggestions := append([]string{}, suggestions...)
+	allSuggestions = append(allSuggestions, details.Suggestions...)
+
+	if len(allSuggestions) > 0 {
 		fmt.Println()
-		fmt.Println(BrandStyle.Render("💡 Actionable suggestions to resolve this:"))
-		for _, s := range dynamicSuggestions {
+		fmt.Println(BrandStyle.Render(fmt.Sprintf("💡 Actionable suggestions to resolve this (%s):", details.Title)))
+		if details.Description != "" {
+			fmt.Println(DimStyle.Render(fmt.Sprintf("  %s", details.Description)))
+			fmt.Println()
+		}
+		for _, s := range allSuggestions {
 			fmt.Println(DimStyle.Render(fmt.Sprintf("  • %s", s)))
 		}
+		if details.QuickAction != "" {
+			fmt.Println()
+			fmt.Printf("  %s %s\n", LabelStyle.Render("Quick Run:"), ValueStyle.Render(details.QuickAction))
+		}
 	}
 
-	if strings.Contains(errStr, "status 500") {
+	if cliErr.Code == errors.ErrServerInternal || cliErr.Code == errors.ErrUnknown {
 		cmdStr := scrubCmdArgs(os.Args)
 		nowStr := time.Now().UTC().Format(time.RFC3339)
+		fmt.Println()
 		fmt.Println(BrandStyle.Render("📋 Copy-paste report for engineering@theseventeen.co:"))
 		fmt.Println(DimStyle.Render("--------------------------------------------------"))
 		fmt.Printf("Command Run: %s\n", cmdStr)
 		fmt.Printf("CLI Version: %s\n", CLIVersion)
 		fmt.Printf("Timestamp:   %s\n", nowStr)
-		fmt.Printf("Error:       %s\n", err.Error())
+		fmt.Printf("Error Code:  %s\n", cliErr.Code)
+		if cliErr.Err != nil {
+			fmt.Printf("Error:       %s\n", cliErr.Err.Error())
+		} else {
+			fmt.Printf("Error:       %s\n", cliErr.Message)
+		}
 		fmt.Printf("Platform:    %s/%s\n", runtime.GOOS, runtime.GOARCH)
 		fmt.Println(DimStyle.Render("--------------------------------------------------"))
 		fmt.Println()

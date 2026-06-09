@@ -18,6 +18,7 @@ import (
 	"github.com/The-17/agentsecrets/pkg/auth"
 	"github.com/The-17/agentsecrets/pkg/capabilities"
 	"github.com/The-17/agentsecrets/pkg/config"
+	"github.com/The-17/agentsecrets/pkg/errors"
 	"github.com/The-17/agentsecrets/pkg/keyring"
 	"github.com/The-17/agentsecrets/pkg/telemetry"
 )
@@ -395,7 +396,11 @@ func (e *Engine) Execute(req CallRequest) (*CallResult, error) {
 
 		cred, err := e.ResolveSecret(inj.SecretKey)
 		if err != nil {
-			return nil, fmt.Errorf("secret '%s' not found in keychain — run 'agentsecrets secrets list' to see available keys, or add it with 'agentsecrets secrets set %s=VALUE'", inj.SecretKey, inj.SecretKey)
+			return nil, errors.New(
+				errors.ErrSecretNotFound,
+				fmt.Sprintf("secret '%s' not found in keychain — run 'agentsecrets secrets list' to see available keys, or add it with 'agentsecrets secrets set %s=VALUE'", inj.SecretKey, inj.SecretKey),
+				err,
+			)
 		}
 
 		if err := Inject(outbound, cred, inj); err != nil {

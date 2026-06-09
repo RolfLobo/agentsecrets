@@ -14,6 +14,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/The-17/agentsecrets/pkg/errors"
 )
 
 // DefaultBaseURL is the SecretsCLI API endpoint
@@ -278,8 +280,13 @@ func (c *Client) DecodeError(resp *http.Response) error {
 		}
 	}
 
-	if resp.StatusCode == 401 {
-		return fmt.Errorf("%w. Your session may have expired. Please run 'agentsecrets login' to authenticate again.", baseErr)
+	switch resp.StatusCode {
+	case 401:
+		return errors.New(errors.ErrUnauthorized, fmt.Sprintf("%v. Your session may have expired. Please run 'agentsecrets login' to authenticate again.", baseErr), baseErr)
+	case 403:
+		return errors.New(errors.ErrForbidden, fmt.Sprintf("%v. Permission denied.", baseErr), baseErr)
+	case 500:
+		return errors.New(errors.ErrServerInternal, fmt.Sprintf("%v. Internal server error.", baseErr), baseErr)
 	}
 
 	return baseErr
