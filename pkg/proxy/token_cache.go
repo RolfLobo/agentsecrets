@@ -12,6 +12,7 @@ import (
 )
 
 type CachedToken struct {
+	TokenID      string
 	AgentID      string
 	AgentName    string
 	WorkspaceID  string
@@ -44,6 +45,7 @@ type verifyResponse struct {
 	ProjectID    string                         `json:"project_id,omitempty"`
 	Environment  string                         `json:"environment,omitempty"`
 	Capabilities capabilities.AgentCapabilities `json:"capabilities,omitempty"`
+	TokenID      string                         `json:"token_id,omitempty"`
 }
 
 func (c *TokenCache) Validate(token string, apiClient *api.Client) (*CachedToken, error) {
@@ -84,6 +86,7 @@ func (c *TokenCache) Validate(token string, apiClient *api.Client) (*CachedToken
 	}
 
 	cachedToken := &CachedToken{
+		TokenID:      res.TokenID,
 		AgentID:      res.AgentID,
 		AgentName:    res.AgentName,
 		WorkspaceID:  res.WorkspaceID,

@@ -236,7 +236,7 @@ func (e *Engine) Execute(req CallRequest) (*CallResult, error) {
 
 	if token != "" && req.Capabilities == nil {
 		req.IdentityLevel = "issued"
-		req.TokenID = token
+		req.TokenID = maskToken(token)
 
 		if e.TokenCache != nil && e.APIClient != nil {
 			cached, err := e.TokenCache.Validate(token, e.APIClient)
@@ -245,6 +245,9 @@ func (e *Engine) Execute(req CallRequest) (*CallResult, error) {
 			}
 			if req.AgentID == "" || req.AgentID == "cli" {
 				req.AgentID = cached.AgentName
+			}
+			if cached.TokenID != "" {
+				req.TokenID = cached.TokenID
 			}
 			req.Capabilities = &cached.Capabilities
 		}
@@ -359,9 +362,13 @@ func (e *Engine) Execute(req CallRequest) (*CallResult, error) {
 	}
 
 	// --- Enforce Secret-Level Policies ---
+	hasPolicy := false
 	if e.ResolvePolicy != nil {
 		for _, inj := range req.Injections {
 			policy, _ := e.ResolvePolicy(inj.SecretKey)
+			if policy != nil && (len(policy.Domains) > 0 || len(policy.Methods) > 0) {
+				hasPolicy = true
+			}
 			action := capabilities.EvaluateSecret(policy, targetDomain, method)
 
 			switch action {
@@ -538,7 +545,7 @@ func (e *Engine) Execute(req CallRequest) (*CallResult, error) {
 		if redacted {
 			outcome = "redacted"
 		}
-		enforcement := makeSuccessEnforcementBlock(targetDomain)
+		enforcement := makeSuccessEnforcementBlock(targetDomain, hasPolicy)
 		resolution := ResolutionBlock{
 			CredentialInjected: true,
 			InjectionStyle:     strings.Join(authStyles, ","),
@@ -700,7 +707,11 @@ func makeEnforcementBlock(reason, msg, targetDomain, method, agentID string, sec
 	}
 }
 
-func makeSuccessEnforcementBlock(targetDomain string) EnforcementBlock {
+func makeSuccessEnforcementBlock(targetDomain string, hasPolicy bool) EnforcementBlock {
+	reason := "no active policy set on this secret"
+	if hasPolicy {
+		reason = "request matches active secret policies"
+	}
 	return EnforcementBlock{
 		Decision:  "permitted",
 		DecidedBy: "secrets_policy",
@@ -718,7 +729,7 @@ func makeSuccessEnforcementBlock(targetDomain string) EnforcementBlock {
 			{
 				Layer:  "secrets_policy",
 				Result: "pass",
-				Reason: "request matches active secret policies",
+				Reason: reason,
 			},
 		},
 	}

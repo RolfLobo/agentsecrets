@@ -141,7 +141,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 
 	if agentToken != "" {
 		identityLevel = "issued"
-		tokenID = agentToken
+		tokenID = maskToken(agentToken)
 
 		// Validate token and extract capabilities
 		if s.TokenCache != nil && s.APIClient != nil {
@@ -152,6 +152,9 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 			}
 			if agentID == "" {
 				agentID = cached.AgentName
+			}
+			if cached.TokenID != "" {
+				tokenID = cached.TokenID
 			}
 			callReqCaps = &cached.Capabilities
 		}
@@ -334,4 +337,17 @@ func (s *Server) handleRotateSession(w http.ResponseWriter, r *http.Request) {
 		"status":  "ok",
 		"message": "session token rotated successfully",
 	})
+}
+
+func maskToken(token string) string {
+	if token == "" {
+		return ""
+	}
+	if strings.HasPrefix(token, "agt_") {
+		return token // DB IDs are safe to log in full
+	}
+	if len(token) <= 10 {
+		return "[REDACTED]"
+	}
+	return token[:6] + "..." + token[len(token)-4:]
 }

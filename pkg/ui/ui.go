@@ -70,7 +70,7 @@ var (
 	// Status key-value pair styling
 	KeyStyle = lipgloss.NewStyle().
 			Foreground(DimText).
-			Width(20)
+			Width(30)
 
 	ValStyle = lipgloss.NewStyle().
 			Foreground(White)

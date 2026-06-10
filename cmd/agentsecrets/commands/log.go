@@ -560,7 +560,7 @@ func showForensicLogDetail(fe *proxy.ForensicAuditEvent) {
 	fmt.Printf("FORENSIC LOG ENTRY  %s\n", fe.ID)
 	fmt.Println("─────────────────────────────────────────────────────────")
 	ui.StatusRow("Timestamp", fe.CreatedAt.Format("2006-01-02 15:04:05.000 MST"))
-	ui.StatusRow("Version", fe.Version)
+	ui.StatusRow("Schema Version", fe.Version)
 	ui.StatusRow("Workspace ID", fe.WorkspaceID)
 	ui.StatusRow("Project ID", fe.ProjectID)
 	ui.StatusRow("Chain Hash", fe.ChainHash)
