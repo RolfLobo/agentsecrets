@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/The-17/agentsecrets/pkg/api"
+	"github.com/The-17/agentsecrets/pkg/auth"
 	_ "github.com/glebarez/go-sqlite"
 	"github.com/google/uuid"
 )
@@ -702,6 +703,16 @@ func LogManagementEvent(method, domain, path, userEmail, workspaceID, projectID,
 		},
 	}
 
-	return logger.LogForensic(ev)
+	if err := logger.LogForensic(ev); err != nil {
+		return err
+	}
+
+	// Try to sync management events immediately to the cloud if we can authenticate
+	if apiClient := auth.NewAuthenticatedClient(); apiClient != nil {
+		logger.APIClient = apiClient
+		_ = logger.SyncUnpushedLogs()
+	}
+
+	return nil
 }
 

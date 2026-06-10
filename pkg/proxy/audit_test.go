@@ -119,3 +119,86 @@ func TestForensicLogAndChainVerification(t *testing.T) {
 		t.Logf("verification failed as expected: %v", err)
 	}
 }
+
+func TestLogManagementEvent(t *testing.T) {
+	// Create temporary directory for home redirect
+	tmpDir, err := os.MkdirTemp("", "agentsecrets-home-test")
+	if err != nil {
+		t.Fatalf("failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	// Save original env vars
+	origHome := os.Getenv("HOME")
+	origUserProfile := os.Getenv("USERPROFILE")
+
+	// Set home env vars to redirect DefaultLogPath
+	os.Setenv("HOME", tmpDir)
+	os.Setenv("USERPROFILE", tmpDir)
+	defer func() {
+		os.Setenv("HOME", origHome)
+		os.Setenv("USERPROFILE", origUserProfile)
+	}()
+
+	// 1. Log management event
+	err = proxy.LogManagementEvent(
+		"ADD",
+		"allowlist",
+		"Added domain test.com",
+		"user@example.com",
+		"ws-1",
+		"proj-1",
+		"dev",
+	)
+	if err != nil {
+		t.Fatalf("failed to log management event: %v", err)
+	}
+
+	// 2. Locate DB file path
+	dbPath := filepath.Join(tmpDir, ".agentsecrets", "audit.db")
+	if _, err := os.Stat(dbPath); os.IsNotExist(err) {
+		t.Fatalf("expected db file to be created at %s, but it does not exist", dbPath)
+	}
+
+	// 3. Open database and verify with LogService
+	logger, err := proxy.NewAuditLogger(dbPath)
+	if err != nil {
+		t.Fatalf("failed to open audit logger: %v", err)
+	}
+	defer logger.Close()
+
+	logSvc, err := log.NewService(nil, logger.DB())
+	if err != nil {
+		t.Fatalf("failed to create log service: %v", err)
+	}
+
+	// Verify chain integrity
+	if err := logSvc.VerifyChain(); err != nil {
+		t.Errorf("chain verification failed for management log: %v", err)
+	}
+
+	// Query local
+	events, err := logSvc.QueryLocal(log.Filter{})
+	if err != nil {
+		t.Fatalf("failed to query local logs: %v", err)
+	}
+
+	if len(events) != 1 {
+		t.Fatalf("expected 1 event, got %d", len(events))
+	}
+
+	ev := events[0]
+	if ev.IdentityLevel != "user" {
+		t.Errorf("expected identity level 'user', got '%s'", ev.IdentityLevel)
+	}
+	if ev.AgentID != "user@example.com" {
+		t.Errorf("expected agent ID 'user@example.com', got '%s'", ev.AgentID)
+	}
+	if ev.Method != "ADD" {
+		t.Errorf("expected method 'ADD', got '%s'", ev.Method)
+	}
+	if ev.TargetURL != "Added domain test.com" {
+		t.Errorf("expected target URL/action 'Added domain test.com', got '%s'", ev.TargetURL)
+	}
+}
+
