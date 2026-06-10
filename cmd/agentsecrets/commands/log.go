@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/The-17/agentsecrets/pkg/errors"
 	"github.com/The-17/agentsecrets/pkg/log"
 	"github.com/The-17/agentsecrets/pkg/proxy"
 	"github.com/The-17/agentsecrets/pkg/ui"
@@ -62,7 +63,7 @@ var logShowCmd = &cobra.Command{
 
 		entry, err := logService.GetLog(id)
 		if err != nil {
-			return err
+			return errors.New(errors.ErrLogNotFound, fmt.Sprintf("log entry %q not found locally", id), err)
 		}
 		showLogDetail(*entry)
 		return nil
@@ -718,7 +719,7 @@ var logReplayCmd = &cobra.Command{
 		id := args[0]
 		fe, err := logService.GetForensicLog(id)
 		if err != nil {
-			return fmt.Errorf("could not retrieve forensic log %s: %w", id, err)
+			return errors.New(errors.ErrLogNotFound, fmt.Sprintf("forensic log entry %q not found locally", id), err)
 		}
 
 		fmt.Println("─────────────────────────────────────────────────────────")

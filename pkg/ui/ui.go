@@ -27,9 +27,9 @@ var (
 	SuccessColor = lipgloss.Color("#34D399") // Emerald
 	ErrorColor   = lipgloss.Color("#F87171") // Red 400
 	WarningColor = lipgloss.Color("#FBBF24") // Amber 400
-	Dim          = lipgloss.Color("#6B7280") // Gray 500
-	White        = lipgloss.Color("#F9FAFB") // Gray 50
-	DimText      = lipgloss.Color("#9CA3AF") // Gray 400
+	Dim          = lipgloss.Color("8")       // ANSI Dark Gray / Bright Black
+	White        = lipgloss.Color("7")       // ANSI Light Gray / White
+	DimText      = lipgloss.Color("244")     // 256-color palette medium gray
 	FaintBorder  = lipgloss.Color("#1F2937") // Gray 800
 )
 
@@ -200,6 +200,15 @@ var ErrorRegistry = map[errors.ErrorCode]ErrorDetails{
 		Suggestions: []string{
 			"Run 'agentsecrets' in your terminal to trigger the auto-approval setup flow.",
 			"Verify the calling process name matches your approved shell / IDE binary path.",
+		},
+	},
+	errors.ErrLogNotFound: {
+		Title:       "Log Entry Not Found",
+		Description: "The requested log ID was not found in your local database.",
+		Suggestions: []string{
+			"Verify that you specified the actual Log ID (e.g. 'log_01J0A...'), not the list index number.",
+			"Run 'agentsecrets log' and enter the row index number interactively to view detailed forensic details.",
+			"Export all logs in JSON format via 'agentsecrets log export --since 24h --format jsonl' to find the correct Log ID.",
 		},
 	},
 	errors.ErrUnknown: {
