@@ -690,6 +690,17 @@ func SetSelectedEnvironment(env string) error {
 	return SaveGlobalConfig(c)
 }
 
+// parseExpiresAt parses an ISO 8601 / RFC 3339 timestamp, handling both
+// standard (no fractional seconds) and Python-style (microsecond-precision)
+// formats. Python's datetime.isoformat() produces timestamps like
+// "2026-06-11T06:29:32.123456+00:00" which time.RFC3339 rejects.
+func parseExpiresAt(s string) (time.Time, error) {
+	if t, err := time.Parse(time.RFC3339, s); err == nil {
+		return t, nil
+	}
+	return time.Parse(time.RFC3339Nano, s)
+}
+
 // IsTokenExpired returns true if the current access token is expired or close to expiring (within 5 minutes).
 func IsTokenExpired() bool {
 	tokens, err := LoadTokens()
@@ -699,7 +710,7 @@ func IsTokenExpired() bool {
 	if tokens.ExpiresAt == "" {
 		return false
 	}
-	exp, err := time.Parse(time.RFC3339, tokens.ExpiresAt)
+	exp, err := parseExpiresAt(tokens.ExpiresAt)
 	if err != nil {
 		return true
 	}
