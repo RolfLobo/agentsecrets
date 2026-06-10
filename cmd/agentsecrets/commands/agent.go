@@ -4,12 +4,15 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/charmbracelet/huh"
 	"github.com/spf13/cobra"
 	"github.com/The-17/agentsecrets/pkg/capabilities"
 
 	"github.com/The-17/agentsecrets/pkg/agents"
 	"github.com/The-17/agentsecrets/pkg/config"
+	"github.com/The-17/agentsecrets/pkg/keyring"
 	"github.com/The-17/agentsecrets/pkg/projects"
+	"github.com/The-17/agentsecrets/pkg/proxy"
 	"github.com/The-17/agentsecrets/pkg/ui"
 )
 
@@ -68,6 +71,9 @@ var agentRegisterCmd = &cobra.Command{
 			return fmt.Errorf("agent registration failed: %w", err)
 		}
 
+		cfg, _ := config.LoadGlobalConfig()
+		_ = proxy.LogManagementEvent("CREATE", "agent", fmt.Sprintf("Registered agent %s", resp.Agent.Name), cfg.Email, workspaceID, projectID, environment)
+
 		scope := "workspace"
 		if projectID != "" {
 			projService := projects.NewService(apiClient)
@@ -93,7 +99,24 @@ var agentRegisterCmd = &cobra.Command{
 		}
 
 		fmt.Println("\n" + ui.WarningStyle.Render("Store this token securely. It will not be shown again."))
-		fmt.Printf("To use it: export AS_AGENT_TOKEN=%s\n\n", resp.Token)
+		fmt.Printf("To use it: export AS_AGENT_TOKEN=%s\n", resp.Token)
+
+		var storeInKeychain bool
+		err = huh.NewConfirm().
+			Title("Would you like to store this agent token in your local OS Keychain?").
+			Description(fmt.Sprintf("This allows referencing it in your code via %s_TOKEN", strings.ToUpper(resp.Agent.Name))).
+			Value(&storeInKeychain).
+			Run()
+
+		if err == nil && storeInKeychain {
+			if err := keyring.SetAgentToken(resp.Agent.Name, resp.Token); err != nil {
+				ui.Error(fmt.Sprintf("Failed to store agent token in keychain: %v", err))
+			} else {
+				fmt.Println()
+				ui.Success(fmt.Sprintf("Stored agent token in keychain! You can now reference it via: %s_TOKEN", strings.ToUpper(resp.Agent.Name)))
+			}
+		}
+		fmt.Println()
 		return nil
 	},
 }
@@ -213,6 +236,9 @@ var agentTokenIssueCmd = &cobra.Command{
 			return fmt.Errorf("token issuance failed: %w", err)
 		}
 
+		cfg, _ := config.LoadGlobalConfig()
+		_ = proxy.LogManagementEvent("ISSUE", "token", fmt.Sprintf("Issued token for agent %s", name), cfg.Email, workspaceID, "", environment)
+
 		fmt.Println("\n" + ui.SuccessStyle.Render("Token issued"))
 		fmt.Printf("  Agent    %s\n", name)
 		fmt.Printf("  Token    %s\n", resp.Token)
@@ -223,6 +249,23 @@ var agentTokenIssueCmd = &cobra.Command{
 			fmt.Printf("  Expires  %s\n", resp.ExpiresAt.Format("2006-01-02"))
 		}
 		fmt.Println("\n" + ui.WarningStyle.Render("Store this token securely. It will not be shown again."))
+
+		var storeInKeychain bool
+		err = huh.NewConfirm().
+			Title("Would you like to store this agent token in your local OS Keychain?").
+			Description(fmt.Sprintf("This allows referencing it in your code via %s_TOKEN", strings.ToUpper(name))).
+			Value(&storeInKeychain).
+			Run()
+
+		if err == nil && storeInKeychain {
+			if err := keyring.SetAgentToken(name, resp.Token); err != nil {
+				ui.Error(fmt.Sprintf("Failed to store agent token in keychain: %v", err))
+			} else {
+				fmt.Println()
+				ui.Success(fmt.Sprintf("Stored agent token in keychain! You can now reference it via: %s_TOKEN", strings.ToUpper(name)))
+			}
+		}
+		fmt.Println()
 		return nil
 	},
 }
@@ -382,6 +425,14 @@ var agentDeleteCmd = &cobra.Command{
 		if err != nil {
 			return fmt.Errorf("failed to delete agent: %w", err)
 		}
+
+		cfg, _ := config.LoadGlobalConfig()
+		var projectID string
+		if agent.ProjectID != nil {
+			projectID = *agent.ProjectID
+		}
+		_ = proxy.LogManagementEvent("DELETE", "agent", fmt.Sprintf("Deleted agent %s", name), cfg.Email, workspaceID, projectID, config.ResolveEnvironment())
+
 		fmt.Println("\nAgent deleted.")
 		return nil
 	},
@@ -528,6 +579,13 @@ var agentPolicySetCmd = &cobra.Command{
 		if err != nil {
 			return fmt.Errorf("failed to set agent policy: %w", err)
 		}
+
+		cfg, _ := config.LoadGlobalConfig()
+		var projectID string
+		if agent.ProjectID != nil {
+			projectID = *agent.ProjectID
+		}
+		_ = proxy.LogManagementEvent("UPDATE", "policy", fmt.Sprintf("Updated policy for agent %s", name), cfg.Email, workspaceID, projectID, config.ResolveEnvironment())
 
 		fmt.Println("\n" + ui.SuccessStyle.Render("Agent policy updated successfully"))
 		return nil

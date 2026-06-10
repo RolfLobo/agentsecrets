@@ -562,6 +562,46 @@ func DeleteUserTokens() error {
 	return nil
 }
 
+// SetAgentToken stores an agent token in the OS keychain.
+func SetAgentToken(agentName, token string) error {
+	name := "agent_token_" + agentName
+	if useFileBackend {
+		encoded := base64.StdEncoding.EncodeToString([]byte(token))
+		return fileSet(name, encoded, "")
+	}
+	if err := gokeyring.Set(serviceName, name, token); err != nil {
+		return fmt.Errorf("failed to store agent token for %s in keychain: %w", agentName, err)
+	}
+	return nil
+}
+
+// GetAgentToken retrieves an agent token from the OS keychain.
+func GetAgentToken(agentName string) (string, error) {
+	name := "agent_token_" + agentName
+	if useFileBackend {
+		v, err := fileGetKey(name, "private")
+		if err != nil {
+			return "", err
+		}
+		return string(v), nil
+	}
+	val, err := gokeyring.Get(serviceName, name)
+	if err != nil {
+		return "", err
+	}
+	return val, nil
+}
+
+// DeleteAgentToken removes an agent token from the OS keychain.
+func DeleteAgentToken(agentName string) error {
+	name := "agent_token_" + agentName
+	if useFileBackend {
+		return fileDelete(name)
+	}
+	_ = gokeyring.Delete(serviceName, name)
+	return nil
+}
+
 // SetWorkspaceKey stores the base64-encoded workspace key in the OS keychain.
 func SetWorkspaceKey(workspaceID, keyB64 string) error {
 	name := "workspace_key_" + workspaceID

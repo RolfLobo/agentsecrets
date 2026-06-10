@@ -3,11 +3,13 @@ package commands
 import (
 	"encoding/json"
 	"fmt"
+	"os"
 	"strings"
 
 	"github.com/spf13/cobra"
 
 	"github.com/The-17/agentsecrets/pkg/proxy"
+	"github.com/The-17/agentsecrets/pkg/ui"
 )
 
 var (
@@ -152,10 +154,12 @@ func runCall(cmd *cobra.Command, args []string) error {
 				msg = errData.Error
 			}
 			if msg != "" {
-				return fmt.Errorf("%s", msg)
+				fmt.Fprintln(os.Stderr, ui.ErrorStyle.Render("x "+msg))
+				os.Exit(1)
 			}
 		}
-		return fmt.Errorf("API call failed with HTTP %d:\n%s", result.StatusCode, string(result.Body))
+		fmt.Fprintf(os.Stderr, "%s\n%s\n", ui.ErrorStyle.Render(fmt.Sprintf("x API call failed with HTTP %d:", result.StatusCode)), string(result.Body))
+		os.Exit(1)
 	}
 
 	// Print response (clean stdout for piping)

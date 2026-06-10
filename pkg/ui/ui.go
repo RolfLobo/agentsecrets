@@ -206,7 +206,7 @@ var ErrorRegistry = map[errors.ErrorCode]ErrorDetails{
 		Title:       "Unexpected Error",
 		Description: "The command failed with an unhandled runtime error.",
 		Suggestions: []string{
-			"Check the exact error trace below for clues.",
+			"Check the error details above for troubleshooting clues.",
 			"Submit a copy-paste report to engineering@theseventeen.co to help resolve this issue.",
 		},
 	},

@@ -12,6 +12,7 @@ import (
 
 	"github.com/The-17/agentsecrets/pkg/config"
 	"github.com/The-17/agentsecrets/pkg/keyring"
+	"github.com/The-17/agentsecrets/pkg/proxy"
 	"github.com/The-17/agentsecrets/pkg/ui"
 	"github.com/The-17/agentsecrets/pkg/workspaces"
 )
@@ -135,6 +136,17 @@ func runAllowlistAdd(_ *cobra.Command, args []string) error {
 	cfg, _ := config.LoadGlobalConfig()
 	wsName := cfg.Workspaces[workspaceID].Name
 	ui.Success(fmt.Sprintf("%s added to %s allowlist", strings.Join(domains, ", "), wsName))
+
+	var projectID string
+	if pc, err := config.LoadProjectConfig(); err == nil && pc != nil {
+		projectID = pc.ProjectID
+	} else {
+		projectID = cfg.SelectedProjectID
+	}
+	for _, d := range domains {
+		_ = proxy.LogManagementEvent("ADD", "allowlist", fmt.Sprintf("Added domain %s", d), cfg.Email, workspaceID, projectID, config.ResolveEnvironment())
+	}
+
 	return nil
 }
 
@@ -173,6 +185,15 @@ func runAllowlistRemove(_ *cobra.Command, args []string) error {
 	cfg, _ := config.LoadGlobalConfig()
 	wsName := cfg.Workspaces[workspaceID].Name
 	ui.Success(fmt.Sprintf("%s removed from %s allowlist", domain, wsName))
+
+	var projectID string
+	if pc, err := config.LoadProjectConfig(); err == nil && pc != nil {
+		projectID = pc.ProjectID
+	} else {
+		projectID = cfg.SelectedProjectID
+	}
+	_ = proxy.LogManagementEvent("REMOVE", "allowlist", fmt.Sprintf("Removed domain %s", domain), cfg.Email, workspaceID, projectID, config.ResolveEnvironment())
+
 	return nil
 }
 

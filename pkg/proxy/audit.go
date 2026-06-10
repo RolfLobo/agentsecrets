@@ -666,3 +666,42 @@ func (a *AuditLogger) LogForensic(event ForensicAuditEvent) error {
 	return err
 }
 
+// LogManagementEvent logs a workspace management action to the local forensic database.
+func LogManagementEvent(method, domain, path, userEmail, workspaceID, projectID, environment string) error {
+	logger, err := NewAuditLogger("")
+	if err != nil {
+		return err
+	}
+	defer logger.Close()
+
+	ev := ForensicAuditEvent{
+		ID:          "log_" + strings.ReplaceAll(uuid.New().String(), "-", ""),
+		Version:     "2",
+		CreatedAt:   time.Now().UTC(),
+		WorkspaceID: workspaceID,
+		ProjectID:   projectID,
+		Event: EventBlock{
+			Type:        "management",
+			Domain:      domain,
+			Path:        path,
+			Method:      method,
+			StatusCode:  200,
+			Outcome:     "success",
+			Environment: environment,
+			AgentIdentity: &AgentIdentity{
+				TokenName:     userEmail,
+				IdentityLevel: "user",
+			},
+		},
+		Enforcement: EnforcementBlock{
+			Decision:  "permitted",
+			DecidedBy: "local cli",
+		},
+		Resolution: ResolutionBlock{
+			ResponseStatus: 200,
+		},
+	}
+
+	return logger.LogForensic(ev)
+}
+

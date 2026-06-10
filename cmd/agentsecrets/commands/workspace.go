@@ -9,6 +9,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/The-17/agentsecrets/pkg/config"
+	"github.com/The-17/agentsecrets/pkg/proxy"
 	"github.com/The-17/agentsecrets/pkg/ui"
 	"github.com/The-17/agentsecrets/pkg/workspaces"
 )
@@ -183,6 +184,14 @@ func runWorkspaceSwitch(_ *cobra.Command, args []string) error {
 		return fmt.Errorf("failed to update active workspace: %w", err)
 	}
 
+	var projectID string
+	if pc, err := config.LoadProjectConfig(); err == nil && pc != nil {
+		projectID = pc.ProjectID
+	} else {
+		projectID = cfg.SelectedProjectID
+	}
+	_ = proxy.LogManagementEvent("SWITCH", "workspace", fmt.Sprintf("Switched active workspace to %s", cfg.Workspaces[selectedID].Name), cfg.Email, selectedID, projectID, config.ResolveEnvironment())
+
 	ui.Success(fmt.Sprintf("Switched to workspace: %s", cfg.Workspaces[selectedID].Name))
 	return nil
 }
@@ -205,6 +214,16 @@ func runWorkspaceCreate(_ *cobra.Command, args []string) error {
 	}); err != nil {
 		return err
 	}
+
+	cfg, _ := config.LoadGlobalConfig()
+	newWorkspaceID := cfg.SelectedWorkspaceID
+	var projectID string
+	if pc, err := config.LoadProjectConfig(); err == nil && pc != nil {
+		projectID = pc.ProjectID
+	} else {
+		projectID = cfg.SelectedProjectID
+	}
+	_ = proxy.LogManagementEvent("CREATE", "workspace", fmt.Sprintf("Created workspace %s", name), cfg.Email, newWorkspaceID, projectID, config.ResolveEnvironment())
 
 	ui.Success(fmt.Sprintf("Workspace %s created and selected!", name))
 	return nil
@@ -284,6 +303,14 @@ func runWorkspaceInvite(_ *cobra.Command, args []string) error {
 		} else {
 			ui.Success(fmt.Sprintf("  ✓ %s invited", r.Email))
 			hasSuccess = true
+
+			var projectID string
+			if pc, err := config.LoadProjectConfig(); err == nil && pc != nil {
+				projectID = pc.ProjectID
+			} else {
+				projectID = cfg.SelectedProjectID
+			}
+			_ = proxy.LogManagementEvent("INVITE", "workspace", fmt.Sprintf("Invited member %s", r.Email), cfg.Email, workspaceID, projectID, config.ResolveEnvironment())
 		}
 	}
 
@@ -353,6 +380,15 @@ func runWorkspaceRemove(_ *cobra.Command, args []string) error {
 		return err
 	}
 
+	cfg, _ := config.LoadGlobalConfig()
+	var projectID string
+	if pc, err := config.LoadProjectConfig(); err == nil && pc != nil {
+		projectID = pc.ProjectID
+	} else {
+		projectID = cfg.SelectedProjectID
+	}
+	_ = proxy.LogManagementEvent("REMOVE", "workspace", fmt.Sprintf("Removed member %s", email), cfg.Email, workspaceID, projectID, config.ResolveEnvironment())
+
 	ui.Success(fmt.Sprintf("Removed %s from workspace.", email))
 	return nil
 }
@@ -405,6 +441,14 @@ func runWorkspacePromote(_ *cobra.Command, args []string) error {
 		return err
 	}
 
+	var projectID string
+	if pc, err := config.LoadProjectConfig(); err == nil && pc != nil {
+		projectID = pc.ProjectID
+	} else {
+		projectID = cfg.SelectedProjectID
+	}
+	_ = proxy.LogManagementEvent("PROMOTE", "workspace", fmt.Sprintf("Promoted member %s", email), cfg.Email, workspaceID, projectID, config.ResolveEnvironment())
+
 	ui.Success(fmt.Sprintf("%s is now an admin of %s", email, cfg.Workspaces[workspaceID].Name))
 	return nil
 }
@@ -437,6 +481,14 @@ func runWorkspaceDemote(_ *cobra.Command, args []string) error {
 	}); err != nil {
 		return err
 	}
+
+	var projectID2 string
+	if pc, err := config.LoadProjectConfig(); err == nil && pc != nil {
+		projectID2 = pc.ProjectID
+	} else {
+		projectID2 = cfg.SelectedProjectID
+	}
+	_ = proxy.LogManagementEvent("DEMOTE", "workspace", fmt.Sprintf("Demoted member %s", email), cfg.Email, workspaceID, projectID2, config.ResolveEnvironment())
 
 	ui.Success(fmt.Sprintf("%s is now a member of %s", email, cfg.Workspaces[workspaceID].Name))
 	return nil

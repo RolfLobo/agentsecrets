@@ -224,6 +224,16 @@ func (e *Engine) Execute(req CallRequest) (*CallResult, error) {
 		token = os.Getenv("AS_AGENT_TOKEN")
 	}
 
+	// Resolve agent token references like <AGENTNAME>_TOKEN from the OS keychain
+	if token != "" && strings.HasSuffix(strings.ToUpper(token), "_TOKEN") && len(token) > 6 {
+		agentName := token[:len(token)-6]
+		retrievedToken, err := keyring.GetAgentToken(agentName)
+		if err != nil {
+			return nil, fmt.Errorf("agent token reference %q was not found in the OS Keychain. Please run 'agentsecrets agent token issue %s' to create and save it in your keychain first", token, agentName)
+		}
+		token = retrievedToken
+	}
+
 	if token != "" && req.Capabilities == nil {
 		req.IdentityLevel = "issued"
 		req.TokenID = token

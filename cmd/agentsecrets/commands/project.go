@@ -11,6 +11,7 @@ import (
 	"github.com/The-17/agentsecrets/pkg/api"
 	"github.com/The-17/agentsecrets/pkg/config"
 	"github.com/The-17/agentsecrets/pkg/projects"
+	"github.com/The-17/agentsecrets/pkg/proxy"
 	"github.com/The-17/agentsecrets/pkg/ui"
 )
 
@@ -177,6 +178,10 @@ func runProjectCreate(cmd *cobra.Command, args []string) error {
 		return nil
 	}
 
+	cfg, _ := config.LoadGlobalConfig()
+	workspaceID := config.GetSelectedWorkspaceID()
+	_ = proxy.LogManagementEvent("CREATE", "project", fmt.Sprintf("Created project %s", created.Name), cfg.Email, workspaceID, created.ID, config.ResolveEnvironment())
+
 	fmt.Println()
 	ui.Success(fmt.Sprintf("Project '%s' created and selected!", created.Name))
 	return nil
@@ -235,6 +240,10 @@ func runProjectUse(cmd *cobra.Command, args []string) error {
 		return nil
 	}
 
+	cfg, _ := config.LoadGlobalConfig()
+	workspaceID := config.GetSelectedWorkspaceID()
+	_ = proxy.LogManagementEvent("LINK", "project", fmt.Sprintf("Linked directory to project %s", used.Name), cfg.Email, workspaceID, used.ID, config.ResolveEnvironment())
+
 	fmt.Println()
 	ui.Success(fmt.Sprintf("Now using project '%s'!", used.Name))
 	return nil
@@ -284,6 +293,23 @@ func runProjectUpdate(cmd *cobra.Command, args []string) error {
 		return nil
 	}
 
+	var projectID string
+	if list, err := projectService.List(); err == nil {
+		for _, p := range list {
+			if p.Name == oldName || p.ID == oldName {
+				projectID = p.ID
+				break
+			}
+		}
+	}
+	cfg, _ := config.LoadGlobalConfig()
+	workspaceID := config.GetSelectedWorkspaceID()
+	targetName := oldName
+	if newName != "" {
+		targetName = newName
+	}
+	_ = proxy.LogManagementEvent("UPDATE", "project", fmt.Sprintf("Updated project %s", targetName), cfg.Email, workspaceID, projectID, config.ResolveEnvironment())
+
 	ui.Success(fmt.Sprintf("Project '%s' updated!", oldName))
 	return nil
 }
@@ -312,12 +338,26 @@ func runProjectDelete(cmd *cobra.Command, args []string) error {
 		return nil
 	}
 
+	var projectID string
+	if list, err := projectService.List(); err == nil {
+		for _, p := range list {
+			if p.Name == name || p.ID == name {
+				projectID = p.ID
+				break
+			}
+		}
+	}
+
 	if err := ui.Spinner(fmt.Sprintf("Deleting project '%s'...", name), func() error {
 		return projectService.Delete(name)
 	}); err != nil {
 		ui.Error("Failed to delete project: " + err.Error())
 		return nil
 	}
+
+	cfg, _ := config.LoadGlobalConfig()
+	workspaceID := config.GetSelectedWorkspaceID()
+	_ = proxy.LogManagementEvent("DELETE", "project", fmt.Sprintf("Deleted project %s", name), cfg.Email, workspaceID, projectID, config.ResolveEnvironment())
 
 	ui.Success(fmt.Sprintf("Project '%s' deleted!", name))
 	return nil

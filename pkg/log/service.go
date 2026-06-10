@@ -101,6 +101,12 @@ func mapForensicToLegacy(fe proxy.ForensicAuditEvent) proxy.AuditEvent {
 		identityLevel = fe.Event.AgentIdentity.IdentityLevel
 	}
 
+	targetURL := "https://" + fe.Event.Domain + fe.Event.Path
+	if fe.Event.Type == "management" {
+		targetURL = fe.Event.Path
+		identityLevel = "user"
+	}
+
 	return proxy.AuditEvent{
 		ID:             fe.ID,
 		Timestamp:      fe.CreatedAt,
@@ -109,7 +115,7 @@ func mapForensicToLegacy(fe proxy.ForensicAuditEvent) proxy.AuditEvent {
 		AgentID:        agentID,
 		IdentityLevel:  identityLevel,
 		Method:         fe.Event.Method,
-		TargetURL:      "https://" + fe.Event.Domain + fe.Event.Path,
+		TargetURL:      targetURL,
 		Domain:         fe.Event.Domain,
 		AuthStyles:     authStyles,
 		StatusCode:     fe.Event.StatusCode,
