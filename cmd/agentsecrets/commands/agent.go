@@ -102,13 +102,18 @@ var agentRegisterCmd = &cobra.Command{
 		fmt.Printf("To use it: export AS_AGENT_TOKEN=%s\n", resp.Token)
 
 		var storeInKeychain bool
-		err = huh.NewConfirm().
-			Title("Would you like to store this agent token in your local OS Keychain?").
-			Description(fmt.Sprintf("This allows referencing it in your code via %s_TOKEN", strings.ToUpper(resp.Agent.Name))).
-			Value(&storeInKeychain).
-			Run()
+		var confirmErr error
+		if cmd.Flags().Changed("save-token") {
+			storeInKeychain, _ = cmd.Flags().GetBool("save-token")
+		} else {
+			confirmErr = huh.NewConfirm().
+				Title("Would you like to store this agent token in your local OS Keychain?").
+				Description(fmt.Sprintf("This allows referencing it in your code via %s_TOKEN", strings.ToUpper(resp.Agent.Name))).
+				Value(&storeInKeychain).
+				Run()
+		}
 
-		if err == nil && storeInKeychain {
+		if confirmErr == nil && storeInKeychain {
 			if err := keyring.SetAgentToken(resp.Agent.Name, resp.Token); err != nil {
 				ui.Error(fmt.Sprintf("Failed to store agent token in keychain: %v", err))
 			} else {
@@ -251,13 +256,18 @@ var agentTokenIssueCmd = &cobra.Command{
 		fmt.Println("\n" + ui.WarningStyle.Render("Store this token securely. It will not be shown again."))
 
 		var storeInKeychain bool
-		err = huh.NewConfirm().
-			Title("Would you like to store this agent token in your local OS Keychain?").
-			Description(fmt.Sprintf("This allows referencing it in your code via %s_TOKEN", strings.ToUpper(name))).
-			Value(&storeInKeychain).
-			Run()
+		var confirmErr error
+		if cmd.Flags().Changed("save-token") {
+			storeInKeychain, _ = cmd.Flags().GetBool("save-token")
+		} else {
+			confirmErr = huh.NewConfirm().
+				Title("Would you like to store this agent token in your local OS Keychain?").
+				Description(fmt.Sprintf("This allows referencing it in your code via %s_TOKEN", strings.ToUpper(name))).
+				Value(&storeInKeychain).
+				Run()
+		}
 
-		if err == nil && storeInKeychain {
+		if confirmErr == nil && storeInKeychain {
 			if err := keyring.SetAgentToken(name, resp.Token); err != nil {
 				ui.Error(fmt.Sprintf("Failed to store agent token in keychain: %v", err))
 			} else {
@@ -463,6 +473,7 @@ func init() {
 	agentRegisterCmd.Flags().StringP("expires", "e", "", "token expiry (e.g. 30d, 90d)")
 	agentRegisterCmd.Flags().String("env", "", "environment for the token (development, staging, production)")
 	agentRegisterCmd.Flags().Bool("output-json", false, "output as JSON instead of formatted text") // Add this if needed later
+	agentRegisterCmd.Flags().Bool("save-token", false, "save the issued token to the OS Keychain without prompting")
 
 	// Flags for list
 	agentListCmd.Flags().StringP("project", "p", "", "filter to a specific project")
@@ -473,6 +484,7 @@ func init() {
 	agentTokenIssueCmd.Flags().StringP("expires", "e", "", "token expiry (e.g. 30d, 90d)")
 	agentTokenIssueCmd.Flags().String("env", "", "environment for the token (development, staging, production)")
 	agentTokenIssueCmd.Flags().Bool("output-json", false, "output as JSON")
+	agentTokenIssueCmd.Flags().Bool("save-token", false, "save the issued token to the OS Keychain without prompting")
 
 	// Flags for token list
 	agentTokenListCmd.Flags().Bool("output-json", false, "output as JSON")
