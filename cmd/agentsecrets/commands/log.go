@@ -17,6 +17,13 @@ import (
 	"github.com/spf13/cobra"
 )
 
+func displayTokenID(id string) string {
+	if len(id) <= 8 {
+		return id
+	}
+	return id[:4] + "..." + id[len(id)-4:]
+}
+
 var (
 	logService  *log.Service
 	logPageSize = 20

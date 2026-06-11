@@ -9,6 +9,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/The-17/agentsecrets/pkg/config"
+	"github.com/The-17/agentsecrets/pkg/errors"
 	"github.com/The-17/agentsecrets/pkg/ui"
 )
 
@@ -17,18 +18,18 @@ import (
 // assuming a valid refresh token exists.
 func (s *Service) EnsureAuth(cmd *cobra.Command, args []string) error {
 	if !config.IsAuthenticated() {
-		return fmt.Errorf("you must be logged in to perform this action. Run 'agentsecrets login'")
+		return errors.New(errors.ErrUnauthorized, "you must be logged in to perform this action", nil)
 	}
 
 	if config.IsTokenExpired() {
 		tokens, err := config.LoadTokens()
 		if err != nil || tokens == nil || tokens.RefreshToken == "" {
-			return fmt.Errorf("session expired, please run 'agentsecrets login' again")
+			return errors.New(errors.ErrUnauthorized, "session expired, please run 'agentsecrets login' again", nil)
 		}
 		if err := ui.Spinner("Refreshing expired session token...", func() error {
 			return s.RefreshSession(tokens.RefreshToken)
 		}); err != nil {
-			return fmt.Errorf("session refresh failed, you may need to log in again: %w", err)
+			return errors.New(errors.ErrUnauthorized, "session refresh failed, you may need to log in again", err)
 		}
 	}
 

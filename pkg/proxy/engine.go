@@ -824,13 +824,9 @@ func (e *Engine) logForensic(
 	// 8. Build Agent Identity
 	var agentIdentity *AgentIdentity
 	if req.AgentToken != "" || req.TokenID != "" {
-		tokenVal := req.AgentToken
-		if tokenVal == "" {
-			tokenVal = req.TokenID
-		}
 		agentIdentity = &AgentIdentity{
 			TokenName:       req.AgentID,
-			TokenID:         tokenVal,
+			TokenID:         req.TokenID,
 			IdentityLevel:   req.IdentityLevel,
 			ProcessVerified: true,
 		}
