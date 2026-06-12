@@ -38,6 +38,10 @@ var statusCmd = &cobra.Command{
 			return nil
 		}
 
+		if err := keychainAuthMiddleware(cmd, args); err != nil {
+			return err
+		}
+
 		email := config.GetEmail()
 		ui.StatusRow("Logged in as:", email)
 
