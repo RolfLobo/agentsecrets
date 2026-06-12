@@ -105,7 +105,6 @@ func init() {
 	// The keychainAuthMiddleware (currently auth-only) handles this.
 	secretsCmd.PersistentPreRunE = keychainAuthMiddleware
 	callCmd.PersistentPreRunE = keychainAuthMiddleware
-	statusCmd.PersistentPreRunE = keychainAuthMiddleware
 
 	rootCmd.AddCommand(workspaceCmd)
 	rootCmd.AddCommand(projectCmd)
