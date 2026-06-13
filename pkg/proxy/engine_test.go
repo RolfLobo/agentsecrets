@@ -8,6 +8,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/The-17/agentsecrets/pkg/capabilities"
 )
@@ -624,6 +625,155 @@ func TestEngineAllowlistEnforcement(t *testing.T) {
 	}
 	if res.StatusCode != 200 {
 		t.Errorf("expected 200 for allowed domain, got %d", res.StatusCode)
+	}
+}
+
+func TestEnginePresenceCheck(t *testing.T) {
+	engine := &Engine{
+		ProjectID: "test-project",
+		ResolvePresence: func(key string) (bool, error) {
+			if key == "KNOWN_KEY" {
+				return true, nil
+			}
+			return false, nil
+		},
+		ResolveSecret: mockResolver(map[string]string{
+			"KNOWN_KEY": "val",
+		}),
+		ResolveAllowlist: mockAllowlist("allowed.com"),
+	}
+
+	// 1. Known key - passes presence check
+	engine.Client = &http.Client{
+		Transport: RoundTripFunc(func(req *http.Request) (*http.Response, error) {
+			w := httptest.NewRecorder()
+			w.WriteHeader(200)
+			return w.Result(), nil
+		}),
+	}
+	res, err := engine.Execute(CallRequest{
+		TargetURL:  "https://allowed.com/v1",
+		Method:     "GET",
+		Injections: []Injection{{Style: "bearer", SecretKey: "KNOWN_KEY"}},
+	})
+	if err != nil {
+		t.Fatalf("Execute failed: %v", err)
+	}
+	if res.StatusCode != 200 {
+		t.Errorf("expected 200, got %d", res.StatusCode)
+	}
+
+	// 2. Unknown key - blocks immediately with error
+	_, err = engine.Execute(CallRequest{
+		TargetURL:  "https://allowed.com/v1",
+		Method:     "GET",
+		Injections: []Injection{{Style: "bearer", SecretKey: "UNKNOWN_KEY"}},
+	})
+	if err == nil {
+		t.Fatal("expected error for unknown key")
+	}
+	if !strings.Contains(err.Error(), "UNKNOWN_KEY") {
+		t.Errorf("expected error message to mention key, got: %v", err)
+	}
+}
+
+func TestEngineAgentWorkspaceMismatch(t *testing.T) {
+	tc := NewTokenCache(5 * time.Minute)
+	tc.tokens["agent-token-123"] = &CachedToken{
+		TokenID:     "tok_123",
+		AgentID:     "agent_id_1",
+		AgentName:   "test-agent",
+		WorkspaceID: "other-workspace",
+		ProjectID:   "test-project",
+		ValidatedAt: time.Now(),
+	}
+
+	engine := &Engine{
+		ProjectID:        "test-project",
+		WorkspaceID:      "my-workspace",
+		TokenCache:       tc,
+		ResolveSecret:    mockResolver(map[string]string{"SECRET_A": "val_a"}),
+		ResolveAllowlist: mockAllowlist("allowed.com"),
+	}
+
+	res, err := engine.Execute(CallRequest{
+		TargetURL:  "https://allowed.com/v1",
+		Method:     "GET",
+		Injections: []Injection{{Style: "bearer", SecretKey: "SECRET_A"}},
+		AgentToken: "agent-token-123",
+	})
+	if err != nil {
+		t.Fatalf("Execute failed: %v", err)
+	}
+	if res.StatusCode != 403 {
+		t.Errorf("expected 403 workspace mismatch, got %d", res.StatusCode)
+	}
+}
+
+func TestEngineAgentProjectMismatch(t *testing.T) {
+	tc := NewTokenCache(5 * time.Minute)
+	tc.tokens["agent-token-123"] = &CachedToken{
+		TokenID:     "tok_123",
+		AgentID:     "agent_id_1",
+		AgentName:   "test-agent",
+		WorkspaceID: "my-workspace",
+		ProjectID:   "other-project",
+		ValidatedAt: time.Now(),
+	}
+
+	engine := &Engine{
+		ProjectID:        "test-project",
+		WorkspaceID:      "my-workspace",
+		TokenCache:       tc,
+		ResolveSecret:    mockResolver(map[string]string{"SECRET_A": "val_a"}),
+		ResolveAllowlist: mockAllowlist("allowed.com"),
+	}
+
+	res, err := engine.Execute(CallRequest{
+		TargetURL:  "https://allowed.com/v1",
+		Method:     "GET",
+		Injections: []Injection{{Style: "bearer", SecretKey: "SECRET_A"}},
+		AgentToken: "agent-token-123",
+	})
+	if err != nil {
+		t.Fatalf("Execute failed: %v", err)
+	}
+	if res.StatusCode != 403 {
+		t.Errorf("expected 403 project mismatch, got %d", res.StatusCode)
+	}
+}
+
+func TestEngineAgentEnvironmentMismatch(t *testing.T) {
+	tc := NewTokenCache(5 * time.Minute)
+	tc.tokens["agent-token-123"] = &CachedToken{
+		TokenID:     "tok_123",
+		AgentID:     "agent_id_1",
+		AgentName:   "test-agent",
+		WorkspaceID: "my-workspace",
+		ProjectID:   "test-project",
+		Environment: "production",
+		ValidatedAt: time.Now(),
+	}
+
+	engine := &Engine{
+		ProjectID:        "test-project",
+		WorkspaceID:      "my-workspace",
+		TokenCache:       tc,
+		ResolveSecret:    mockResolver(map[string]string{"SECRET_A": "val_a"}),
+		ResolveAllowlist: mockAllowlist("allowed.com"),
+	}
+
+	res, err := engine.Execute(CallRequest{
+		TargetURL:  "https://allowed.com/v1",
+		Method:     "GET",
+		Injections: []Injection{{Style: "bearer", SecretKey: "SECRET_A"}},
+		AgentToken: "agent-token-123",
+	})
+	if err != nil {
+		t.Fatalf("Execute failed: %v", err)
+	}
+	if res.StatusCode != 403 {
+		t.Errorf("expected 403 environment mismatch, got %d", res.StatusCode)
 	}
 }
 

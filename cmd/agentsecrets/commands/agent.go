@@ -39,6 +39,9 @@ var agentRegisterCmd = &cobra.Command{
 	Short: "Register a new agent and issue its first token",
 	Args:  cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
+		if err := verifyPasswordLocally(); err != nil {
+			return err
+		}
 		name := args[0]
 		projectFlag, _ := cmd.Flags().GetString("project")
 		label, _ := cmd.Flags().GetString("label")
@@ -159,18 +162,21 @@ var agentListCmd = &cobra.Command{
 				return fmt.Errorf("failed to list agents: %w", err)
 			}
 		} else {
-			// Fetch workspace-scoped agents
-			list, err = agentService.List(workspaceID, "")
+			// Fetch all agents (workspace and project-scoped) in a single fast call
+			list, err = agentService.ListAll(workspaceID)
 			if err != nil {
-				return fmt.Errorf("failed to list agents: %w", err)
-			}
+				// Fallback to sequential listing if backend does not support include_projects
+				list, err = agentService.List(workspaceID, "")
+				if err != nil {
+					return fmt.Errorf("failed to list agents: %w", err)
+				}
 
-			// Fetch project-scoped agents across all projects using the loaded list
-			for _, p := range projectsList {
-				if p.WorkspaceID == workspaceID {
-					projAgents, err := agentService.List(workspaceID, p.ID)
-					if err == nil {
-						list = append(list, projAgents...)
+				for _, p := range projectsList {
+					if p.WorkspaceID == workspaceID {
+						projAgents, err := agentService.List(workspaceID, p.ID)
+						if err == nil {
+							list = append(list, projAgents...)
+						}
 					}
 				}
 			}
@@ -213,6 +219,9 @@ var agentTokenIssueCmd = &cobra.Command{
 	Short: "Issue a new token for an existing agent",
 	Args:  cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
+		if err := verifyPasswordLocally(); err != nil {
+			return err
+		}
 		name := args[0]
 		label, _ := cmd.Flags().GetString("label")
 		expires, _ := cmd.Flags().GetString("expires")

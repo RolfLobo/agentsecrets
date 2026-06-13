@@ -140,30 +140,70 @@ func (s *Service) List(workspaceID, projectID string) ([]Agent, error) {
 	return wrapper.Data, nil
 }
 
+// ListAll returns all agents in the workspace, including project-scoped ones.
+func (s *Service) ListAll(workspaceID string) ([]Agent, error) {
+	if workspaceID == "" {
+		return nil, fmt.Errorf("workspaceID is required to list agents")
+	}
+
+	endpointKey := "agents.list"
+	urlParams := map[string]string{"workspace_id": workspaceID}
+	queryParams := map[string]string{"include_projects": "true"}
+
+	resp, err := s.client.Call(endpointKey, "GET", nil, urlParams, queryParams)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list all agents: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 400 {
+		return nil, s.client.DecodeError(resp)
+	}
+
+	var wrapper struct {
+		Data []Agent `json:"data"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&wrapper); err != nil {
+		return nil, fmt.Errorf("failed to decode response: %w", err)
+	}
+	return wrapper.Data, nil
+}
+
 // GetByName returns an agent by its exact name within the given workspace.
 // It searches both workspace-scoped agents and all project-scoped agents.
 func (s *Service) GetByName(workspaceID, name string) (*Agent, error) {
-	// 1. Check workspace-scoped agents
-	agents, err := s.List(workspaceID, "")
+	// Try single fast request first
+	agentsList, err := s.ListAll(workspaceID)
 	if err == nil {
-		for _, a := range agents {
+		for _, a := range agentsList {
 			if a.Name == name {
 				return &a, nil
 			}
 		}
-	}
+	} else {
+		// Fallback to sequential lookups if backend doesn't support ListAll (include_projects)
+		// 1. Check workspace-scoped agents
+		agentsList, err = s.List(workspaceID, "")
+		if err == nil {
+			for _, a := range agentsList {
+				if a.Name == name {
+					return &a, nil
+				}
+			}
+		}
 
-	// 2. Check project-scoped agents
-	projService := projects.NewService(s.client)
-	projectsList, err := projService.List()
-	if err == nil {
-		for _, p := range projectsList {
-			if p.WorkspaceID == workspaceID {
-				projAgents, err := s.List(workspaceID, p.ID)
-				if err == nil {
-					for _, a := range projAgents {
-						if a.Name == name {
-							return &a, nil
+		// 2. Check project-scoped agents
+		projService := projects.NewService(s.client)
+		projectsList, err := projService.List()
+		if err == nil {
+			for _, p := range projectsList {
+				if p.WorkspaceID == workspaceID {
+					projAgents, err := s.List(workspaceID, p.ID)
+					if err == nil {
+						for _, a := range projAgents {
+							if a.Name == name {
+								return &a, nil
+							}
 						}
 					}
 				}

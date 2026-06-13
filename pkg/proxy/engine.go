@@ -67,6 +67,9 @@ type CallResult struct {
 // This allows the engine to be tested with a mock keyring.
 type SecretResolver func(key string) (string, error)
 
+// SecretPresenceResolver is a function that checks if a secret exists by key name.
+type SecretPresenceResolver func(key string) (bool, error)
+
 // PolicyResolver is a function that retrieves a secret's policy by key name.
 // Returns nil if no policy is set (unrestricted).
 type PolicyResolver func(key string) (*capabilities.SecretPolicy, error)
@@ -81,6 +84,7 @@ type Engine struct {
 	Audit            *AuditLogger
 	Client           *http.Client
 	ResolveSecret    SecretResolver
+	ResolvePresence  SecretPresenceResolver
 	ResolvePolicy    PolicyResolver
 	ResolveAllowlist AllowlistResolver
 	Approvals        *ApprovalStore
@@ -178,6 +182,18 @@ func NewEngine(projectID string) (*Engine, error) {
 	eng.ResolveSecret = func(key string) (string, error) {
 		return keyring.GetSecret(projectID, resolveEnvForAudit(), key)
 	}
+	eng.ResolvePresence = func(key string) (bool, error) {
+		keys, err := keyring.ListProjectKeyNames(projectID, resolveEnvForAudit())
+		if err != nil {
+			return false, err
+		}
+		for _, k := range keys {
+			if strings.EqualFold(k, key) {
+				return true, nil
+			}
+		}
+		return false, nil
+	}
 	eng.ResolvePolicy = func(key string) (*capabilities.SecretPolicy, error) {
 		policyBytes, err := keyring.GetSecretPolicy(projectID, resolveEnvForAudit(), key)
 		if err != nil {
@@ -215,45 +231,6 @@ func (e *Engine) Execute(req CallRequest) (*CallResult, error) {
 		method = "GET"
 	}
 
-	// --- Resolve Agent Identity and Capabilities ---
-	token := req.AgentToken
-	if token == "" {
-		token = req.TokenID
-	}
-	if token == "" {
-		token = os.Getenv("AS_AGENT_TOKEN")
-	}
-
-	// Resolve agent token references like <AGENTNAME>_TOKEN from the OS keychain
-	if token != "" && strings.HasSuffix(strings.ToUpper(token), "_TOKEN") && len(token) > 6 {
-		agentName := token[:len(token)-6]
-		retrievedToken, err := keyring.GetAgentToken(agentName)
-		if err != nil {
-			return nil, fmt.Errorf("agent token reference %q was not found in the OS Keychain. Please run 'agentsecrets agent token issue %s' to create and save it in your keychain first", token, agentName)
-		}
-		token = retrievedToken
-	}
-
-	if token != "" && req.Capabilities == nil {
-		req.IdentityLevel = "issued"
-		req.TokenID = maskToken(token)
-
-		if e.TokenCache != nil && e.APIClient != nil {
-			cached, err := e.TokenCache.Validate(token, e.APIClient)
-			if err != nil {
-				return nil, fmt.Errorf("agent token validation failed: %w", err)
-			}
-			if req.AgentID == "" || req.AgentID == "cli" {
-				req.AgentID = cached.AgentName
-			}
-			if cached.TokenID != "" {
-				req.TokenID = cached.TokenID
-			}
-			req.Capabilities = &cached.Capabilities
-		}
-	}
-
-	// --- Check Allowlist ---
 	u, err := url.Parse(req.TargetURL)
 	if err != nil {
 		return nil, fmt.Errorf("invalid target URL: %w", err)
@@ -261,14 +238,7 @@ func (e *Engine) Execute(req CallRequest) (*CallResult, error) {
 
 	targetDomain := strings.ToLower(u.Hostname())
 
-	var allowlist []string
-	if e.ResolveAllowlist != nil {
-		allowlist, err = e.ResolveAllowlist(e.WorkspaceID)
-		if err != nil {
-			return nil, fmt.Errorf("failed to read allowlist: %w", err)
-		}
-	}
-
+	// Initialize secretKeys and authStyles for logBlocked capture
 	secretKeys := make([]string, 0, len(req.Injections))
 	authStyles := make([]string, 0, len(req.Injections))
 	for _, inj := range req.Injections {
@@ -318,7 +288,30 @@ func (e *Engine) Execute(req CallRequest) (*CallResult, error) {
 		}, nil
 	}
 
-	// --- Enforce HTTPS ---
+	// 1. Secret Presence Check (Cheapest Check, purely offline)
+	hasSecret := func(key string) (bool, error) {
+		if e.ResolvePresence != nil {
+			return e.ResolvePresence(key)
+		}
+		if e.ResolveSecret != nil {
+			_, err := e.ResolveSecret(key)
+			return err == nil, nil
+		}
+		return false, nil
+	}
+
+	for _, inj := range req.Injections {
+		present, err := hasSecret(inj.SecretKey)
+		if err != nil || !present {
+			return nil, errors.New(
+				errors.ErrSecretNotFound,
+				fmt.Sprintf("secret '%s' not found in keychain — run 'agentsecrets secrets list' to see available keys, or add it with 'agentsecrets secrets set %s=VALUE'", inj.SecretKey, inj.SecretKey),
+				fmt.Errorf("secret not found in local index"),
+			)
+		}
+	}
+
+	// 2. Enforce HTTPS Target
 	if strings.ToLower(u.Scheme) != "https" && flag.Lookup("test.v") == nil {
 		isLocal := false
 		hostLower := strings.ToLower(u.Hostname())
@@ -327,6 +320,74 @@ func (e *Engine) Execute(req CallRequest) (*CallResult, error) {
 		}
 		if !(isLocal && e.AllowLocalHTTP) {
 			return logBlocked("non_https_blocked", "Non-HTTPS requests are strictly blocked by the proxy to prevent credential exposure. Use HTTPS instead.")
+		}
+	}
+
+	// 3. Resolve Agent Identity and enforce capabilities and workspace/project/environment scopes
+	token := req.AgentToken
+	if token == "" {
+		token = req.TokenID
+	}
+	if token == "" {
+		token = os.Getenv("AS_AGENT_TOKEN")
+	}
+
+	// Resolve agent token references like <AGENTNAME>_TOKEN from the OS keychain
+	if token != "" && strings.HasSuffix(strings.ToUpper(token), "_TOKEN") && len(token) > 6 {
+		agentName := token[:len(token)-6]
+		retrievedToken, err := keyring.GetAgentToken(agentName)
+		if err != nil {
+			return nil, fmt.Errorf("agent token reference %q was not found in the OS Keychain. Please run 'agentsecrets agent token issue %s' to create and save it in your keychain first", token, agentName)
+		}
+		token = retrievedToken
+	}
+
+	if token != "" {
+		req.IdentityLevel = "issued"
+		req.TokenID = maskToken(token)
+
+		if e.TokenCache != nil {
+			cached, err := e.TokenCache.Validate(token, e.APIClient)
+			if err != nil {
+				return nil, fmt.Errorf("agent token validation failed: %w", err)
+			}
+			if req.AgentID == "" || req.AgentID == "cli" {
+				req.AgentID = cached.AgentName
+			}
+			if cached.TokenID != "" {
+				req.TokenID = cached.TokenID
+			}
+			req.Capabilities = &cached.Capabilities
+
+			// Verify scope restrictions (Workspace and Project and Environment)
+			if cached.WorkspaceID != "" && cached.WorkspaceID != e.WorkspaceID {
+				return logBlocked("agent_workspace_mismatch", fmt.Sprintf("Agent '%s' is not authorized to access workspace '%s'.", req.AgentID, e.WorkspaceID))
+			}
+			if cached.ProjectID != "" && cached.ProjectID != e.ProjectID {
+				return logBlocked("agent_project_mismatch", fmt.Sprintf("Agent '%s' is not authorized to access project '%s'.", req.AgentID, e.ProjectID))
+			}
+			if cached.Environment != "" && !strings.EqualFold(cached.Environment, resolveEnvForAudit()) {
+				return logBlocked("agent_environment_mismatch", fmt.Sprintf("Agent '%s' is not authorized to access the '%s' environment.", req.AgentID, resolveEnvForAudit()))
+			}
+		}
+	}
+
+	// Enforce Agent Capabilities
+	if req.Capabilities != nil {
+		for _, inj := range req.Injections {
+			if !isSecretAllowed(req.Capabilities, inj.SecretKey) {
+				msg := fmt.Sprintf("Agent '%s' is not allowed to access secret '%s' — update agent policy with 'agentsecrets agent policy set'", req.AgentID, inj.SecretKey)
+				return logBlocked("capability_denied", msg)
+			}
+		}
+	}
+
+	// 4. Check Allowlist
+	var allowlist []string
+	if e.ResolveAllowlist != nil {
+		allowlist, err = e.ResolveAllowlist(e.WorkspaceID)
+		if err != nil {
+			return nil, fmt.Errorf("failed to read allowlist: %w", err)
 		}
 	}
 
@@ -348,20 +409,7 @@ func (e *Engine) Execute(req CallRequest) (*CallResult, error) {
 		return logBlocked("domain_not_in_allowlist", msg)
 	}
 
-	secretKeys = secretKeys[:0] // reset for normal accumulation
-	authStyles = authStyles[:0]
-
-	// --- Enforce Agent Capabilities ---
-	if req.Capabilities != nil {
-		for _, inj := range req.Injections {
-			if !isSecretAllowed(req.Capabilities, inj.SecretKey) {
-				msg := fmt.Sprintf("Agent '%s' is not allowed to access secret '%s' — update agent policy with 'agentsecrets agent policy set'", req.AgentID, inj.SecretKey)
-				return logBlocked("capability_denied", msg)
-			}
-		}
-	}
-
-	// --- Enforce Secret-Level Policies ---
+	// 5. Enforce Secret-Level Policies
 	hasPolicy := false
 	if e.ResolvePolicy != nil {
 		for _, inj := range req.Injections {
@@ -387,10 +435,13 @@ func (e *Engine) Execute(req CallRequest) (*CallResult, error) {
 						inj.SecretKey, method, targetDomain, inj.SecretKey, method, targetDomain)
 					return logBlocked("policy_approval_required", msg)
 				}
-				// approved — fall through
 			}
 		}
 	}
+
+	// Reset for normal accumulation
+	secretKeys = secretKeys[:0]
+	authStyles = authStyles[:0]
 
 	// --- Build outbound request ---
 	bodyReader := bytes.NewReader(req.Body)
