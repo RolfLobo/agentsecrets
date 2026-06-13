@@ -28,82 +28,79 @@ var statusCmd = &cobra.Command{
 		ui.Banner("AgentSecrets Status")
 		ui.Divider()
 
+		global, _ := config.LoadGlobalConfig()
+
 		// Auth status
-		if !config.IsAuthenticated() {
-			ui.StatusRowDim("Logged in:", "No")
-			fmt.Println()
-			ui.Info("  Run 'agentsecrets init' to create an account")
-			ui.Info("  Run 'agentsecrets login' to log in")
-			fmt.Println()
-			return nil
-		}
+		isAuthenticated := config.IsAuthenticated()
+		if isAuthenticated {
+			if err := keychainAuthMiddleware(cmd, args); err != nil {
+				return err
+			}
 
-		if err := keychainAuthMiddleware(cmd, args); err != nil {
-			return err
-		}
+			email := config.GetEmail()
+			ui.StatusRow("Logged in as:", email)
 
-		email := config.GetEmail()
-		ui.StatusRow("Logged in as:", email)
-
-		// Token Health
-		tokens, _ := config.LoadTokens()
-		if tokens != nil {
-			// Check Access Token
-			if tokens.ExpiresAt != "" {
-				exp, err := time.Parse(time.RFC3339, tokens.ExpiresAt)
-				if err == nil {
-					timeUntil := time.Until(exp)
-					if timeUntil <= 0 {
-						if tokens.RefreshToken != "" {
-							ui.StatusRow("Session:", "Expired — will auto-refresh on next command")
+			// Token Health
+			tokens, _ := config.LoadTokens()
+			if tokens != nil {
+				// Check Access Token
+				if tokens.ExpiresAt != "" {
+					exp, err := time.Parse(time.RFC3339, tokens.ExpiresAt)
+					if err == nil {
+						timeUntil := time.Until(exp)
+						if timeUntil <= 0 {
+							if tokens.RefreshToken != "" {
+								ui.StatusRow("Session:", "Expired — will auto-refresh on next command")
+							} else {
+								ui.StatusRow("Session:", "Expired — run 'agentsecrets login'")
+							}
+						} else if timeUntil < 5*time.Minute {
+							// e.g., "in 3 minutes" -> "3 minutes" by stripping "in "
+							timeLeft := humanize.Time(exp)
+							if strings.HasPrefix(timeLeft, "in ") {
+								timeLeft = timeLeft[3:]
+							}
+							ui.StatusRow("Session:", fmt.Sprintf("Expiring Soon (%s left) — will auto-refresh on next command", timeLeft))
 						} else {
-							ui.StatusRow("Session:", "Expired — run 'agentsecrets login'")
+							ui.StatusRow("Session:", fmt.Sprintf("Active (expires %s)", humanize.Time(exp)))
 						}
-					} else if timeUntil < 5*time.Minute {
-						// e.g., "in 3 minutes" -> "3 minutes" by stripping "in "
-						timeLeft := humanize.Time(exp)
-						if strings.HasPrefix(timeLeft, "in ") {
-							timeLeft = timeLeft[3:]
-						}
-						ui.StatusRow("Session:", fmt.Sprintf("Expiring Soon (%s left) — will auto-refresh on next command", timeLeft))
 					} else {
-						ui.StatusRow("Session:", fmt.Sprintf("Active (expires %s)", humanize.Time(exp)))
+						ui.StatusRowDim("Session:", "Unknown expiry")
 					}
 				} else {
 					ui.StatusRowDim("Session:", "Unknown expiry")
 				}
-			} else {
-				ui.StatusRowDim("Session:", "Unknown expiry")
+
+				// Check Refresh Token
+				if tokens.RefreshToken != "" {
+					ui.StatusRow("Refresh Token:", "Available")
+				} else {
+					ui.StatusRow("Refresh Token:", "Missing")
+				}
 			}
 
-			// Check Refresh Token
-			if tokens.RefreshToken != "" {
-				ui.StatusRow("Refresh Token:", "Available")
-			} else {
-				ui.StatusRow("Refresh Token:", "Missing")
+			// Workspace info
+			wsID := config.GetSelectedWorkspaceID()
+
+			wsDisplay := "—"
+			wsDim := true
+			if wsID != "" && global != nil {
+				if ws, ok := global.Workspaces[wsID]; ok {
+					wsDisplay = fmt.Sprintf("%s (%s)", ws.Name, ws.Type)
+					wsDim = false
+				} else {
+					wsDisplay = wsID
+					wsDim = false
+				}
 			}
-		}
 
-		// Workspace info
-		wsID := config.GetSelectedWorkspaceID()
-		global, _ := config.LoadGlobalConfig()
-
-		wsDisplay := "—"
-		wsDim := true
-		if wsID != "" && global != nil {
-			if ws, ok := global.Workspaces[wsID]; ok {
-				wsDisplay = fmt.Sprintf("%s (%s)", ws.Name, ws.Type)
-				wsDim = false
+			if wsDim {
+				ui.StatusRowDim("Selected Workspace:", wsDisplay)
 			} else {
-				wsDisplay = wsID
-				wsDim = false
+				ui.StatusRow("Selected Workspace:", wsDisplay)
 			}
-		}
-
-		if wsDim {
-			ui.StatusRowDim("Selected Workspace:", wsDisplay)
 		} else {
-			ui.StatusRow("Selected Workspace:", wsDisplay)
+			ui.StatusRowDim("Logged in:", "No")
 		}
 
 		// Environment info
@@ -135,7 +132,9 @@ var statusCmd = &cobra.Command{
 
 			// Sync info
 			secretsDisplay := "Unable to calculate"
-			if secretsService != nil {
+			if !isAuthenticated {
+				secretsDisplay = "Login to view"
+			} else if secretsService != nil {
 				diff, diffErr := secretsService.DiffCached("", "")
 				if diffErr != nil {
 					secretsDisplay = fmt.Sprintf("Could not check (%s)", diffErr.Error())
