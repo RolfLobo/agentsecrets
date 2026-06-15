@@ -145,6 +145,14 @@ var ErrorRegistry = map[errors.ErrorCode]ErrorDetails{
 		},
 		QuickAction: "agentsecrets login",
 	},
+	errors.ErrInvalidCredentials: {
+		Title:       "Invalid Credentials",
+		Description: "The email or password you entered is incorrect.",
+		Suggestions: []string{
+			"Double check your email spelling and password.",
+			"If you don't have an account, run 'agentsecrets init' to sign up.",
+		},
+	},
 	errors.ErrForbidden: {
 		Title:       "Permission Denied (Forbidden)",
 		Description: "You do not have the required role or capabilities to perform this action.",

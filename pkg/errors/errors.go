@@ -13,6 +13,7 @@ const (
 	ErrKeychainLocked    ErrorCode = "KEY-501"
 	ErrKeychainHeadless  ErrorCode = "KEY-502"
 	ErrUnauthorized      ErrorCode = "AUTH-401"
+	ErrInvalidCredentials ErrorCode = "AUTH-402"
 	ErrForbidden         ErrorCode = "AUTH-403"
 	ErrServerInternal    ErrorCode = "SRV-500"
 	ErrConnection        ErrorCode = "NET-101"

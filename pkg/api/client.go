@@ -287,6 +287,14 @@ func (c *Client) DecodeError(resp *http.Response) error {
 
 	switch resp.StatusCode {
 	case 401:
+		isLoginOrSignup := false
+		if resp.Request != nil && resp.Request.URL != nil {
+			path := resp.Request.URL.Path
+			isLoginOrSignup = strings.Contains(path, "/auth/login/") || strings.Contains(path, "/auth/register/")
+		}
+		if isLoginOrSignup {
+			return errors.New(errors.ErrInvalidCredentials, baseErr.Error(), baseErr)
+		}
 		return errors.New(errors.ErrUnauthorized, fmt.Sprintf("%v. Your session may have expired. Please run 'agentsecrets login' to authenticate again.", baseErr), baseErr)
 	case 403:
 		return errors.New(errors.ErrForbidden, fmt.Sprintf("%v. Permission denied.", baseErr), baseErr)
