@@ -33,10 +33,6 @@ var statusCmd = &cobra.Command{
 		// Auth status
 		isAuthenticated := config.IsAuthenticated()
 		if isAuthenticated {
-			if err := keychainAuthMiddleware(cmd, args); err != nil {
-				return err
-			}
-
 			email := config.GetEmail()
 			ui.StatusRow("Logged in as:", email)
 

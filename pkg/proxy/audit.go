@@ -16,6 +16,7 @@ import (
 
 	"github.com/The-17/agentsecrets/pkg/api"
 	"github.com/The-17/agentsecrets/pkg/auth"
+	"github.com/The-17/agentsecrets/pkg/config"
 	_ "github.com/glebarez/go-sqlite"
 	"github.com/google/uuid"
 )
@@ -193,8 +194,10 @@ func NewAuditLogger(dbPath string) (*AuditLogger, error) {
 		return nil, fmt.Errorf("failed to open sqlite database: %w", err)
 	}
 
-	// Optimize SQLite write performance (WAL mode + normal synchronous) only outside tests
-	if flag.Lookup("test.v") == nil {
+	if flag.Lookup("test.v") != nil {
+		_, _ = db.Exec("PRAGMA journal_mode=DELETE;")
+		_, _ = db.Exec("PRAGMA synchronous=OFF;")
+	} else {
 		_, _ = db.Exec("PRAGMA journal_mode=WAL;")
 		_, _ = db.Exec("PRAGMA synchronous=NORMAL;")
 	}
@@ -350,6 +353,9 @@ func (a *AuditLogger) Log(event AuditEvent) error {
 func (a *AuditLogger) SyncUnpushedLogs() error {
 	if a.APIClient == nil {
 		return nil // Cloud sync is not configured
+	}
+	if !config.IsAuthenticated() {
+		return nil // Skip syncing if user has no active session
 	}
 
 	a.mu.Lock()

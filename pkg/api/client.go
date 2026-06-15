@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -112,8 +113,12 @@ type Client struct {
 
 // NewClient creates a new API client with the default base URL.
 func NewClient(tokenFunc func() string) *Client {
+	baseURL := DefaultBaseURL
+	if envURL := os.Getenv("AGENTSECRETS_API_URL"); envURL != "" {
+		baseURL = envURL
+	}
 	return &Client{
-		BaseURL:    DefaultBaseURL,
+		BaseURL:    baseURL,
 		HTTPClient: &http.Client{Timeout: 30 * time.Second},
 		getToken:   tokenFunc,
 	}
