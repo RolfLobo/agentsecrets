@@ -158,7 +158,7 @@ var ErrorRegistry = map[errors.ErrorCode]ErrorDetails{
 		Description: "The AgentSecrets Cloud service encountered an unexpected database or system failure.",
 		Suggestions: []string{
 			"Please wait a few moments and try your command again.",
-			"If this error persists, report it to our engineering support group.",
+			"Submit the copy-paste report below to engineering@theseventeen.co to help resolve this issue.",
 		},
 	},
 	errors.ErrConnection: {
@@ -216,7 +216,7 @@ var ErrorRegistry = map[errors.ErrorCode]ErrorDetails{
 		Description: "The command failed with an unhandled runtime error.",
 		Suggestions: []string{
 			"Check the error details above for troubleshooting clues.",
-			"Submit a copy-paste report to engineering@theseventeen.co to help resolve this issue.",
+			"Submit a report to engineering.",
 		},
 	},
 }
