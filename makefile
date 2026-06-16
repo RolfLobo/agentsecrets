@@ -110,6 +110,17 @@ release:
 	@echo "✓ Release binaries built in $(BUILD_DIR)/releases/"
 	@ls -lh $(BUILD_DIR)/releases/
 
+# Check compilation across all three major platforms
+build-all:
+	@echo "Checking compilation across platforms..."
+	@echo -n "  Linux (amd64)... "
+	@GOOS=linux GOARCH=amd64 $(GO) build -o /dev/null ./cmd/agentsecrets/ && echo "✓ OK" || (echo "✗ FAILED"; exit 1)
+	@echo -n "  macOS (amd64)... "
+	@GOOS=darwin GOARCH=amd64 $(GO) build -o /dev/null ./cmd/agentsecrets/ && echo "✓ OK" || (echo "✗ FAILED"; exit 1)
+	@echo -n "  Windows (amd64)... "
+	@GOOS=windows GOARCH=amd64 $(GO) build -o /dev/null ./cmd/agentsecrets/ && echo "✓ OK" || (echo "✗ FAILED"; exit 1)
+	@echo "✓ All platforms compile successfully!"
+
 # Quick checks before committing
 pre-commit: fmt test lint
 	@echo "✓ All pre-commit checks passed"

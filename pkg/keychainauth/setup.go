@@ -553,6 +553,9 @@ func queryInstalledVersion(binPath string) (string, error) {
 //   0 if v1 == v2
 //   1 if v1 > v2
 func compareVersions(v1, v2 string) int {
+	if v1 == "dev" || v1 == "vdev" {
+		return 0
+	}
 	v1 = strings.TrimPrefix(v1, "v")
 	v2 = strings.TrimPrefix(v2, "v")
 
