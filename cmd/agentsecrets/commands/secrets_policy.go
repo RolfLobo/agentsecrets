@@ -97,7 +97,22 @@ func runSecretsPolicySet(cmd *cobra.Command, args []string) error {
 	// Build method map
 	methodsMap := make(map[string]capabilities.Action)
 	for _, m := range policyMethods {
-		methodsMap[strings.ToUpper(strings.TrimSpace(m))] = action
+		m = strings.TrimSpace(m)
+		if m == "" {
+			continue
+		}
+		parts := strings.SplitN(m, "=", 2)
+		method := strings.ToUpper(strings.TrimSpace(parts[0]))
+
+		act := action // default action
+		if len(parts) == 2 {
+			customAct := capabilities.Action(strings.ToLower(strings.TrimSpace(parts[1])))
+			if customAct != capabilities.Allow && customAct != capabilities.Deny && customAct != capabilities.RequestPermission {
+				return fmt.Errorf("invalid action %q for method %s — must be 'allow', 'deny', or 'request_permission'", parts[1], method)
+			}
+			act = customAct
+		}
+		methodsMap[method] = act
 	}
 
 	var domains []string

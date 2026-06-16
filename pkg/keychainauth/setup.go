@@ -94,6 +94,7 @@ func EnsureInstalled() (string, error) {
 // installViaBrew installs keychain-auth via Homebrew and returns the binary path.
 func installViaBrew() (string, error) {
 	cmd := exec.Command("brew", "install", "The-17/tap/keychain-auth")
+	cmd.Env = append(os.Environ(), "HOMEBREW_NO_SANDBOX=1")
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 

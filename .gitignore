@@ -44,7 +44,7 @@ config.json
 # Build artifacts
 dist/
 build/
-bin/
+/bin/
 *.egg-info/
 node_modules/
 .npm/

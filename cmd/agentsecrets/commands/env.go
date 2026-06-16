@@ -1,7 +1,11 @@
 package commands
 
 import (
+	"encoding/base64"
+	"encoding/hex"
 	"fmt"
+	"io"
+	"net/url"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -37,6 +41,11 @@ func NewEnvCmd() *cobra.Command {
 
 func runEnv(cmd *cobra.Command, args []string) error {
 	telemetry.RecordIntegration("env")
+
+	// Intercept help flags since DisableFlagParsing is active
+	if len(args) > 0 && (args[0] == "--help" || args[0] == "-h") {
+		return cmd.Help()
+	}
 
 	// Strip leading -- if present
 	if len(args) > 0 && args[0] == "--" {
@@ -91,12 +100,15 @@ func runEnv(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("command not found: %s", args[0])
 	}
 
+	// Generate secret variants for masking
+	maskingSecrets := generateVariants(secrets)
+
 	// Build child process
 	childCmd := exec.Command(commandPath, args[1:]...)
 	childCmd.Env = env
 	childCmd.Stdin = os.Stdin
-	childCmd.Stdout = os.Stdout
-	childCmd.Stderr = os.Stderr
+	childCmd.Stdout = &MaskingWriter{underlying: os.Stdout, secrets: maskingSecrets}
+	childCmd.Stderr = &MaskingWriter{underlying: os.Stderr, secrets: maskingSecrets}
 
 	// Forward signals to child
 	sigChan := make(chan os.Signal, 1)
@@ -184,4 +196,72 @@ func ensureKeychainAuthForEnv() error {
 		return fmt.Errorf("%s", keychainauth.UserMessage(err))
 	}
 	return nil
+}
+
+// generateVariants returns all potential encoding/case variants of a secret value.
+func generateVariants(secrets map[string]string) []string {
+	var variants []string
+	seen := make(map[string]bool)
+
+	add := func(v string) {
+		if v != "" && !seen[v] && len(v) >= 4 { // Don't mask very short strings to avoid false positives
+			variants = append(variants, v)
+			seen[v] = true
+		}
+	}
+
+	for _, value := range secrets {
+		if value == "" {
+			continue
+		}
+		// 1. Raw secret
+		add(value)
+
+		// 2. Case variants
+		add(strings.ToLower(value))
+		add(strings.ToUpper(value))
+
+		// 3. Base64 variants
+		b64Std := base64.StdEncoding.EncodeToString([]byte(value))
+		add(b64Std)
+		add(strings.ToLower(b64Std))
+		add(strings.ToUpper(b64Std))
+
+		b64URL := base64.URLEncoding.EncodeToString([]byte(value))
+		add(b64URL)
+		add(strings.ToLower(b64URL))
+		add(strings.ToUpper(b64URL))
+
+		// 4. Hex variant
+		hx := hex.EncodeToString([]byte(value))
+		add(hx)
+		add(strings.ToUpper(hx))
+
+		// 5. URL Query Escape
+		add(url.QueryEscape(value))
+	}
+	return variants
+}
+
+// MaskingWriter masks secrets in output streams
+type MaskingWriter struct {
+	underlying io.Writer
+	secrets    []string
+}
+
+func (mw *MaskingWriter) Write(p []byte) (n int, err error) {
+	if len(mw.secrets) == 0 {
+		return mw.underlying.Write(p)
+	}
+
+	content := string(p)
+	for _, secret := range mw.secrets {
+		content = strings.ReplaceAll(content, secret, "[REDACTED]")
+	}
+
+	_, err = mw.underlying.Write([]byte(content))
+	if err != nil {
+		return 0, err
+	}
+	return len(p), nil
 }
