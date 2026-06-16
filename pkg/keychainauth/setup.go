@@ -1,12 +1,12 @@
 package keychainauth
 
 import (
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
-	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -26,6 +26,8 @@ import (
 //
 // Returns nil if everything is ready, or an error describing what failed.
 func AutoSetup() error {
+	_ = PurgeLegacyFiles()
+
 	kcPath, err := EnsureInstalled()
 	if err != nil {
 		return fmt.Errorf("keychain-auth setup: %w", err)
@@ -42,35 +44,49 @@ func AutoSetup() error {
 	return nil
 }
 
-// EnsureInstalled checks if keychain-auth is in PATH.
-// If not found, attempts to install it via the platform's package manager.
+const RequiredDaemonVersion = "2.2.0"
+
+// EnsureInstalled checks if keychain-auth is in PATH and matches the required version.
+// If not found or outdated, attempts to install it via the platform's package manager.
 // Returns the absolute path to the keychain-auth binary.
 func EnsureInstalled() (string, error) {
 	homeDir, _ := os.UserHomeDir()
-	goBinPath := filepath.Join(homeDir, "go", "bin", "keychain-auth")
+	binaryName := "keychain-auth"
+	if runtime.GOOS == "windows" {
+		binaryName = "keychain-auth.exe"
+	}
+	goBinPath := filepath.Join(homeDir, "go", "bin", binaryName)
 
 	// 1. Prefer our locally built binary in ~/go/bin
 	if _, err := os.Stat(goBinPath); err == nil {
-		return goBinPath, nil
+		if v, vErr := queryInstalledVersion(goBinPath); vErr == nil && compareVersions(v, RequiredDaemonVersion) >= 0 {
+			return goBinPath, nil
+		}
 	}
 
 	// 2. Check if already installed in PATH
-	if path, err := exec.LookPath("keychain-auth"); err == nil {
-		return path, nil
+	if path, err := exec.LookPath(binaryName); err == nil {
+		if v, vErr := queryInstalledVersion(path); vErr == nil && compareVersions(v, RequiredDaemonVersion) >= 0 {
+			return path, nil
+		}
 	}
 
 	// Check common user-local bin paths if PATH isn't set up properly
 	commonPaths := []string{
-		filepath.Join(homeDir, ".local", "bin", "keychain-auth"),
-		"/usr/local/bin/keychain-auth",
+		filepath.Join(homeDir, ".local", "bin", binaryName),
+	}
+	if runtime.GOOS != "windows" {
+		commonPaths = append(commonPaths, "/usr/local/bin/keychain-auth")
 	}
 	for _, p := range commonPaths {
 		if _, err := os.Stat(p); err == nil {
-			return p, nil
+			if v, vErr := queryInstalledVersion(p); vErr == nil && compareVersions(v, RequiredDaemonVersion) >= 0 {
+				return p, nil
+			}
 		}
 	}
 
-	// Not installed — attempt platform-specific installation
+	// Not installed or outdated — attempt platform-specific installation
 	switch runtime.GOOS {
 	case "darwin":
 		return installViaBrew()
@@ -84,6 +100,14 @@ func EnsureInstalled() (string, error) {
 				"Install it with Homebrew:\n" +
 				"  brew install The-17/tap/keychain-auth\n\n" +
 				"Or download from GitHub:\n" +
+				"  https://github.com/The-17/keychain-auth/releases",
+		)
+	case "windows":
+		return "", fmt.Errorf(
+			"keychain-auth is not installed.\n\n" +
+				"Build it from source:\n" +
+				"  go install github.com/The-17/keychain-auth/cmd/keychain-auth@latest\n\n" +
+				"Or download the Windows release from GitHub:\n" +
 				"  https://github.com/The-17/keychain-auth/releases",
 		)
 	default:
@@ -286,6 +310,13 @@ type kcConfig struct {
 
 func keychainAuthConfigPath() string {
 	home, _ := os.UserHomeDir()
+	if runtime.GOOS == "windows" {
+		dir := os.Getenv("APPDATA")
+		if dir == "" {
+			dir = filepath.Join(home, "AppData", "Roaming")
+		}
+		return filepath.Join(dir, "keychain-auth", "config.json")
+	}
 	if runtime.GOOS == "darwin" {
 		return filepath.Join(home, "Library", "Application Support", "keychain-auth", "config.json")
 	}
@@ -298,14 +329,15 @@ func keychainAuthConfigPath() string {
 }
 
 // EnsureDaemonRunning checks if the keychain-auth daemon is running by probing
-// the socket. If the socket doesn't exist, it attempts to start the daemon
-// using the platform's service manager.
+// the socket/pipe. If it doesn't exist, it attempts to start the daemon.
 func EnsureDaemonRunning(keychainAuthPath string) error {
 	if IsAvailable() {
 		return nil
 	}
 
 	switch runtime.GOOS {
+	case "windows":
+		return startDirect(keychainAuthPath)
 	case "darwin":
 		return startDaemonMacOS(keychainAuthPath)
 	case "linux":
@@ -318,12 +350,16 @@ func EnsureDaemonRunning(keychainAuthPath string) error {
 // RestartDaemon kills any running keychain-auth daemon and starts a fresh one.
 // This is needed after re-registering a binary so the daemon picks up the new hash.
 func RestartDaemon() error {
-	// Kill existing daemon
-	_ = exec.Command("pkill", "-x", "keychain-auth").Run()
-
-	// Remove stale socket
-	sockPath := SocketPath()
-	_ = os.Remove(sockPath)
+	if runtime.GOOS == "windows" {
+		// On Windows, kill the process by name
+		_ = exec.Command("taskkill", "/F", "/IM", "keychain-auth.exe").Run()
+	} else {
+		// Kill existing daemon
+		_ = exec.Command("pkill", "-x", "keychain-auth").Run()
+		// Remove stale socket
+		sockPath := SocketPath()
+		_ = os.Remove(sockPath)
+	}
 
 	// Wait a moment for the process to die
 	time.Sleep(200 * time.Millisecond)
@@ -382,15 +418,30 @@ func startDaemonLinux(keychainAuthPath string) error {
 func startDirect(keychainAuthPath string) error {
 	sockPath := SocketPath()
 
-	// Ensure the socket directory exists
-	if err := os.MkdirAll(filepath.Dir(sockPath), 0700); err != nil {
-		return fmt.Errorf("failed to create socket directory: %w", err)
+	if runtime.GOOS != "windows" {
+		// Ensure the socket directory exists
+		if err := os.MkdirAll(filepath.Dir(sockPath), 0700); err != nil {
+			return fmt.Errorf("failed to create socket directory: %w", err)
+		}
 	}
 
 	// Pass --socket so even older keychain-auth binaries that default to
 	// /var/run/ will use the user-writable path instead.
 	cmd := exec.Command(keychainAuthPath, "start", "--socket", sockPath)
-	logFile, _ := os.OpenFile("/home/theapiartist/.config/keychain-auth/daemon.log", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
+
+	var logDir string
+	if home, err := os.UserHomeDir(); err == nil {
+		if runtime.GOOS == "windows" {
+			logDir = filepath.Join(home, "AppData", "Local", "keychain-auth")
+		} else {
+			logDir = filepath.Join(home, ".config", "keychain-auth")
+		}
+	} else {
+		logDir = os.TempDir()
+	}
+	_ = os.MkdirAll(logDir, 0700)
+	logFile, _ := os.OpenFile(filepath.Join(logDir, "daemon.log"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
+	
 	cmd.Stdout = logFile
 	cmd.Stderr = logFile
 	cmd.Stdin = nil
@@ -409,18 +460,18 @@ func startDirect(keychainAuthPath string) error {
 	return waitForSocket()
 }
 
-// waitForSocket polls for the socket file to appear and be dialable, with an 8-second timeout.
+// waitForSocket polls for the socket file/named pipe to appear and be dialable, with an 8-second timeout.
 func waitForSocket() error {
 	sockPath := SocketPath()
 	for i := 0; i < 80; i++ {
-		c, err := net.Dial("unix", sockPath)
+		c, err := dialCLOEXEC(sockPath)
 		if err == nil {
 			c.Close()
 			return nil
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
-	return fmt.Errorf("keychain-auth daemon started but socket not available after 8 seconds")
+	return fmt.Errorf("keychain-auth daemon started but socket/pipe not available after 8 seconds")
 }
 
 // computeHash returns the SHA-256 hash of a file in "sha256:<hex>" format.
@@ -436,4 +487,92 @@ func computeHash(path string) (string, error) {
 		return "", err
 	}
 	return "sha256:" + hex.EncodeToString(h.Sum(nil)), nil
+}
+
+// PurgeLegacyFiles overwrites legacy keyring.json files with random bytes and deletes them.
+func PurgeLegacyFiles() error {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return err
+	}
+
+	paths := []string{
+		filepath.Join(home, ".agentsecrets", "keyring.json"),
+		filepath.Join(home, ".keychain-auth", "keyring.json"),
+	}
+
+	for _, p := range paths {
+		info, err := os.Stat(p)
+		if err != nil {
+			continue // file doesn't exist, skip
+		}
+		if info.IsDir() {
+			continue
+		}
+
+		size := info.Size()
+		if size <= 0 {
+			size = 1024
+		}
+
+		// Shred file by overwriting it with random bytes
+		f, err := os.OpenFile(p, os.O_WRONLY, 0600)
+		if err != nil {
+			_ = os.Remove(p)
+			continue
+		}
+
+		randBytes := make([]byte, size)
+		if _, randErr := rand.Read(randBytes); randErr == nil {
+			_, _ = f.Write(randBytes)
+			_ = f.Sync()
+		}
+		f.Close()
+		_ = os.Remove(p)
+	}
+
+	return nil
+}
+
+// queryInstalledVersion returns the version of the installed keychain-auth daemon.
+func queryInstalledVersion(binPath string) (string, error) {
+	cmd := exec.Command(binPath, "--version")
+	out, err := cmd.Output()
+	if err != nil {
+		return "", err
+	}
+	fields := strings.Fields(string(out))
+	if len(fields) == 0 {
+		return "", fmt.Errorf("empty version output")
+	}
+	return fields[len(fields)-1], nil
+}
+
+// compareVersions parses simple semver (e.g. "2.2.0") and returns:
+//  -1 if v1 < v2
+//   0 if v1 == v2
+//   1 if v1 > v2
+func compareVersions(v1, v2 string) int {
+	v1 = strings.TrimPrefix(v1, "v")
+	v2 = strings.TrimPrefix(v2, "v")
+
+	parts1 := strings.Split(v1, ".")
+	parts2 := strings.Split(v2, ".")
+
+	for i := 0; i < 3; i++ {
+		var n1, n2 int
+		if i < len(parts1) {
+			_, _ = fmt.Sscanf(parts1[i], "%d", &n1)
+		}
+		if i < len(parts2) {
+			_, _ = fmt.Sscanf(parts2[i], "%d", &n2)
+		}
+		if n1 < n2 {
+			return -1
+		}
+		if n1 > n2 {
+			return 1
+		}
+	}
+	return 0
 }

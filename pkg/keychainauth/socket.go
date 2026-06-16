@@ -7,9 +7,12 @@ import (
 	"time"
 )
 
-// SocketPath returns the keychain-auth Unix socket path.
+// SocketPath returns the keychain-auth Unix socket path or named pipe path on Windows.
 // It uses platform-specific, user-writable directories to avoid permission issues.
 func SocketPath() string {
+	if runtime.GOOS == "windows" {
+		return `\\.\pipe\keychain-auth`
+	}
 	if runtime.GOOS == "darwin" {
 		return filepath.Join(os.Getenv("HOME"), "Library", "Application Support", "keychain-auth", "agent.sock")
 	}

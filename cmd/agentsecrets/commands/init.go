@@ -44,42 +44,47 @@ func runInit(cmd *cobra.Command, args []string) error {
 	var modeToUse int
 
 	// Phase 1: Global Setup (Self-Contained)
-	if !config.GlobalConfigExists() {
+	if !config.GlobalConfigExists() || !config.IsAuthenticated() {
 		ui.Info("Setting up AgentSecrets...")
 
-		if err := config.InitGlobalConfig(); err != nil {
-			return fmt.Errorf("failed to initialize global config: %w", err)
-		}
+		if !config.GlobalConfigExists() {
+			if err := config.InitGlobalConfig(); err != nil {
+				return fmt.Errorf("failed to initialize global config: %w", err)
+			}
 
-		// First-ever run: prompt for storage mode unless flag passed
-		modeToUse = storageMode
-		if !cmd.Flags().Changed("storage-mode") {
-			var modeChoice string
-			err := huh.NewSelect[string]().
-				Title("How would you like secrets to be stored locally by default?").
-				Options(
-					huh.NewOption("1. Keychain only (recommended) — values never written to disk.\n   .env.example created with key names only.", "1"),
-					huh.NewOption("2. .env file — plaintext file, compatible with all existing tooling.", "2"),
-				).
-				Value(&modeChoice).
-				Run()
+			// First-ever run: prompt for storage mode unless flag passed
+			modeToUse = storageMode
+			if !cmd.Flags().Changed("storage-mode") {
+				var modeChoice string
+				err := huh.NewSelect[string]().
+					Title("How would you like secrets to be stored locally by default?").
+					Options(
+						huh.NewOption("1. Keychain only (recommended) — values never written to disk.\n   .env.example created with key names only.", "1"),
+						huh.NewOption("2. .env file — plaintext file, compatible with all existing tooling.", "2"),
+					).
+					Value(&modeChoice).
+					Run()
 
-			if err == nil {
-				if modeChoice == "2" {
-					modeToUse = 2
-				} else {
-					modeToUse = 1
+				if err == nil {
+					if modeChoice == "2" {
+						modeToUse = 2
+					} else {
+						modeToUse = 1
+					}
 				}
 			}
-		}
 
-		if err := config.SetStorageMode(modeToUse); err != nil {
-			return fmt.Errorf("failed to set storage mode: %w", err)
-		}
+			if err := config.SetStorageMode(modeToUse); err != nil {
+				return fmt.Errorf("failed to set storage mode: %w", err)
+			}
 
-		// Set default environment
-		if err := config.SetSelectedEnvironment("development"); err != nil {
-			return fmt.Errorf("failed to set default environment: %w", err)
+			// Set default environment
+			if err := config.SetSelectedEnvironment("development"); err != nil {
+				return fmt.Errorf("failed to set default environment: %w", err)
+			}
+		} else {
+			// Subsequent runs (already exists but not authenticated): use global default
+			modeToUse = config.GetStorageMode()
 		}
 
 		_ = writeWorkflowFile()

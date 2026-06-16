@@ -35,6 +35,9 @@ func Init() error {
 		return nil
 	}
 
+	// Shred and delete legacy files on startup
+	_ = PurgeLegacyFiles()
+
 	sockPath := SocketPath()
 
 	// Step 1: Check socket exists before attempting connection
