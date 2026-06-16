@@ -2,10 +2,10 @@
 //
 // Secret reads and writes are performed directly via the OS keychain (go-keyring).
 // On Linux/WSL (where D-Bus Secret Service is typically unavailable),
-// storage falls back to file-based storage in ~/.agentsecrets/keyring.json.
+// storage falls back to file-based storage in ~/.agentsecrets/keyring_file.json.
 //
 // On Linux/WSL (where D-Bus Secret Service is typically unavailable),
-// keypair storage falls back to file-based storage in ~/.agentsecrets/keyring.json.
+// keypair storage falls back to file-based storage in ~/.agentsecrets/keyring_file.json.
 //
 // Service name: "AgentSecrets"
 // Keypair naming: "{email}_private_key", "{email}_public_key"
@@ -127,7 +127,7 @@ func keyringFilePath() (string, error) {
 	if err != nil {
 		return "", err
 	}
-	path := filepath.Join(home, ".agentsecrets", "keyring.json")
+	path := filepath.Join(home, ".agentsecrets", "keyring_file.json")
 	_ = os.MkdirAll(filepath.Dir(path), 0700)
 	return path, nil
 }

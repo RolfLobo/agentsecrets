@@ -29,10 +29,37 @@ func dialCLOEXEC(sockPath string) (net.Conn, error) {
 
 // PipeConn implements net.Conn for a Windows Named Pipe.
 type PipeConn struct {
-	handle windows.Handle
+	handle       windows.Handle
+	readDeadline time.Time
 }
 
+type pipeError struct {
+	error
+	timeout bool
+}
+
+func (e *pipeError) Timeout() bool   { return e.timeout }
+func (e *pipeError) Temporary() bool { return e.timeout }
+
 func (c *PipeConn) Read(b []byte) (int, error) {
+	if !c.readDeadline.IsZero() {
+		// Poll for data until the deadline
+		for {
+			var avail uint32
+			err := windows.PeekNamedPipe(c.handle, nil, 0, nil, &avail, nil)
+			if err != nil {
+				return 0, err
+			}
+			if avail > 0 {
+				break // data is ready to be read
+			}
+			if time.Now().After(c.readDeadline) {
+				return 0, &pipeError{error: os.ErrDeadlineExceeded, timeout: true}
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+
 	var done uint32
 	err := windows.ReadFile(c.handle, b, &done, nil)
 	if err != nil {
@@ -65,6 +92,16 @@ func (a pipeAddr) String() string  { return string(a) }
 func (c *PipeConn) LocalAddr() net.Addr  { return pipeAddr("keychain-auth-pipe") }
 func (c *PipeConn) RemoteAddr() net.Addr { return pipeAddr("keychain-auth-pipe") }
 
-func (c *PipeConn) SetDeadline(t time.Time) error      { return nil }
-func (c *PipeConn) SetReadDeadline(t time.Time) error  { return nil }
-func (c *PipeConn) SetWriteDeadline(t time.Time) error { return nil }
+func (c *PipeConn) SetDeadline(t time.Time) error {
+	c.readDeadline = t
+	return nil
+}
+
+func (c *PipeConn) SetReadDeadline(t time.Time) error {
+	c.readDeadline = t
+	return nil
+}
+
+func (c *PipeConn) SetWriteDeadline(t time.Time) error {
+	return nil
+}
