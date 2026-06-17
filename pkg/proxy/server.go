@@ -11,6 +11,7 @@ import (
 
 	"github.com/The-17/agentsecrets/pkg/api"
 	"github.com/The-17/agentsecrets/pkg/capabilities"
+	"github.com/The-17/agentsecrets/pkg/keyring"
 )
 
 // Server is the HTTP proxy server that wraps the Engine.
@@ -133,6 +134,17 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 
 	if agentToken == "" {
 		agentToken = os.Getenv("AS_AGENT_TOKEN")
+	}
+
+	// Resolve agent token references like <AGENTNAME>_TOKEN from the OS keychain
+	if agentToken != "" && strings.HasSuffix(strings.ToUpper(agentToken), "_TOKEN") && len(agentToken) > 6 {
+		agentName := agentToken[:len(agentToken)-6]
+		retrievedToken, err := keyring.GetAgentToken(agentName)
+		if err != nil {
+			writeError(w, 401, fmt.Sprintf("Agent token reference %q was not found in the OS Keychain: %v", agentToken, err))
+			return
+		}
+		agentToken = retrievedToken
 	}
 
 	identityLevel := "anonymous"
