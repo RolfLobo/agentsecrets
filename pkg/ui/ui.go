@@ -224,7 +224,7 @@ var ErrorRegistry = map[errors.ErrorCode]ErrorDetails{
 		Description: "The command failed with an unhandled runtime error.",
 		Suggestions: []string{
 			"Check the error details above for troubleshooting clues.",
-			"Submit a report to engineering.",
+			"Submit a report to engineering@theseventeen.co.",
 		},
 	},
 }
