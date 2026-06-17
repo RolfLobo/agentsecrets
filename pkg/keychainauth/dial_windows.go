@@ -5,10 +5,32 @@ package keychainauth
 import (
 	"net"
 	"os"
+	"syscall"
 	"time"
+	"unsafe"
 
 	"golang.org/x/sys/windows"
 )
+
+var (
+	modkernel32       = syscall.NewLazyDLL("kernel32.dll")
+	procPeekNamedPipe = modkernel32.NewProc("PeekNamedPipe")
+)
+
+func peekNamedPipe(handle windows.Handle, lpTotalBytesAvail *uint32) error {
+	r1, _, err := procPeekNamedPipe.Call(
+		uintptr(handle),
+		0,
+		0,
+		0,
+		uintptr(unsafe.Pointer(lpTotalBytesAvail)),
+		0,
+	)
+	if r1 == 0 {
+		return err
+	}
+	return nil
+}
 
 // dialCLOEXEC connects to the Windows Named Pipe.
 func dialCLOEXEC(sockPath string) (net.Conn, error) {
@@ -46,7 +68,7 @@ func (c *PipeConn) Read(b []byte) (int, error) {
 		// Poll for data until the deadline
 		for {
 			var avail uint32
-			err := windows.PeekNamedPipe(c.handle, nil, 0, nil, &avail, nil)
+			err := peekNamedPipe(c.handle, &avail)
 			if err != nil {
 				return 0, err
 			}

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"runtime"
 	"strings"
 	"sync"
 )
@@ -40,9 +41,11 @@ func Init() error {
 
 	sockPath := SocketPath()
 
-	// Step 1: Check socket exists before attempting connection
-	if _, err := os.Stat(sockPath); os.IsNotExist(err) {
-		return &DaemonNotRunningError{SocketPath: sockPath, Cause: err}
+	// Step 1: Check socket exists before attempting connection (Unix only)
+	if runtime.GOOS != "windows" {
+		if _, err := os.Stat(sockPath); os.IsNotExist(err) {
+			return &DaemonNotRunningError{SocketPath: sockPath, Cause: err}
+		}
 	}
 
 	// Step 2: Connect to the Unix socket with SOCK_CLOEXEC to prevent
@@ -168,7 +171,16 @@ func Close() {
 }
 
 // IsAvailable checks whether the keychain-auth socket file exists on disk.
+// On Windows, it attempts to dial the named pipe to check availability.
 func IsAvailable() bool {
+	if runtime.GOOS == "windows" {
+		c, err := dialCLOEXEC(SocketPath())
+		if err == nil {
+			c.Close()
+			return true
+		}
+		return false
+	}
 	_, err := os.Stat(SocketPath())
 	return err == nil
 }
