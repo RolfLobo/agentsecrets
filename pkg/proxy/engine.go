@@ -337,6 +337,10 @@ func (e *Engine) Execute(req CallRequest) (*CallResult, error) {
 		agentName := token[:len(token)-6]
 		retrievedToken, err := keyring.GetAgentToken(agentName)
 		if err != nil {
+			// Fallback to lowercase agent name
+			retrievedToken, err = keyring.GetAgentToken(strings.ToLower(agentName))
+		}
+		if err != nil {
 			return nil, fmt.Errorf("agent token reference %q was not found in the OS Keychain. Please run 'agentsecrets agent token issue %s' to create and save it in your keychain first", token, agentName)
 		}
 		token = retrievedToken

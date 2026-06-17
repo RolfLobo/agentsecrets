@@ -141,6 +141,10 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		agentName := agentToken[:len(agentToken)-6]
 		retrievedToken, err := keyring.GetAgentToken(agentName)
 		if err != nil {
+			// Fallback to lowercase agent name
+			retrievedToken, err = keyring.GetAgentToken(strings.ToLower(agentName))
+		}
+		if err != nil {
 			writeError(w, 401, fmt.Sprintf("Agent token reference %q was not found in the OS Keychain: %v", agentToken, err))
 			return
 		}
