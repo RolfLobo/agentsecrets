@@ -3,6 +3,7 @@ package commands
 import (
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"sort"
 	"strings"
 
@@ -82,10 +83,19 @@ func runSecretsPolicySet(cmd *cobra.Command, args []string) error {
 	}
 
 	env := config.ResolveEnvironment()
-	if env == "production" {
-		if err := verifyPasswordLocally(); err != nil {
-			return err
-		}
+
+	// Policy changes are security-sensitive — always require password verification.
+	if err := verifyPasswordLocally(); err != nil {
+		return err
+	}
+
+	// Validate that the secret key actually exists locally before allowing a policy.
+	exists, err := keyring.SecretExists(project.ProjectID, env, key)
+	if err != nil {
+		return fmt.Errorf("failed to check if secret exists: %w", err)
+	}
+	if !exists {
+		return fmt.Errorf("secret '%s' does not exist in the '%s' environment. Add it first with: agentsecrets secrets set %s=VALUE", key, env, key)
 	}
 
 	// Validate action
@@ -120,6 +130,22 @@ func runSecretsPolicySet(cmd *cobra.Command, args []string) error {
 		domains = append(domains, strings.ToLower(strings.TrimSpace(d)))
 	}
 
+	// Validate that all policy domains are in the workspace allowlist.
+	if len(domains) > 0 && project.WorkspaceID != "" {
+		allowlist, alErr := keyring.GetWorkspaceAllowlist(project.WorkspaceID)
+		if alErr == nil && len(allowlist) > 0 {
+			allowlistSet := make(map[string]bool, len(allowlist))
+			for _, d := range allowlist {
+				allowlistSet[strings.ToLower(d)] = true
+			}
+			for _, d := range domains {
+				if !allowlistSet[d] {
+					return fmt.Errorf("domain '%s' is not in your workspace allowlist. Add it first with: agentsecrets workspace allowlist add %s", d, d)
+				}
+			}
+		}
+	}
+
 	policy := capabilities.SecretPolicy{
 		Domains: domains,
 		Methods: methodsMap,
@@ -130,6 +156,23 @@ func runSecretsPolicySet(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("failed to serialize policy: %w", err)
 	}
 
+	// 1. Save secret policy to cloud
+	if apiClient != nil {
+		resp, err := apiClient.Call("secrets.set_policy", "PUT", policy, map[string]string{
+			"project_id":  project.ProjectID,
+			"environment": env,
+			"key":         key,
+		}, nil)
+		if err != nil {
+			return fmt.Errorf("failed to save policy to cloud: %w", err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			return apiClient.DecodeError(resp)
+		}
+	}
+
+	// 2. Save secret policy to local keyring
 	if err := keyring.SetSecretPolicy(project.ProjectID, env, key, policyBytes); err != nil {
 		return fmt.Errorf("failed to save secret policy to keyring: %w", err)
 	}
@@ -141,6 +184,7 @@ func runSecretsPolicySet(cmd *cobra.Command, args []string) error {
 	ui.Success(fmt.Sprintf("Policy updated for secret %s", key))
 	return nil
 }
+
 
 func runSecretsPolicyGet(cmd *cobra.Command, args []string) error {
 	key := args[0]
@@ -197,13 +241,30 @@ func runSecretsPolicyDelete(cmd *cobra.Command, args []string) error {
 	}
 
 	env := config.ResolveEnvironment()
-	if env == "production" {
-		if err := verifyPasswordLocally(); err != nil {
-			return err
+
+	// Policy changes are security-sensitive — always require password verification.
+	if err := verifyPasswordLocally(); err != nil {
+		return err
+	}
+
+	// 1. Delete on cloud API (by setting to empty policy)
+	if apiClient != nil {
+		emptyPolicy := capabilities.SecretPolicy{}
+		resp, err := apiClient.Call("secrets.set_policy", "PUT", emptyPolicy, map[string]string{
+			"project_id":  project.ProjectID,
+			"environment": env,
+			"key":         key,
+		}, nil)
+		if err != nil {
+			return fmt.Errorf("failed to delete policy on cloud: %w", err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			return apiClient.DecodeError(resp)
 		}
 	}
 
-	// Deleting the policy is setting it to nil
+	// 2. Deleting the policy locally is setting it to nil
 	if err := keyring.SetSecretPolicy(project.ProjectID, env, key, nil); err != nil {
 		return fmt.Errorf("failed to delete policy: %w", err)
 	}
@@ -215,6 +276,7 @@ func runSecretsPolicyDelete(cmd *cobra.Command, args []string) error {
 	ui.Success(fmt.Sprintf("Policy deleted for secret %s", key))
 	return nil
 }
+
 
 func runSecretsPolicyList(cmd *cobra.Command, _ []string) error {
 	project, err := config.LoadProjectConfig()

@@ -24,7 +24,6 @@ var (
 	logsSecretFlag string
 	logsLastFlag   int
 	logsEnvFlag    string
-	allowLocalHTTP bool
 )
 
 var proxyCmd = &cobra.Command{
@@ -82,7 +81,6 @@ Example:
 
 func init() {
 	proxyStartCmd.Flags().IntVar(&proxyPort, "port", 8765, "Port to listen on")
-	proxyStartCmd.Flags().BoolVar(&allowLocalHTTP, "allow-local-http", false, "Allow HTTP connections to local loopback destinations")
 
 	proxyLogsCmd.Flags().StringVar(&logsSecretFlag, "secret", "", "Filter logs by secret key name")
 	proxyLogsCmd.Flags().IntVar(&logsLastFlag, "last", 20, "Number of recent log entries to show")
@@ -132,7 +130,6 @@ func runProxyStart(cmd *cobra.Command, args []string) error {
 
 	ui.StatusRow("Project:", project.ProjectName)
 	ui.StatusRow("Port:", fmt.Sprintf("%d", proxyPort))
-	ui.StatusRow("Local HTTP:", fmt.Sprintf("%t", allowLocalHTTP))
 	fmt.Println()
 
 	engine, err := proxy.NewEngine(project.ProjectID)
@@ -143,11 +140,6 @@ func runProxyStart(cmd *cobra.Command, args []string) error {
 			"Check if there are conflicts in your local configuration or storage.",
 		)
 		return nil
-	}
-
-	// Set allow local HTTP flag
-	if allowLocalHTTP {
-		engine.AllowLocalHTTP = true
 	}
 
 	// Inject apiClient for cloud log syncing
@@ -358,7 +350,8 @@ func runProxyLogs(cmd *cobra.Command, args []string) error {
 	defer svc.Close()
 
 	filter := log.Filter{
-		Limit: logsLastFlag,
+		Limit:             logsLastFlag,
+		ExcludeManagement: true,
 	}
 	if logsSecretFlag != "" {
 		filter.Credential = logsSecretFlag

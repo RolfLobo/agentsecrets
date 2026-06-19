@@ -14,11 +14,14 @@ import (
 // conn holds the persistent connection to the keychain-auth daemon.
 // The connection itself is the authenticated session — no tokens needed.
 var (
-	conn        net.Conn
-	scanner     *bufio.Scanner
-	encoder     *json.Encoder
-	sessionMu   sync.Mutex
-	initialized bool
+	conn          net.Conn
+	scanner       *bufio.Scanner
+	encoder       *json.Encoder
+	sessionMu     sync.Mutex
+	initialized   bool
+	testStubMode  bool
+	testStubStore map[string]string
+	testStubMu    sync.RWMutex
 )
 
 // Init connects to the keychain-auth daemon.
@@ -255,9 +258,14 @@ func GetAllProjectSecrets(projectID, environment string) (map[string]string, err
 	result := make(map[string]string, len(resp.Results))
 	for _, item := range resp.Results {
 		bare := stripPrefix(item.Target, prefix)
-		if bare != "" {
-			result[bare] = item.Value
+		if bare == "" {
+			continue
 		}
+		// Skip metadata entries (e.g. "KEY:policy") — only return actual secrets.
+		if strings.HasSuffix(bare, ":policy") {
+			continue
+		}
+		result[bare] = item.Value
 	}
 	return result, nil
 }
@@ -279,12 +287,18 @@ func ListProjectKeyNames(projectID, environment string) ([]string, error) {
 	keys := make([]string, 0, len(resp.Results))
 	for _, item := range resp.Results {
 		bare := stripPrefix(item.Target, prefix)
-		if bare != "" {
-			keys = append(keys, bare)
+		if bare == "" {
+			continue
 		}
+		// Skip metadata entries (e.g. "KEY:policy") — only return actual secret keys.
+		if strings.HasSuffix(bare, ":policy") {
+			continue
+		}
+		keys = append(keys, bare)
 	}
 	return keys, nil
 }
+
 
 // SetWorkspaceAllowlist stores the domain allowlist for a workspace.
 func SetWorkspaceAllowlist(workspaceID string, domains []string) error {
@@ -363,6 +377,11 @@ func GetSecretPolicy(projectID, environment, key string) ([]byte, error) {
 // The caller must NOT hold sessionMu.
 func sendRequest(req request) (*response, error) {
 	sessionMu.Lock()
+	testMode := testStubMode
+	if testMode {
+		sessionMu.Unlock()
+		return handleStubRequest(req)
+	}
 	defer sessionMu.Unlock()
 
 	if !initialized {
@@ -427,4 +446,130 @@ func stripPrefix(target, prefix string) string {
 		return target[len(prefix):]
 	}
 	return ""
+}
+
+// Write writes a value to a service/target namespace in the OS keychain via the daemon.
+func Write(service, target, value string) error {
+	_, err := sendRequest(request{
+		Type:    typeRequest,
+		Action:  actionWrite,
+		Service: service,
+		Targets: []string{target},
+		Values:  []string{value},
+	})
+	return err
+}
+
+// Read retrieves a single value for a service/target from the OS keychain via the daemon.
+func Read(service, target string) (string, error) {
+	resp, err := sendRequest(request{
+		Type:    typeRequest,
+		Action:  actionRead,
+		Service: service,
+		Targets: []string{target},
+	})
+	if err != nil {
+		return "", err
+	}
+	if len(resp.Results) == 0 {
+		return "", fmt.Errorf("keychainauth: target %q not found", target)
+	}
+	return resp.Results[0].Value, nil
+}
+
+// Delete removes a service/target entry from the OS keychain via the daemon.
+func Delete(service, target string) error {
+	_, err := sendRequest(request{
+		Type:    typeRequest,
+		Action:  actionDelete,
+		Service: service,
+		Targets: []string{target},
+	})
+	return err
+}
+
+// Search returns a list of target keys registered under a service namespace that start with a prefix.
+func Search(service, prefix string) ([]string, error) {
+	resp, err := sendRequest(request{
+		Type:    typeRequest,
+		Action:  actionSearch,
+		Service: service,
+		Targets: []string{prefix},
+	})
+	if err != nil {
+		return nil, err
+	}
+	results := make([]string, 0, len(resp.Results))
+	for _, r := range resp.Results {
+		results = append(results, r.Target)
+	}
+	return results, nil
+}
+
+// SetupTestStub enables an in-memory client stub for running unit tests without a running daemon.
+func SetupTestStub() {
+	sessionMu.Lock()
+	defer sessionMu.Unlock()
+	testStubMode = true
+	testStubStore = make(map[string]string)
+	initialized = true
+}
+
+// TeardownTestStub disables the in-memory client stub and clears test store data.
+func TeardownTestStub() {
+	sessionMu.Lock()
+	defer sessionMu.Unlock()
+	testStubMode = false
+	testStubStore = nil
+	initialized = false
+}
+
+func handleStubRequest(req request) (*response, error) {
+	testStubMu.Lock()
+	defer testStubMu.Unlock()
+
+	resp := &response{
+		Type:   typeResponse,
+		Status: "success",
+	}
+
+	switch req.Action {
+	case actionRead:
+		for _, target := range req.Targets {
+			key := req.Service + ":" + target
+			if val, ok := testStubStore[key]; ok {
+				resp.Results = append(resp.Results, resultItem{
+					Target: target,
+					Value:  val,
+				})
+			}
+		}
+	case actionWrite:
+		for i, target := range req.Targets {
+			key := req.Service + ":" + target
+			testStubStore[key] = req.Values[i]
+		}
+	case actionDelete:
+		for _, target := range req.Targets {
+			key := req.Service + ":" + target
+			delete(testStubStore, key)
+		}
+	case actionSearch:
+		if len(req.Targets) > 0 {
+			prefix := req.Targets[0]
+			for k, val := range testStubStore {
+				if strings.HasPrefix(k, req.Service+":") {
+					target := strings.TrimPrefix(k, req.Service+":")
+					if strings.HasPrefix(target, prefix) {
+						resp.Results = append(resp.Results, resultItem{
+							Target: target,
+							Value:  val,
+						})
+					}
+				}
+			}
+		}
+	}
+
+	return resp, nil
 }

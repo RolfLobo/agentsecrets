@@ -9,6 +9,7 @@ import (
 
 	"github.com/The-17/agentsecrets/pkg/api"
 	"github.com/The-17/agentsecrets/pkg/capabilities"
+	"github.com/The-17/agentsecrets/pkg/keyring"
 )
 
 type CachedToken struct {
@@ -67,8 +68,33 @@ func (c *TokenCache) Validate(token string, apiClient *api.Client) (*CachedToken
 	}
 
 	resp, err := apiClient.Call("agents.token_validate", "POST", payload, nil, nil)
-	if err != nil {
-		return nil, fmt.Errorf("failed to call token validation API: %w", err)
+	if err != nil || resp.StatusCode >= 500 {
+		// Network or server error — try local keyring fallback
+		agentName, findErr := keyring.FindAgentNameByToken(token)
+		if findErr == nil {
+			capsBytes, getErr := keyring.GetAgentCapabilities(agentName)
+			if getErr == nil && len(capsBytes) > 0 {
+				var caps capabilities.AgentCapabilities
+				if unmarshalErr := json.Unmarshal(capsBytes, &caps); unmarshalErr == nil {
+					// Found locally cached capabilities!
+					cachedToken := &CachedToken{
+						TokenID:      "cached_" + agentName,
+						AgentID:      agentName,
+						AgentName:    agentName,
+						Capabilities: caps,
+						ValidatedAt:  time.Now(),
+					}
+					c.mu.Lock()
+					c.tokens[token] = cachedToken
+					c.mu.Unlock()
+					return cachedToken, nil
+				}
+			}
+		}
+		if err != nil {
+			return nil, fmt.Errorf("failed to call token validation API: %w", err)
+		}
+		return nil, fmt.Errorf("token validation API returned status %d", resp.StatusCode)
 	}
 	defer resp.Body.Close()
 
@@ -83,6 +109,15 @@ func (c *TokenCache) Validate(token string, apiClient *api.Client) (*CachedToken
 
 	if !res.Valid {
 		return nil, fmt.Errorf("invalid token: %s", res.Reason)
+	}
+
+	// Cache validated capabilities in the local keyring for offline fallback
+	if res.AgentName != "" {
+		_ = keyring.SetAgentToken(res.AgentName, token)
+		capsBytes, marshalErr := json.Marshal(res.Capabilities)
+		if marshalErr == nil {
+			_ = keyring.SetAgentCapabilities(res.AgentName, capsBytes)
+		}
 	}
 
 	cachedToken := &CachedToken{

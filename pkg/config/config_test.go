@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/The-17/agentsecrets/pkg/keychainauth"
 	"github.com/The-17/agentsecrets/pkg/keyring"
 )
 
@@ -15,13 +16,9 @@ func TestConfigRoundtrip(t *testing.T) {
 	HomeDirHook = func() (string, error) { return tmpDir, nil }
 	defer func() { HomeDirHook = oldHome }()
 
-	// Redirect keyring home directory and force file backend to isolate tests
-	oldKeyringHome := keyring.HomeDirHook
-	keyring.HomeDirHook = func() (string, error) { return tmpDir, nil }
-	defer func() { keyring.HomeDirHook = oldKeyringHome }()
-
-	keyring.ForceFileBackend(true)
-	defer keyring.ForceFileBackend(false)
+	// Set up the in-memory test stub for keychain-auth
+	keychainauth.SetupTestStub()
+	defer keychainauth.TeardownTestStub()
 
 	// 1. Init
 	if err := InitGlobalConfig(); err != nil {

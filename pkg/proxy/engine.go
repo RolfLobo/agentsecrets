@@ -21,6 +21,7 @@ import (
 	"github.com/The-17/agentsecrets/pkg/errors"
 	"github.com/The-17/agentsecrets/pkg/keyring"
 	"github.com/The-17/agentsecrets/pkg/telemetry"
+	"github.com/The-17/agentsecrets/pkg/workspaces"
 )
 
 // resolveEnvForAudit returns the current environment for audit logging.
@@ -91,7 +92,6 @@ type Engine struct {
 	Transient        bool
 	TokenCache       *TokenCache
 	APIClient        *api.Client
-	AllowLocalHTTP   bool
 
 	// Live State
 	LastSync   time.Time
@@ -118,16 +118,13 @@ func NewEngine(projectID string) (*Engine, error) {
 
 	apiClient := auth.NewAuthenticatedClient()
 
-	allowLocalHTTP := os.Getenv("AGENTSECRETS_ALLOW_LOCAL_HTTP") == "true"
-
 	eng := &Engine{
-		ProjectID:      projectID,
-		WorkspaceID:    pc.WorkspaceID,
-		Audit:          audit,
-		Approvals:      NewApprovalStore(),
-		AllowLocalHTTP: allowLocalHTTP,
-		APIClient:      apiClient,
-		TokenCache:     NewTokenCache(5 * time.Minute),
+		ProjectID:   projectID,
+		WorkspaceID: pc.WorkspaceID,
+		Audit:       audit,
+		Approvals:   NewApprovalStore(),
+		APIClient:   apiClient,
+		TokenCache:  NewTokenCache(5 * time.Minute),
 	}
 
 	dialer := &net.Dialer{
@@ -154,10 +151,6 @@ func NewEngine(projectID string) (*Engine, error) {
 			// Validate all resolved IPs
 			for _, resolvedIP := range ips {
 				if isPrivateOrLoopbackIP(resolvedIP) {
-					// Check if loopback is allowed
-					if isLoopbackIP(resolvedIP) && eng.AllowLocalHTTP {
-						continue
-					}
 					return nil, fmt.Errorf("SSRF prevention: connection to private/loopback IP %s is blocked", resolvedIP)
 				}
 			}
@@ -196,17 +189,62 @@ func NewEngine(projectID string) (*Engine, error) {
 	}
 	eng.ResolvePolicy = func(key string) (*capabilities.SecretPolicy, error) {
 		policyBytes, err := keyring.GetSecretPolicy(projectID, resolveEnvForAudit(), key)
-		if err != nil {
-			return nil, nil // no policy = unrestricted
+		if err == nil && len(policyBytes) > 0 {
+			var policy capabilities.SecretPolicy
+			if err := json.Unmarshal(policyBytes, &policy); err == nil {
+				return &policy, nil
+			}
 		}
-		var policy capabilities.SecretPolicy
-		if err := json.Unmarshal(policyBytes, &policy); err != nil {
-			return nil, nil // malformed policy = treat as unrestricted
+
+		// Keychain is empty (or failed/malformed) — fallback to cloud API
+		if eng.APIClient != nil {
+			resp, err := eng.APIClient.Call("secrets.get_policy", "GET", nil, map[string]string{
+				"project_id":  projectID,
+				"environment": resolveEnvForAudit(),
+				"key":         key,
+			}, nil)
+			if err == nil {
+				defer resp.Body.Close()
+				if resp.StatusCode == http.StatusOK {
+					var res struct {
+						Data capabilities.SecretPolicy `json:"data"`
+					}
+					if err := json.NewDecoder(resp.Body).Decode(&res); err == nil {
+						// Cache in local keyring
+						pBytes, err := json.Marshal(res.Data)
+						if err == nil {
+							_ = keyring.SetSecretPolicy(projectID, resolveEnvForAudit(), key, pBytes)
+						}
+						return &res.Data, nil
+					}
+				}
+			}
 		}
-		return &policy, nil
+
+		return nil, nil // default unrestricted
 	}
-	eng.ResolveAllowlist = func(workspaceID string) ([]string, error) {
-		return keyring.GetWorkspaceAllowlist(workspaceID)
+	eng.ResolveAllowlist = func(wsID string) ([]string, error) {
+		domains, err := keyring.GetWorkspaceAllowlist(wsID)
+		if err != nil {
+			return nil, err
+		}
+
+		// Keychain is empty — this happens after a daemon restart (in-memory backend
+		// on Linux/WSL loses state) or on a fresh machine before a pull.
+		// Fall back to the API and re-cache so subsequent calls are served locally.
+		if len(domains) == 0 && apiClient != nil {
+			wsSvc := workspaces.NewService(apiClient)
+			apiDomains, apiErr := wsSvc.ListAllowlist(wsID)
+			if apiErr == nil && len(apiDomains) > 0 {
+				for _, d := range apiDomains {
+					domains = append(domains, d.Domain)
+				}
+				// Cache back to keychain so the next call is served locally.
+				_ = keyring.SetWorkspaceAllowlist(wsID, domains)
+			}
+		}
+
+		return domains, nil
 	}
 
 	return eng, nil
@@ -313,14 +351,7 @@ func (e *Engine) Execute(req CallRequest) (*CallResult, error) {
 
 	// 2. Enforce HTTPS Target
 	if strings.ToLower(u.Scheme) != "https" && flag.Lookup("test.v") == nil {
-		isLocal := false
-		hostLower := strings.ToLower(u.Hostname())
-		if hostLower == "localhost" || hostLower == "127.0.0.1" || hostLower == "::1" {
-			isLocal = true
-		}
-		if !(isLocal && e.AllowLocalHTTP) {
-			return logBlocked("non_https_blocked", "Non-HTTPS requests are strictly blocked by the proxy to prevent credential exposure. Use HTTPS instead.")
-		}
+		return logBlocked("non_https_blocked", "Non-HTTPS requests are strictly blocked by the proxy to prevent credential exposure. Use HTTPS instead.")
 	}
 
 	// 3. Resolve Agent Identity and enforce capabilities and workspace/project/environment scopes
@@ -346,7 +377,7 @@ func (e *Engine) Execute(req CallRequest) (*CallResult, error) {
 		token = retrievedToken
 	}
 
-	if token != "" {
+	if token != "" && req.Capabilities == nil {
 		req.IdentityLevel = "issued"
 		req.TokenID = maskToken(token)
 

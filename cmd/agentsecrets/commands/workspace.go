@@ -74,6 +74,7 @@ func init() {
 			Args:  cobra.ExactArgs(1),
 			RunE:  runWorkspaceDemote,
 		},
+		workspaceLogsCmd,
 	)
 }
 

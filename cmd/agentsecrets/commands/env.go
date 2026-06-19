@@ -226,16 +226,31 @@ func generateVariants(secrets map[string]string) []string {
 		add(b64Std)
 		add(strings.ToLower(b64Std))
 		add(strings.ToUpper(b64Std))
+		// Raw (unpadded) Std
+		b64StdRaw := strings.TrimRight(b64Std, "=")
+		add(b64StdRaw)
+		add(strings.ToLower(b64StdRaw))
+		add(strings.ToUpper(b64StdRaw))
 
 		b64URL := base64.URLEncoding.EncodeToString([]byte(value))
 		add(b64URL)
 		add(strings.ToLower(b64URL))
 		add(strings.ToUpper(b64URL))
+		// Raw (unpadded) URL
+		b64URLRaw := strings.TrimRight(b64URL, "=")
+		add(b64URLRaw)
+		add(strings.ToLower(b64URLRaw))
+		add(strings.ToUpper(b64URLRaw))
 
 		// 4. Hex variant
 		hx := hex.EncodeToString([]byte(value))
 		add(hx)
 		add(strings.ToUpper(hx))
+		// Prefixed Hex
+		add("0x" + hx)
+		add("0x" + strings.ToUpper(hx))
+		add("0X" + hx)
+		add("0X" + strings.ToUpper(hx))
 
 		// 5. URL Query Escape
 		add(url.QueryEscape(value))

@@ -2,25 +2,20 @@ package main
 
 import (
 	"fmt"
-	"os"
-
-	"github.com/The-17/agentsecrets/pkg/api"
 	"github.com/The-17/agentsecrets/pkg/config"
-	"github.com/The-17/agentsecrets/pkg/workspaces"
 )
 
 func main() {
-	client := api.NewClient(func() string {
-		return config.GetAccessToken()
-	})
-	wsSvc := workspaces.NewService(client)
-	domains, err := wsSvc.ListAllowlist("e6ff8934-8fb7-46b9-8899-02682b666d2a")
+	fmt.Printf("IsAuthenticated: %v\n", config.IsAuthenticated())
+	fmt.Printf("GetEmail: %q\n", config.GetEmail())
+	tokens, err := config.LoadTokens()
 	if err != nil {
-		fmt.Printf("Error: %v\n", err)
-		os.Exit(1)
-	}
-	fmt.Printf("Count: %d\n", len(domains))
-	for _, d := range domains {
-		fmt.Printf("- %s (added by %s)\n", d.Domain, d.AddedBy)
+		fmt.Printf("LoadTokens Error: %v\n", err)
+	} else if tokens != nil {
+		fmt.Printf("Access Token: %q\n", tokens.AccessToken)
+		fmt.Printf("Refresh Token: %q\n", tokens.RefreshToken)
+		fmt.Printf("Expires At: %q\n", tokens.ExpiresAt)
+	} else {
+		fmt.Println("Tokens: nil")
 	}
 }

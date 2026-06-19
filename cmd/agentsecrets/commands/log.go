@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/The-17/agentsecrets/pkg/config"
 	"github.com/The-17/agentsecrets/pkg/errors"
 	"github.com/The-17/agentsecrets/pkg/log"
 	"github.com/The-17/agentsecrets/pkg/proxy"
@@ -37,12 +38,14 @@ var logWatchCmd = &cobra.Command{
 	},
 }
 
-var logCmd = &cobra.Command{
-	Use:   "log",
+var logsCmd = &cobra.Command{
+	Use:   "logs",
 	Short: "View and filter the credential call audit log",
 	Long:  "Every call made through the AgentSecrets proxy is logged here.\nThe log records which agent made the call, which credential was\nreferenced, which API was called, and what happened — but never\nthe credential value.",
 	PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
-		// Run root's persistent pre-run if exists (or init auth)
+		if err := ensureDaemonInitialized(); err != nil {
+			return err
+		}
 		if err := authService.EnsureAuth(cmd, args); err != nil {
 			return err
 		}
@@ -62,13 +65,27 @@ var logShowCmd = &cobra.Command{
 	Args:  cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		id := args[0]
+		cfg, _ := config.LoadGlobalConfig()
+		wsID := config.GetSelectedWorkspaceID()
+		var entry *proxy.AuditEvent
+		var err error
+
+		if cfg != nil && wsID != "" && strings.EqualFold(cfg.Workspaces[wsID].Type, "shared") {
+			entry, err = logService.GetRemoteLog(id)
+			if err != nil {
+				return errors.New(errors.ErrLogNotFound, fmt.Sprintf("log entry %q not found remotely: %v", id, err), err)
+			}
+			showLogDetail(*entry)
+			return nil
+		}
+
 		fe, err := logService.GetForensicLog(id)
 		if err == nil {
 			showForensicLogDetail(fe)
 			return nil
 		}
 
-		entry, err := logService.GetLog(id)
+		entry, err = logService.GetLog(id)
 		if err != nil {
 			return errors.New(errors.ErrLogNotFound, fmt.Sprintf("log entry %q not found locally", id), err)
 		}
@@ -84,7 +101,7 @@ var logSummaryCmd = &cobra.Command{
 		since, _ := cmd.Flags().GetString("since")
 		filter := buildFilter(cmd, since)
 
-		logs, err := logService.QueryLocal(filter)
+		logs, err := queryLogs(filter)
 		if err != nil {
 			return err
 		}
@@ -201,7 +218,7 @@ var logExportCmd = &cobra.Command{
 			filter.Until = parseDuration(untilStr)
 		}
 
-		logs, err := logService.QueryLocal(filter)
+		logs, err := queryLogs(filter)
 		if err != nil {
 			return err
 		}
@@ -356,6 +373,7 @@ func buildFilter(cmd *cobra.Command, sinceStr string) log.Filter {
 	f.ProjectID, _ = cmd.Flags().GetString("project")
 	f.Environment, _ = cmd.Flags().GetString("env")
 	f.Limit, _ = cmd.Flags().GetInt("limit")
+	f.ExcludeManagement = true
 
 	untilStr, _ := cmd.Flags().GetString("until")
 	if sinceStr != "" {
@@ -386,9 +404,24 @@ func colorStatus(statusCode int, status string) string {
 	}
 }
 
-func runLogList(cmd *cobra.Command, args []string) error {
-	sinceStr, _ := cmd.Flags().GetString("since")
-	filter := buildFilter(cmd, sinceStr)
+func queryLogs(filter log.Filter) ([]proxy.AuditEvent, error) {
+	cfg, err := config.LoadGlobalConfig()
+	if err != nil {
+		return nil, err
+	}
+	wsID := config.GetSelectedWorkspaceID()
+	if wsID == "" {
+		return nil, fmt.Errorf("no workspace selected")
+	}
+	filter.WorkspaceID = wsID
+	ws := cfg.Workspaces[wsID]
+	if strings.EqualFold(ws.Type, "shared") {
+		return logService.QueryRemote(wsID, filter)
+	}
+	return logService.QueryLocal(filter)
+}
+
+func runLogListWithFilter(cmd *cobra.Command, filter log.Filter) error {
 	useJSON, _ := cmd.Flags().GetBool("json")
 	useTail, _ := cmd.Flags().GetBool("tail")
 
@@ -397,7 +430,7 @@ func runLogList(cmd *cobra.Command, args []string) error {
 	}
 
 	if useJSON {
-		logs, err := logService.QueryLocal(filter)
+		logs, err := queryLogs(filter)
 		if err != nil {
 			return err
 		}
@@ -412,7 +445,7 @@ func runLogList(cmd *cobra.Command, args []string) error {
 	for {
 		filter.Limit = logPageSize
 		filter.Offset = offset
-		logs, err := logService.QueryLocal(filter)
+		logs, err := queryLogs(filter)
 		if err != nil {
 			return err
 		}
@@ -466,7 +499,7 @@ func runLogList(cmd *cobra.Command, args []string) error {
 		// Anonymous call hint
 		if anonymousCount > 0 {
 			fmt.Println("\n" + ui.WarningStyle.Render(fmt.Sprintf("%d anonymous calls detected.", anonymousCount)))
-			fmt.Println("Run: agentsecrets log --identity anonymous")
+			fmt.Println("Run: agentsecrets logs --identity anonymous")
 		}
 
 		fmt.Println("\n" + ui.DimStyle.Render("Navigation: [n]ext, [p]rev, [1-20] for detail, [q]uit"))
@@ -504,6 +537,74 @@ func runLogList(cmd *cobra.Command, args []string) error {
 		}
 	}
 }
+
+func runLogList(cmd *cobra.Command, args []string) error {
+	sinceStr, _ := cmd.Flags().GetString("since")
+	filter := buildFilter(cmd, sinceStr)
+	return runLogListWithFilter(cmd, filter)
+}
+
+func runProjectLogs(cmd *cobra.Command, args []string) error {
+	sinceStr, _ := cmd.Flags().GetString("since")
+	filter := buildFilter(cmd, sinceStr)
+
+	var projectID string
+	if pc, err := config.LoadProjectConfig(); err == nil && pc != nil {
+		projectID = pc.ProjectID
+	} else {
+		cfg, _ := config.LoadGlobalConfig()
+		if cfg != nil {
+			projectID = cfg.SelectedProjectID
+		}
+	}
+	if projectID == "" {
+		return fmt.Errorf("no project selected — run 'agentsecrets project use' first")
+	}
+	filter.ProjectID = projectID
+
+	return runLogListWithFilter(cmd, filter)
+}
+
+var workspaceLogsCmd = &cobra.Command{
+	Use:   "logs",
+	Short: "View audit logs for the current workspace",
+	PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
+		if err := ensureDaemonInitialized(); err != nil {
+			return err
+		}
+		if err := authService.EnsureAuth(cmd, args); err != nil {
+			return err
+		}
+		var err error
+		logService, err = log.NewService(apiClient, nil)
+		if err != nil {
+			return fmt.Errorf("could not initialize log service: %v", err)
+		}
+		return nil
+	},
+	RunE: runLogList,
+}
+
+var projectLogsCmd = &cobra.Command{
+	Use:   "logs",
+	Short: "View audit logs for the current project",
+	PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
+		if err := ensureDaemonInitialized(); err != nil {
+			return err
+		}
+		if err := authService.EnsureAuth(cmd, args); err != nil {
+			return err
+		}
+		var err error
+		logService, err = log.NewService(apiClient, nil)
+		if err != nil {
+			return fmt.Errorf("could not initialize log service: %v", err)
+		}
+		return nil
+	},
+	RunE: runProjectLogs,
+}
+
 
 // displayLogBasic prints a single log entry in the spec format:
 // 14:22:01  billing-tool  →  api.stripe.com  POST /v1/charges  200  143ms
@@ -847,12 +948,12 @@ var logReplayCmd = &cobra.Command{
 }
 
 func init() {
-	logCmd.AddCommand(logShowCmd)
-	logCmd.AddCommand(logSummaryCmd)
-	logCmd.AddCommand(logWatchCmd)
-	logCmd.AddCommand(logExportCmd)
-	logCmd.AddCommand(logVerifyCmd)
-	logCmd.AddCommand(logReplayCmd)
+	logsCmd.AddCommand(logShowCmd)
+	logsCmd.AddCommand(logSummaryCmd)
+	logsCmd.AddCommand(logWatchCmd)
+	logsCmd.AddCommand(logExportCmd)
+	logsCmd.AddCommand(logVerifyCmd)
+	logsCmd.AddCommand(logReplayCmd)
 
 	addFilterFlags := func(c *cobra.Command) {
 		c.Flags().String("agent", "", "filter by agent name")
@@ -873,12 +974,26 @@ func init() {
 		c.Flags().Int("limit", 50, "number of entries to show (default 50)")
 	}
 
-	addFilterFlags(logCmd)
-	logCmd.Flags().Bool("verbose", false, "full record including allowlist snapshot")
-	logCmd.Flags().Bool("json", false, "output as newline-delimited JSON")
-	logCmd.Flags().Bool("csv", false, "output as CSV with headers")
-	logCmd.Flags().Bool("no-color", false, "disable color output")
-	logCmd.Flags().Bool("tail", false, "live stream new entries (same as log watch)")
+	addFilterFlags(logsCmd)
+	logsCmd.Flags().Bool("verbose", false, "full record including allowlist snapshot")
+	logsCmd.Flags().Bool("json", false, "output as newline-delimited JSON")
+	logsCmd.Flags().Bool("csv", false, "output as CSV with headers")
+	logsCmd.Flags().Bool("no-color", false, "disable color output")
+	logsCmd.Flags().Bool("tail", false, "live stream new entries (same as log watch)")
+
+	addFilterFlags(workspaceLogsCmd)
+	workspaceLogsCmd.Flags().Bool("verbose", false, "full record including allowlist snapshot")
+	workspaceLogsCmd.Flags().Bool("json", false, "output as newline-delimited JSON")
+	workspaceLogsCmd.Flags().Bool("csv", false, "output as CSV with headers")
+	workspaceLogsCmd.Flags().Bool("no-color", false, "disable color output")
+	workspaceLogsCmd.Flags().Bool("tail", false, "live stream new entries")
+
+	addFilterFlags(projectLogsCmd)
+	projectLogsCmd.Flags().Bool("verbose", false, "full record including allowlist snapshot")
+	projectLogsCmd.Flags().Bool("json", false, "output as newline-delimited JSON")
+	projectLogsCmd.Flags().Bool("csv", false, "output as CSV with headers")
+	projectLogsCmd.Flags().Bool("no-color", false, "disable color output")
+	projectLogsCmd.Flags().Bool("tail", false, "live stream new entries")
 
 	logSummaryCmd.Flags().String("since", "7d", "default: 7d")
 	logSummaryCmd.Flags().String("until", "", "")
@@ -910,7 +1025,7 @@ func watchLogs(svc *log.Service) error {
 			Since: lastSeen,
 			Limit: 20,
 		}
-		logs, err := svc.QueryLocal(filter)
+		logs, err := queryLogs(filter)
 		if err == nil && len(logs) > 0 {
 			// Logs come in newest first
 			for i := len(logs) - 1; i >= 0; i-- {

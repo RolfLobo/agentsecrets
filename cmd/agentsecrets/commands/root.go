@@ -6,6 +6,7 @@ import (
 
 	"errors"
 	"fmt"
+	"github.com/The-17/agentsecrets/pkg/agents"
 	"github.com/The-17/agentsecrets/pkg/api"
 	"github.com/The-17/agentsecrets/pkg/auth"
 	"github.com/The-17/agentsecrets/pkg/config"
@@ -96,21 +97,38 @@ func init() {
 	rootCmd.AddCommand(statusCmd)
 
 	// Add auth middleware to commands that require it
-	workspaceCmd.PersistentPreRunE = authService.EnsureAuth
-	projectCmd.PersistentPreRunE = authService.EnsureAuth
-	environmentCmd.PersistentPreRunE = authService.EnsureAuth
-	proxyCmd.PersistentPreRunE = authService.EnsureAuth
+	workspaceCmd.PersistentPreRunE = keychainAuthMiddleware
+	projectCmd.PersistentPreRunE = keychainAuthMiddleware
+	environmentCmd.PersistentPreRunE = keychainAuthMiddleware
+	proxyCmd.PersistentPreRunE = keychainAuthMiddleware
+	agentCmd.PersistentPreRunE = func(cmd *cobra.Command, args []string) error {
+		if err := keychainAuthMiddleware(cmd, args); err != nil {
+			return err
+		}
+		// Init agent service (originally in agent.go's PersistentPreRunE)
+		if agentService == nil {
+			agentService = agents.NewService(apiClient)
+		}
+		return nil
+	}
 
 	// Commands that read secrets or display sensitive info need auth verification.
-	// The keychainAuthMiddleware (currently auth-only) handles this.
+	// The keychainAuthMiddleware handles this.
 	secretsCmd.PersistentPreRunE = keychainAuthMiddleware
 	callCmd.PersistentPreRunE = keychainAuthMiddleware
+
+	// Authentication/setup commands that need secure keychain-auth connection but
+	// do not require the user to be already authenticated.
+	initCmd.PersistentPreRunE = daemonOnlyMiddleware
+	loginCmd.PersistentPreRunE = daemonOnlyMiddleware
+	logoutCmd.PersistentPreRunE = daemonOnlyMiddleware
+	statusCmd.PersistentPreRunE = daemonOnlyMiddleware
 
 	rootCmd.AddCommand(workspaceCmd)
 	rootCmd.AddCommand(projectCmd)
 	rootCmd.AddCommand(secretsCmd)
 	rootCmd.AddCommand(agentCmd)
-	rootCmd.AddCommand(logCmd)
+	rootCmd.AddCommand(logsCmd)
 	rootCmd.AddCommand(proxyCmd)
 	rootCmd.AddCommand(mcpCmd)
 	rootCmd.AddCommand(callCmd)
@@ -120,24 +138,16 @@ func init() {
 	rootCmd.AddCommand(docsCmd)
 }
 
-// keychainAuthMiddleware is a PersistentPreRunE that ensures both:
-// 1. The user is authenticated (EnsureAuth)
-// 2. A keychain-auth connection is established (keychainauth.Init)
-//
-// If keychain-auth is not installed or not running, it performs automatic
-// setup with a spinner so the user never has to think about it.
-func keychainAuthMiddleware(cmd *cobra.Command, args []string) error {
-	// Step 1: Ensure the user is logged in
-	if err := authService.EnsureAuth(cmd, args); err != nil {
-		return err
-	}
-
-	// Step 2: Skip if connection already established (e.g. parent command already ran this)
+// ensureDaemonInitialized ensures that:
+// 1. The keychain-auth daemon is set up and running (AutoSetup if missing/outdated)
+// 2. The client is successfully initialized and connected to the daemon socket/named pipe
+func ensureDaemonInitialized() error {
+	// Step 1: Skip if connection already established
 	if keychainauth.IsInitialized() {
 		return nil
 	}
 
-	// Step 3: If keychain-auth isn't available or we're not fully configured, run auto-setup with a spinner
+	// Step 2: If keychain-auth isn't available or we're not fully configured, run auto-setup with a spinner
 	if !keychainauth.IsAvailable() || !keychainauth.IsFullyConfigured() {
 		if err := ui.Spinner("Setting up keychain-auth...", func() error {
 			return keychainauth.AutoSetup()
@@ -148,7 +158,7 @@ func keychainAuthMiddleware(cmd *cobra.Command, args []string) error {
 			ui.Info("  brew install The-17/tap/keychain-auth")
 			ui.Info("  keychain-auth start")
 			fmt.Println()
-			return fmt.Errorf("keychain-auth is required for secret operations")
+			return fmt.Errorf("keychain-auth is required for secure credentials storage")
 		}
 	}
 
@@ -176,7 +186,7 @@ func keychainAuthMiddleware(cmd *cobra.Command, args []string) error {
 				ui.Info("  brew install The-17/tap/keychain-auth")
 				ui.Info("  keychain-auth start")
 				fmt.Println()
-				return fmt.Errorf("keychain-auth is required for secret operations")
+				return fmt.Errorf("keychain-auth is required for secure credentials storage")
 			}
 
 			err = keychainauth.Init()
@@ -198,4 +208,21 @@ func keychainAuthMiddleware(cmd *cobra.Command, args []string) error {
 	}
 
 	return nil
+}
+
+// keychainAuthMiddleware is a PersistentPreRunE that ensures both:
+// 1. The keychain-auth connection is established
+// 2. The user is authenticated (EnsureAuth)
+func keychainAuthMiddleware(cmd *cobra.Command, args []string) error {
+	if err := ensureDaemonInitialized(); err != nil {
+		return err
+	}
+	return authService.EnsureAuth(cmd, args)
+}
+
+// daemonOnlyMiddleware is a PersistentPreRunE that ensures the keychain-auth daemon
+// connection is established (without requiring user authentication first).
+// Used by bootstrap/login/logout flow.
+func daemonOnlyMiddleware(cmd *cobra.Command, args []string) error {
+	return ensureDaemonInitialized()
 }

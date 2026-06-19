@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"strings"
 	"time"
 
@@ -15,23 +16,25 @@ import (
 
 // Filter holds all options for querying audit logs.
 type Filter struct {
-	Agent       string
-	Token       string
-	Identity    string // "anonymous", "declared", "issued"
-	Credential  string
-	Domain      string
-	Method      string
-	Environment string // "development", "staging", "production"
-	Status      int
-	StatusClass string // "2xx", "4xx", "5xx", "error"
-	Failed      bool
-	Blocked     bool
-	Redacted    bool
-	ProjectID   string
-	Since       time.Time
-	Until       time.Time
-	Limit       int
-	Offset      int
+	Agent             string
+	Token             string
+	Identity          string // "anonymous", "declared", "issued"
+	Credential        string
+	Domain            string
+	Method            string
+	Environment       string // "development", "staging", "production"
+	Status            int
+	StatusClass       string // "2xx", "4xx", "5xx", "error"
+	Failed            bool
+	Blocked           bool
+	Redacted          bool
+	ProjectID         string
+	WorkspaceID       string
+	Since             time.Time
+	Until             time.Time
+	Limit             int
+	Offset            int
+	ExcludeManagement bool
 }
 
 // Service provides methods to query local and cloud audit logs.
@@ -149,6 +152,9 @@ func (s *Service) QueryLocal(f Filter) ([]proxy.AuditEvent, error) {
 // queryLocalLegacy fetches legacy audit events from the local SQLite database.
 func (s *Service) queryLocalLegacy(f Filter) ([]proxy.AuditEvent, error) {
 	query := "SELECT id, timestamp, COALESCE(environment, '') as environment, agent_id, identity_level, method, target_url, domain, status_code, duration_ms, status, reason, redacted, resolution_path, caller_role, workspace_id, project_id, token_id, secret_keys, auth_styles FROM audit_events WHERE 1=1"
+	if f.ExcludeManagement {
+		query += " AND identity_level != 'user'"
+	}
 	args := []interface{}{}
 
 	if f.Agent != "" {
@@ -215,6 +221,10 @@ func (s *Service) queryLocalLegacy(f Filter) ([]proxy.AuditEvent, error) {
 	if f.ProjectID != "" {
 		query += " AND project_id = ?"
 		args = append(args, f.ProjectID)
+	}
+	if f.WorkspaceID != "" {
+		query += " AND workspace_id = ?"
+		args = append(args, f.WorkspaceID)
 	}
 	if f.Environment != "" {
 		query += " AND environment = ?"
@@ -342,6 +352,9 @@ func (s *Service) queryLocalLegacy(f Filter) ([]proxy.AuditEvent, error) {
 // QueryLocalForensic fetches forensic audit events from the local SQLite database.
 func (s *Service) QueryLocalForensic(f Filter) ([]proxy.ForensicAuditEvent, error) {
 	query := `SELECT id, version, created_at, workspace_id, project_id, environment, agent_id, token_id, domain, method, status_code, outcome, latency_ms, chain_hash, event_json, snapshot_json, enforcement_json, resolution_json FROM forensic_audit_events WHERE 1=1`
+	if f.ExcludeManagement {
+		query += " AND json_extract(event_json, '$.type') != 'management'"
+	}
 	args := []interface{}{}
 
 	if f.Agent != "" {
@@ -408,6 +421,10 @@ func (s *Service) QueryLocalForensic(f Filter) ([]proxy.ForensicAuditEvent, erro
 	if f.ProjectID != "" {
 		query += " AND project_id = ?"
 		args = append(args, f.ProjectID)
+	}
+	if f.WorkspaceID != "" {
+		query += " AND workspace_id = ?"
+		args = append(args, f.WorkspaceID)
 	}
 	if f.Environment != "" {
 		query += " AND environment = ?"
@@ -736,3 +753,200 @@ func (s *Service) VerifyChain() error {
 	}
 	return nil
 }
+
+// QueryRemote fetches audit events from the remote API for the given workspace.
+func (s *Service) QueryRemote(workspaceID string, f Filter) ([]proxy.AuditEvent, error) {
+	params := map[string]string{
+		"workspace_id": workspaceID,
+	}
+	if f.ProjectID != "" {
+		params["project_id"] = f.ProjectID
+	}
+	if f.Agent != "" {
+		params["agent_id"] = f.Agent
+	}
+	if f.Token != "" {
+		params["agent_token_id"] = f.Token
+	}
+	if f.Identity != "" {
+		params["identity_level"] = f.Identity
+	}
+	if f.Credential != "" {
+		params["credential_ref"] = f.Credential
+	}
+	if f.Environment != "" {
+		params["environment"] = f.Environment
+	}
+	if f.Domain != "" {
+		params["domain"] = f.Domain
+	}
+	if f.Method != "" {
+		params["method"] = f.Method
+	}
+	if f.Status != 0 {
+		params["status_code"] = fmt.Sprintf("%d", f.Status)
+	}
+	if !f.Since.IsZero() {
+		params["since"] = f.Since.Format(time.RFC3339)
+	}
+	if !f.Until.IsZero() {
+		params["until"] = f.Until.Format(time.RFC3339)
+	}
+	if f.Limit > 0 {
+		params["limit"] = fmt.Sprintf("%d", f.Limit)
+	}
+
+	resp, err := s.client.Call("log.list", "GET", nil, params, nil)
+	if err != nil {
+		return nil, fmt.Errorf("remote query failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, s.client.DecodeError(resp)
+	}
+
+	var apiRes struct {
+		Data []struct {
+			ID             string `json:"id"`
+			Timestamp      string `json:"timestamp"`
+			AgentID        string `json:"agent_id"`
+			IdentityLevel  string `json:"identity_level"`
+			CredentialRef  string `json:"credential_ref"`
+			InjectionStyle string `json:"injection_style"`
+			TargetDomain   string `json:"target_domain"`
+			TargetURL      string `json:"target_url"`
+			Method         string `json:"method"`
+			StatusCode     int    `json:"status_code"`
+			DurationMs     int64  `json:"duration_ms"`
+			Redacted       bool   `json:"redacted"`
+			ResolutionPath string `json:"resolution_path"`
+			Error          string `json:"error"`
+		} `json:"data"`
+	}
+
+	if err := json.NewDecoder(resp.Body).Decode(&apiRes); err != nil {
+		return nil, fmt.Errorf("failed to decode response: %w", err)
+	}
+
+	var results []proxy.AuditEvent
+	for _, r := range apiRes.Data {
+		var secretKeys []string
+		if r.CredentialRef != "" {
+			secretKeys = strings.Split(r.CredentialRef, ",")
+		} else {
+			secretKeys = []string{}
+		}
+
+		var authStyles []string
+		if r.InjectionStyle != "" {
+			authStyles = strings.Split(r.InjectionStyle, ",")
+		} else {
+			authStyles = []string{}
+		}
+
+		t, _ := time.Parse(time.RFC3339, r.Timestamp)
+
+		status := "OK"
+		if r.StatusCode >= 400 || r.Error != "" {
+			status = "FAILED"
+		}
+
+		results = append(results, proxy.AuditEvent{
+			ID:             r.ID,
+			Timestamp:      t,
+			SecretKeys:     secretKeys,
+			AgentID:        r.AgentID,
+			IdentityLevel:  r.IdentityLevel,
+			Method:         r.Method,
+			TargetURL:      r.TargetURL,
+			Domain:         r.TargetDomain,
+			AuthStyles:     authStyles,
+			StatusCode:     r.StatusCode,
+			DurationMs:     r.DurationMs,
+			Status:         status,
+			Reason:         r.Error,
+			Redacted:       r.Redacted,
+			ResolutionPath: r.ResolutionPath,
+		})
+	}
+
+	return results, nil
+}
+
+// GetRemoteLog fetches a single log entry from the remote API.
+func (s *Service) GetRemoteLog(logID string) (*proxy.AuditEvent, error) {
+	resp, err := s.client.Call("log.detail", "GET", nil, map[string]string{"log_id": logID}, nil)
+	if err != nil {
+		return nil, fmt.Errorf("remote detail failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, s.client.DecodeError(resp)
+	}
+
+	var apiRes struct {
+		Data struct {
+			ID             string `json:"id"`
+			Timestamp      string `json:"timestamp"`
+			AgentID        string `json:"agent_id"`
+			IdentityLevel  string `json:"identity_level"`
+			CredentialRef  string `json:"credential_ref"`
+			InjectionStyle string `json:"injection_style"`
+			TargetDomain   string `json:"target_domain"`
+			TargetURL      string `json:"target_url"`
+			Method         string `json:"method"`
+			StatusCode     int    `json:"status_code"`
+			DurationMs     int64  `json:"duration_ms"`
+			Redacted       bool   `json:"redacted"`
+			ResolutionPath string `json:"resolution_path"`
+			Error          string `json:"error"`
+		} `json:"data"`
+	}
+
+	if err := json.NewDecoder(resp.Body).Decode(&apiRes); err != nil {
+		return nil, fmt.Errorf("failed to decode response: %w", err)
+	}
+
+	r := apiRes.Data
+	var secretKeys []string
+	if r.CredentialRef != "" {
+		secretKeys = strings.Split(r.CredentialRef, ",")
+	} else {
+		secretKeys = []string{}
+	}
+
+	var authStyles []string
+	if r.InjectionStyle != "" {
+		authStyles = strings.Split(r.InjectionStyle, ",")
+	} else {
+		authStyles = []string{}
+	}
+
+	t, _ := time.Parse(time.RFC3339, r.Timestamp)
+
+	status := "OK"
+	if r.StatusCode >= 400 || r.Error != "" {
+		status = "FAILED"
+	}
+
+	return &proxy.AuditEvent{
+		ID:             r.ID,
+		Timestamp:      t,
+		SecretKeys:     secretKeys,
+		AgentID:        r.AgentID,
+		IdentityLevel:  r.IdentityLevel,
+		Method:         r.Method,
+		TargetURL:      r.TargetURL,
+		Domain:         r.TargetDomain,
+		AuthStyles:     authStyles,
+		StatusCode:     r.StatusCode,
+		DurationMs:     r.DurationMs,
+		Status:         status,
+		Reason:         r.Error,
+		Redacted:       r.Redacted,
+		ResolutionPath: r.ResolutionPath,
+	}, nil
+}
+

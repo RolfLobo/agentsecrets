@@ -173,6 +173,20 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 				tokenID = cached.TokenID
 			}
 			callReqCaps = &cached.Capabilities
+
+			// Verify scope restrictions (Workspace and Project and Environment)
+			if cached.WorkspaceID != "" && cached.WorkspaceID != s.Engine.WorkspaceID {
+				writeError(w, 403, fmt.Sprintf("Agent '%s' is not authorized to access workspace '%s'.", agentID, s.Engine.WorkspaceID))
+				return
+			}
+			if cached.ProjectID != "" && cached.ProjectID != s.Engine.ProjectID {
+				writeError(w, 403, fmt.Sprintf("Agent '%s' is not authorized to access project '%s'.", agentID, s.Engine.ProjectID))
+				return
+			}
+			if cached.Environment != "" && !strings.EqualFold(cached.Environment, resolveEnvForAudit()) {
+				writeError(w, 403, fmt.Sprintf("Agent '%s' is not authorized to access the '%s' environment.", agentID, resolveEnvForAudit()))
+				return
+			}
 		}
 	} else if agentID != "" {
 		identityLevel = "declared"
