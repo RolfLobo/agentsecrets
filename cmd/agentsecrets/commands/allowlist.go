@@ -44,8 +44,8 @@ var allowlistListCmd = &cobra.Command{
 }
 
 var allowlistLogCmd = &cobra.Command{
-	Use:   "log",
-	Short: "View allowlist audit log",
+	Use:   "logs",
+	Short: "View allowlist audit logs",
 	RunE:  runAllowlistLog,
 }
 

@@ -17,9 +17,11 @@ type Day struct {
 	CommandExecutions   map[string]int `json:"command_executions"`
 	ProxyCalls          int            `json:"proxy_calls"`
 	ProxyBlocked        int            `json:"proxy_blocked"`
-	ProxyRedacted       int            `json:"proxy_redacted"`
-	InjectionStylesUsed []string       `json:"injection_styles_used"`
-	IntegrationsActive  []string       `json:"integrations_active"`
+	ProxyRedacted        int            `json:"proxy_redacted"`
+	SecretsResolved      int            `json:"secrets_resolved"`
+	TotalProxyDurationMs int64          `json:"total_proxy_duration_ms"`
+	InjectionStylesUsed  []string       `json:"injection_styles_used"`
+	IntegrationsActive   []string       `json:"integrations_active"`
 
 	// Snapshot metadata for the day
 	CliVersion           string `json:"cli_version"`
@@ -166,6 +168,22 @@ func RecordProxyRedacted() {
 	_ = save()
 }
 
+// RecordSecretResolved increments the resolved secrets count.
+func RecordSecretResolved() {
+	mu.Lock()
+	defer mu.Unlock()
+	currentDay().SecretsResolved++
+	_ = save()
+}
+
+// RecordProxyDuration adds proxy latency to the cumulative duration.
+func RecordProxyDuration(ms int64) {
+	mu.Lock()
+	defer mu.Unlock()
+	currentDay().TotalProxyDurationMs += ms
+	_ = save()
+}
+
 // RecordInjectionStyle records a unique injection style used (e.g. "bearer", "header").
 func RecordInjectionStyle(style string) {
 	mu.Lock()
@@ -266,10 +284,12 @@ func SyncIfDue(client *api.Client, cliVersion string) {
 				"command_executions":     dayData.CommandExecutions,
 				"proxy_calls":            dayData.ProxyCalls,
 				"proxy_blocked":          dayData.ProxyBlocked,
-				"proxy_redacted":         dayData.ProxyRedacted,
-				"injection_styles_used":  dayData.InjectionStylesUsed,
-				"integrations_active":    dayData.IntegrationsActive,
-				"cli_version":            dayData.CliVersion,
+				"proxy_redacted":           dayData.ProxyRedacted,
+				"secrets_resolved":         dayData.SecretsResolved,
+				"total_proxy_duration_ms":   dayData.TotalProxyDurationMs,
+				"injection_styles_used":    dayData.InjectionStylesUsed,
+				"integrations_active":      dayData.IntegrationsActive,
+				"cli_version":              dayData.CliVersion,
 				"os":                     dayData.OS,
 				"arch":                   dayData.Arch,
 				"active_environment":     dayData.ActiveEnvironment,

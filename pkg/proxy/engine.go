@@ -506,6 +506,8 @@ func (e *Engine) Execute(req CallRequest) (*CallResult, error) {
 			)
 		}
 
+		telemetry.RecordSecretResolved()
+
 		if err := Inject(outbound, cred, inj); err != nil {
 			return nil, fmt.Errorf("injection failed for %s (%s): %w", inj.SecretKey, inj.Style, err)
 		}
@@ -517,6 +519,9 @@ func (e *Engine) Execute(req CallRequest) (*CallResult, error) {
 
 	// --- Forward ---
 	result, err := Forward(e.Client, outbound)
+	if err == nil && result != nil {
+		telemetry.RecordProxyDuration(result.Duration.Milliseconds())
+	}
 	if err != nil {
 		if strings.Contains(err.Error(), "SSRF prevention:") {
 			telemetry.RecordProxyBlocked()
