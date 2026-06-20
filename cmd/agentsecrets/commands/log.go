@@ -13,6 +13,7 @@ import (
 	"github.com/The-17/agentsecrets/pkg/config"
 	"github.com/The-17/agentsecrets/pkg/errors"
 	"github.com/The-17/agentsecrets/pkg/log"
+	"github.com/The-17/agentsecrets/pkg/projects"
 	"github.com/The-17/agentsecrets/pkg/proxy"
 	"github.com/The-17/agentsecrets/pkg/ui"
 	"github.com/spf13/cobra"
@@ -414,6 +415,20 @@ func queryLogs(filter log.Filter) ([]proxy.AuditEvent, error) {
 		return nil, fmt.Errorf("no workspace selected")
 	}
 	filter.WorkspaceID = wsID
+
+	// Resolve project name/slug to project UUID if provided
+	if filter.ProjectID != "" {
+		projSvc := projects.NewService(apiClient)
+		if list, err := projSvc.List(); err == nil {
+			for _, p := range list {
+				if strings.EqualFold(p.ID, filter.ProjectID) || strings.EqualFold(p.Name, filter.ProjectID) {
+					filter.ProjectID = p.ID
+					break
+				}
+			}
+		}
+	}
+
 	ws := cfg.Workspaces[wsID]
 	if strings.EqualFold(ws.Type, "shared") {
 		return logService.QueryRemote(wsID, filter)
@@ -564,47 +579,6 @@ func runProjectLogs(cmd *cobra.Command, args []string) error {
 
 	return runLogListWithFilter(cmd, filter)
 }
-
-var workspaceLogsCmd = &cobra.Command{
-	Use:   "logs",
-	Short: "View audit logs for the current workspace",
-	PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
-		if err := ensureDaemonInitialized(); err != nil {
-			return err
-		}
-		if err := authService.EnsureAuth(cmd, args); err != nil {
-			return err
-		}
-		var err error
-		logService, err = log.NewService(apiClient, nil)
-		if err != nil {
-			return fmt.Errorf("could not initialize log service: %v", err)
-		}
-		return nil
-	},
-	RunE: runLogList,
-}
-
-var projectLogsCmd = &cobra.Command{
-	Use:   "logs",
-	Short: "View audit logs for the current project",
-	PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
-		if err := ensureDaemonInitialized(); err != nil {
-			return err
-		}
-		if err := authService.EnsureAuth(cmd, args); err != nil {
-			return err
-		}
-		var err error
-		logService, err = log.NewService(apiClient, nil)
-		if err != nil {
-			return fmt.Errorf("could not initialize log service: %v", err)
-		}
-		return nil
-	},
-	RunE: runProjectLogs,
-}
-
 
 // displayLogBasic prints a single log entry in the spec format:
 // 14:22:01  billing-tool  →  api.stripe.com  POST /v1/charges  200  143ms
@@ -980,20 +954,6 @@ func init() {
 	logsCmd.Flags().Bool("csv", false, "output as CSV with headers")
 	logsCmd.Flags().Bool("no-color", false, "disable color output")
 	logsCmd.Flags().Bool("tail", false, "live stream new entries (same as log watch)")
-
-	addFilterFlags(workspaceLogsCmd)
-	workspaceLogsCmd.Flags().Bool("verbose", false, "full record including allowlist snapshot")
-	workspaceLogsCmd.Flags().Bool("json", false, "output as newline-delimited JSON")
-	workspaceLogsCmd.Flags().Bool("csv", false, "output as CSV with headers")
-	workspaceLogsCmd.Flags().Bool("no-color", false, "disable color output")
-	workspaceLogsCmd.Flags().Bool("tail", false, "live stream new entries")
-
-	addFilterFlags(projectLogsCmd)
-	projectLogsCmd.Flags().Bool("verbose", false, "full record including allowlist snapshot")
-	projectLogsCmd.Flags().Bool("json", false, "output as newline-delimited JSON")
-	projectLogsCmd.Flags().Bool("csv", false, "output as CSV with headers")
-	projectLogsCmd.Flags().Bool("no-color", false, "disable color output")
-	projectLogsCmd.Flags().Bool("tail", false, "live stream new entries")
 
 	logSummaryCmd.Flags().String("since", "7d", "default: 7d")
 	logSummaryCmd.Flags().String("until", "", "")
