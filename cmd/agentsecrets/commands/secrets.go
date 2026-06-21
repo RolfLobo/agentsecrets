@@ -35,7 +35,7 @@ func InitSecretsService(client *api.Client) {
 var secretsCmd = &cobra.Command{
 	Use:   "secrets",
 	Short: "Manage your secrets",
-	Long:  `Add, retrieve, and synchronize secrets for your projects. Secrets are encrypted locally before being stored in the cloud.`,
+	Long:  `Add and synchronize secrets for your projects. Secrets are encrypted locally before being stored in the cloud.`,
 }
 
 var secretsSetCmd = &cobra.Command{
@@ -45,12 +45,6 @@ var secretsSetCmd = &cobra.Command{
 	RunE:  runSecretsSet,
 }
 
-var secretsGetCmd = &cobra.Command{
-	Use:   "get [key]",
-	Short: "Retrieve and decrypt a single secret",
-	Args:  cobra.ExactArgs(1),
-	RunE:  runSecretsGet,
-}
 
 var secretsListCmd = &cobra.Command{
 	Use:   "list",
@@ -91,7 +85,6 @@ func init() {
 	secretsDiffCmd.Flags().StringVar(&diffFrom, "from", "", "Source environment for cross-environment diff")
 	secretsDiffCmd.Flags().StringVar(&diffTo, "to", "", "Target environment for cross-environment diff")
 
-	secretsGetCmd.ValidArgsFunction = autocompleteSecretKeys
 	secretsDeleteCmd.ValidArgsFunction = autocompleteSecretKeys
 
 	_ = secretsDiffCmd.RegisterFlagCompletionFunc("from", autocompleteEnvironments)
@@ -99,7 +92,6 @@ func init() {
 
 	secretsCmd.AddCommand(
 		secretsSetCmd,
-		secretsGetCmd,
 		secretsListCmd,
 		secretsPullCmd,
 		secretsPushCmd,
@@ -170,22 +162,6 @@ func runSecretsSet(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-func runSecretsGet(cmd *cobra.Command, args []string) error {
-	key := args[0]
-	var val string
-
-	if err := ui.Spinner(fmt.Sprintf("Retrieving %s...", key), func() error {
-		var e error
-		val, e = secretsService.Get(key)
-		return e
-	}); err != nil {
-		ui.Error(fmt.Sprintf("Get secret: %v", err))
-		return nil
-	}
-
-	fmt.Printf("\n%s\n", val)
-	return nil
-}
 
 func runSecretsList(cmd *cobra.Command, args []string) error {
 	if listRemote {

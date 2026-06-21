@@ -15,6 +15,8 @@ import (
 	"github.com/The-17/agentsecrets/pkg/ui"
 	"github.com/The-17/agentsecrets/pkg/workspaces"
 	"os"
+	"os/exec"
+	"runtime"
 	"strings"
 )
 
@@ -147,8 +149,21 @@ func ensureDaemonInitialized() error {
 		return nil
 	}
 
-	// Step 2: If keychain-auth isn't available or we're not fully configured, run auto-setup with a spinner
+	// Step 2: If keychain-auth isn't available or we're not fully configured, run auto-setup
 	if !keychainauth.IsAvailable() || !keychainauth.IsFullyConfigured() {
+		if runtime.GOOS == "linux" {
+			// Check if sudo is cached. If not, prompt the user before starting the spinner.
+			sudoCheck := exec.Command("sudo", "-n", "true")
+			if err := sudoCheck.Run(); err != nil {
+				fmt.Println("keychain-auth sandbox system setup is required. Please authorize when prompted.")
+				sudoVal := exec.Command("sudo", "-v")
+				sudoVal.Stdin = os.Stdin
+				sudoVal.Stdout = os.Stdout
+				sudoVal.Stderr = os.Stderr
+				_ = sudoVal.Run() // Wait for password entry to cache it
+			}
+		}
+
 		if err := ui.Spinner("Setting up keychain-auth...", func() error {
 			return keychainauth.AutoSetup()
 		}); err != nil {
@@ -174,7 +189,19 @@ func ensureDaemonInitialized() error {
 				_ = os.Remove(keychainauth.SocketPath())
 			}
 
-			if errSetup := ui.Spinner("Setting up keychain-auth...", func() error {
+			if runtime.GOOS == "linux" {
+				sudoCheck := exec.Command("sudo", "-n", "true")
+				if err := sudoCheck.Run(); err != nil {
+					fmt.Println("keychain-auth daemon restart is required. Please authorize when prompted.")
+					sudoVal := exec.Command("sudo", "-v")
+					sudoVal.Stdin = os.Stdin
+					sudoVal.Stdout = os.Stdout
+					sudoVal.Stderr = os.Stderr
+					_ = sudoVal.Run()
+				}
+			}
+
+			if errSetup := ui.Spinner("Starting keychain-auth daemon...", func() error {
 				if isMismatch {
 					return keychainauth.RestartDaemon()
 				}
@@ -198,8 +225,23 @@ func ensureDaemonInitialized() error {
 		var denied *keychainauth.DaemonDeniedError
 		if errors.As(err, &denied) && (denied.IsUnregistered() || denied.IsHashMismatch()) {
 			keychainauth.Close()
-			_ = keychainauth.AutoSetup()
-			_ = keychainauth.RestartDaemon()
+
+			if runtime.GOOS == "linux" {
+				sudoCheck := exec.Command("sudo", "-n", "true")
+				if err := sudoCheck.Run(); err != nil {
+					fmt.Println("keychain-auth binary registration is required. Please authorize when prompted.")
+					sudoVal := exec.Command("sudo", "-v")
+					sudoVal.Stdin = os.Stdin
+					sudoVal.Stdout = os.Stdout
+					sudoVal.Stderr = os.Stderr
+					_ = sudoVal.Run()
+				}
+			}
+
+			_ = ui.Spinner("Registering agentsecrets binary with daemon...", func() error {
+				_ = keychainauth.AutoSetup()
+				return keychainauth.RestartDaemon()
+			})
 			err = keychainauth.Init()
 		}
 	}

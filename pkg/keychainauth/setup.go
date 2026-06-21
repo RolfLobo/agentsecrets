@@ -17,8 +17,9 @@ import (
 
 // AutoSetup performs the full keychain-auth setup sequence:
 //  1. Ensures keychain-auth is installed (installs if missing)
-//  2. Registers the AgentSecrets binary hash with keychain-auth
-//  3. Ensures the daemon is running (starts if not)
+//  2. Installs the system sandbox (system user, config, service) on Linux
+//  3. Registers the AgentSecrets binary hash with keychain-auth
+//  4. Ensures the daemon is running (starts if not)
 //
 // This is designed to be invisible to the user during normal operation.
 // When called during an upgrade (first secret read after update), the caller
@@ -31,6 +32,12 @@ func AutoSetup() error {
 	kcPath, err := EnsureInstalled()
 	if err != nil {
 		return fmt.Errorf("keychain-auth setup: %w", err)
+	}
+
+	if runtime.GOOS == "linux" {
+		if err := ensureSandboxInstalled(kcPath); err != nil {
+			return fmt.Errorf("keychain-auth sandbox system setup: %w", err)
+		}
 	}
 
 	if err := EnsureRegistered(kcPath); err != nil {
@@ -226,7 +233,13 @@ func EnsureRegistered(keychainAuthPath string) error {
 		}
 	}
 
-	cmd := exec.Command(keychainAuthPath, action, selfPath)
+	var cmd *exec.Cmd
+	if runtime.GOOS == "linux" && keychainAuthConfigPath() == "/etc/keychain-auth/config.json" {
+		cmd = exec.Command("sudo", keychainAuthPath, action, selfPath)
+		cmd.Stdin = os.Stdin
+	} else {
+		cmd = exec.Command(keychainAuthPath, action, selfPath)
+	}
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("failed to %s with keychain-auth: %w\nOutput: %s", action, err, strings.TrimSpace(string(output)))
@@ -309,6 +322,12 @@ type kcConfig struct {
 }
 
 func keychainAuthConfigPath() string {
+	if runtime.GOOS == "linux" {
+		sysPath := "/etc/keychain-auth/config.json"
+		if _, err := os.Stat(sysPath); err == nil {
+			return sysPath
+		}
+	}
 	home, _ := os.UserHomeDir()
 	if runtime.GOOS == "windows" {
 		dir := os.Getenv("APPDATA")
@@ -394,16 +413,29 @@ func startDaemonMacOS(keychainAuthPath string) error {
 	// Last resort: start directly
 	return startDirect(keychainAuthPath)
 }
-
 // startDaemonLinux starts keychain-auth via systemd on Linux.
 func startDaemonLinux(keychainAuthPath string) error {
-	// Try systemd user service first
+	// Try systemd system service first (dedicated system user sandbox daemon)
+	if _, err := os.Stat("/run/keychain-auth"); err == nil {
+		cmd := exec.Command("systemctl", "start", "keychain-auth")
+		if err := cmd.Run(); err == nil {
+			return waitForSocket()
+		}
+		// Fallback with sudo
+		cmd = exec.Command("sudo", "systemctl", "start", "keychain-auth")
+		cmd.Stdin = os.Stdin
+		if err := cmd.Run(); err == nil {
+			return waitForSocket()
+		}
+	}
+
+	// Fallback to systemd user service (user-space legacy daemon)
 	cmd := exec.Command("systemctl", "--user", "start", "keychain-auth")
 	if err := cmd.Run(); err == nil {
 		return waitForSocket()
 	}
 
-	// Try enabling and starting
+	// Try enabling and starting user service
 	cmd = exec.Command("systemctl", "--user", "enable", "--now", "keychain-auth")
 	if err := cmd.Run(); err == nil {
 		return waitForSocket()
@@ -412,7 +444,6 @@ func startDaemonLinux(keychainAuthPath string) error {
 	// Last resort: start directly
 	return startDirect(keychainAuthPath)
 }
-
 // startDirect starts keychain-auth as a background process. This is the fallback
 // when the system service manager is not configured.
 func startDirect(keychainAuthPath string) error {
@@ -578,4 +609,60 @@ func compareVersions(v1, v2 string) int {
 		}
 	}
 	return 0
+}
+
+func ensureSandboxInstalled(keychainAuthPath string) error {
+	// If system-wide configuration is already set up, we are good
+	if _, err := os.Stat("/etc/keychain-auth/config.json"); err == nil {
+		return nil
+	}
+
+	selfPath, err := os.Executable()
+	if err != nil {
+		return fmt.Errorf("cannot determine own binary path: %w", err)
+	}
+	selfPath, err = filepath.EvalSymlinks(selfPath)
+	if err != nil {
+		return fmt.Errorf("cannot resolve own binary symlinks: %w", err)
+	}
+
+	// Run install command via sudo
+	cmd := exec.Command("sudo", keychainAuthPath, "install")
+	cmd.Stdin = os.Stdin
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("keychain-auth system installer command failed: %w\nOutput: %s", err, string(output))
+	}
+
+	// Register the calling agentsecrets binary
+	regCmd := exec.Command("sudo", "/usr/local/bin/keychain-auth", "register", selfPath)
+	regCmd.Stdin = os.Stdin
+	regOutput, err := regCmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("failed to register binary: %w\nOutput: %s", err, string(regOutput))
+	}
+
+	// Update permissions in the config file to allow read/write for agentsecrets
+	pyScript := fmt.Sprintf(`
+import json
+path = "/etc/keychain-auth/config.json"
+with open(path, "r") as f:
+    cfg = json.load(f)
+for i, rb in enumerate(cfg.get("registered_binaries", [])):
+    if rb["path"] == "%[1]s":
+        cfg["registered_binaries"][i]["allowed_read_services"] = ["agentsecrets"]
+        cfg["registered_binaries"][i]["allowed_write_services"] = ["agentsecrets"]
+        cfg["registered_binaries"][i]["can_search"] = True
+with open(path, "w") as f:
+    json.dump(cfg, f, indent=2)
+`, selfPath)
+
+	authCmd := exec.Command("sudo", "python3", "-c", pyScript)
+	authCmd.Stdin = os.Stdin
+	authOutput, err := authCmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("failed to authorize AgentSecrets namespace: %w\nOutput: %s", err, string(authOutput))
+	}
+
+	return nil
 }
