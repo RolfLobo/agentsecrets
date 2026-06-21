@@ -40,14 +40,15 @@ Three layers, each with a specific role:
 
 | Key | Where Stored | Who Can Access |
 |---|---|---|
-| Private Key | OS keychain (encrypted by OS + password-derived key) | You only |
-| Workspace Key | `~/.agentsecrets/config.json` (decrypted at login) | You + team members (each with their own encrypted copy) |
+| Private Key | Keychain via `keychain-auth` daemon | You only |
+| Workspace Key | Cached securely in client memory (retrieved from `keychain-auth` at runtime) | You + authorized client binaries |
 | Password-Derived Key | Never stored — derived on demand | You only (requires password) |
 
-The OS keychain itself is protected by the operating system:
-- **macOS**: Keychain Access — protected by login password + Secure Enclave on Apple Silicon
+All secure keychain operations are delegated exclusively to the local **`keychain-auth` daemon**, which manages native credentials and enforces process verification. Under the hood, `keychain-auth` leverages:
+- **macOS**: Apple Keychain Services — protected by login password + Secure Enclave on Apple Silicon
 - **Windows**: Windows Credential Manager — protected by Windows login and DPAPI
 - **Linux**: Secret Service (GNOME Keyring / KWallet) — protected by user session
+- **Fallback (Headless/WSL)**: AES-256-GCM encrypted database file sealed using TPM2 hardware registers (Linux) or Windows Host Credential Manager interop (WSL).
 
 ### How Secrets Are Encrypted
 
@@ -308,52 +309,55 @@ This file lives in the project directory (alongside your code). It links the dir
 
 ---
 
-## keychain-auth (Process-Level Verification)
+## keychain-auth (Process-Level Verification & Anti-Impersonation)
 
-keychain-auth is a standalone daemon that mediates all secret reads between AgentSecrets and the OS keychain. It prevents unauthorized processes from accessing stored credentials.
+`keychain-auth` is a standalone unprivileged system daemon that mediates all secret reads between `agentsecrets` and the OS keychain. It acts as a Zero-Trust Security Broker to prevent unauthorized processes or drive-by scripts from accessing stored credentials.
 
 ### How It Works
 
 ```
 agentsecrets secrets pull
   │
-  ├─ Connect to keychain-auth Unix socket
-  ├─ Send SESSION_INIT: {pid, binary_path, binary_hash, protocol_version}
+  ├─ Connects to keychain-auth Unix socket / Named Pipe
   │
-  ├─ keychain-auth verifies:
-  │   1. Binary hash matches a registered trusted binary
-  │   2. PID corresponds to the claimed binary path
-  │   3. Protocol version is supported
+  ├─ daemon retrieves caller identity directly from the OS kernel:
+  │   1. Real PID resolved via peer credentials (SO_PEERCRED / LOCAL_PEERPID)
+  │   2. Resolves caller's true executable path and computes its SHA-256 hash
   │
-  ├─ SESSION_ACCEPTED → session token granted (in-memory only)
+  ├─ daemon verifies the identity:
+  │   1. Matches registered hashes in config.json, OR
+  │   2. Validates Ed25519 developer code signature appended to the executable
+  │
+  ├─ ACCEPTED → Connection remains open (Connection is the authenticated session)
   │   or
-  └─ SESSION_REJECTED → access denied with reason code
+  └─ REJECTED → Socket closed immediately (Unregistered binary logged to pending queue)
 ```
 
+### Zero-Trust Code Signing (Ed25519)
+To avoid manual UAC/sudo elevation prompts when `agentsecrets` is updated (which changes its static SHA-256 hash), the daemon supports Developer Code Signing.
+*   Client binaries are signed using an Ed25519 private key, with the 64-byte signature and `KCAS` magic bytes appended to the end of the binary.
+*   The daemon verifies the signature against a list of trusted developer public keys in `/etc/keychain-auth/config.json`.
+*   If valid, the new hash is auto-registered silently without user intervention.
+
 ### Auto-Setup
-
-The first time a user runs a command that needs secrets, AgentSecrets automatically:
-
-1. Installs keychain-auth via Homebrew (`brew install The-17/tap/keychain-auth`)
-2. Registers the AgentSecrets binary hash (`keychain-auth register ./agentsecrets`)
-3. Starts the daemon with `--socket` pointing to a user-writable directory
-4. Establishes a session
-
-If the binary hash changes (e.g., after a rebuild or upgrade), the CLI automatically re-registers and restarts the daemon.
+The first time a command requiring secrets is run, `agentsecrets` automatically sets up the daemon:
+1.  **Installation**: Detects or installs `keychain-auth` via Homebrew or platform packages.
+2.  **Sandbox Provisioning (Linux)**: Executes `sudo keychain-auth install` to create the unprivileged system user (`keychain-auth`), the dedicated daemon group (`agentgroup`), and the systemd unit.
+3.  **Prompt-Safe Elevation**: Prior to showing the CLI spinner, `agentsecrets` checks if `sudo` credentials are cached (`sudo -n true`). If they are not, it prompts you interactively (`sudo -v`) first so the password prompt is fully interactive and does not get hidden or corrupted by the spinner graphics.
+4.  **Registration**: Registers the client binary hash with the daemon.
 
 ### Socket Location
 
 | Platform | Path |
 |---|---|
-| Linux / WSL | `$XDG_RUNTIME_DIR/keychain-auth/agent.sock` (fallback: `~/.cache/keychain-auth/agent.sock`) |
+| Linux / WSL | `/run/keychain-auth/agent.sock` (fallback: `$XDG_RUNTIME_DIR/keychain-auth/agent.sock` or `~/.cache/keychain-auth/agent.sock`) |
 | macOS | `~/Library/Application Support/keychain-auth/agent.sock` |
+| Windows | Named Pipe: `\\.\pipe\keychain-auth` |
 
 ### Security Properties
-
-- The socket file is `0600` (owner-only read/write)
-- Session tokens are in-memory only — never written to disk
-- Binary hashes are computed fresh on every invocation — never cached
-- Registration is idempotent — re-registering the same hash is a no-op
+*   **Connection-Bound**: There are no session tokens or API keys sent over the wire. Closing the socket immediately terminates the authorized session.
+*   **Anti-Hijacking (`O_CLOEXEC`)**: `agentsecrets` opens the socket with the `O_CLOEXEC` flag, ensuring the file descriptor is closed automatically upon spawning any child process, preventing credential exfiltration.
+*   **Idempotency**: All registration and update hooks are fully idempotent.
 
 ---
 
