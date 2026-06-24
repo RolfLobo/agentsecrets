@@ -225,9 +225,6 @@ var agentTokenIssueCmd = &cobra.Command{
 	Short: "Issue a new token for an existing agent",
 	Args:  cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
-		if err := verifyPasswordLocally(); err != nil {
-			return err
-		}
 		name := args[0]
 		label, _ := cmd.Flags().GetString("label")
 		expires, _ := cmd.Flags().GetString("expires")
@@ -242,8 +239,12 @@ var agentTokenIssueCmd = &cobra.Command{
 			return fmt.Errorf("no workspace selected — run 'agentsecrets workspace switch' first")
 		}
 
-		agent, err := agentService.GetByName(workspaceID, name)
+		agent, err := getAgentByName(workspaceID, name)
 		if err != nil {
+			return err
+		}
+
+		if err := verifyPasswordLocally(); err != nil {
 			return err
 		}
 
@@ -307,7 +308,7 @@ var agentTokenListCmd = &cobra.Command{
 			return fmt.Errorf("no workspace selected — run 'agentsecrets workspace switch' first")
 		}
 
-		agent, err := agentService.GetByName(workspaceID, name)
+		agent, err := getAgentByName(workspaceID, name)
 		if err != nil {
 			return err
 		}
@@ -373,7 +374,7 @@ var agentTokenRevokeCmd = &cobra.Command{
 				}
 			}
 
-			agent, err := agentService.GetByName(workspaceID, agentName)
+			agent, err := getAgentByName(workspaceID, agentName)
 			if err != nil {
 				return err
 			}
@@ -403,7 +404,7 @@ var agentTokenRevokeCmd = &cobra.Command{
 			}
 		}
 
-		agent, err := agentService.GetByName(workspaceID, agentName)
+		agent, err := getAgentByName(workspaceID, agentName)
 		if err != nil {
 			return err
 		}
@@ -431,6 +432,11 @@ var agentDeleteCmd = &cobra.Command{
 			return fmt.Errorf("no workspace selected — run 'agentsecrets workspace switch' first")
 		}
 
+		agent, err := getAgentByName(workspaceID, name)
+		if err != nil {
+			return err
+		}
+
 		if !confirm {
 			fmt.Printf("Delete agent %q and revoke all active tokens? [y/N] ", name)
 			var response string
@@ -442,11 +448,6 @@ var agentDeleteCmd = &cobra.Command{
 		}
 
 		if err := verifyPasswordLocally(); err != nil {
-			return err
-		}
-
-		agent, err := agentService.GetByName(workspaceID, name)
-		if err != nil {
 			return err
 		}
 
@@ -533,7 +534,7 @@ var agentPolicyGetCmd = &cobra.Command{
 			return fmt.Errorf("no workspace selected — run 'agentsecrets workspace switch' first")
 		}
 
-		agent, err := agentService.GetByName(workspaceID, name)
+		agent, err := getAgentByName(workspaceID, name)
 		if err != nil {
 			return err
 		}
@@ -570,11 +571,7 @@ var agentPolicySetCmd = &cobra.Command{
 			return fmt.Errorf("no workspace selected — run 'agentsecrets workspace switch' first")
 		}
 
-		if err := verifyPasswordLocally(); err != nil {
-			return err
-		}
-
-		agent, err := agentService.GetByName(workspaceID, name)
+		agent, err := getAgentByName(workspaceID, name)
 		if err != nil {
 			return err
 		}
@@ -616,6 +613,10 @@ var agentPolicySetCmd = &cobra.Command{
 			if err := validateSecretsExist(projectID, allKeys); err != nil {
 				return err
 			}
+		}
+
+		if err := verifyPasswordLocally(); err != nil {
+			return err
 		}
 
 		caps := capabilities.AgentCapabilities{
@@ -693,4 +694,15 @@ func resolveProjectID(workspaceID, projectNameOrID string) (string, error) {
 	}
 
 	return "", fmt.Errorf("project %q not found in workspace", projectNameOrID)
+}
+
+func getAgentByName(workspaceID, name string) (*agents.Agent, error) {
+	agent, err := agentService.GetByName(workspaceID, name)
+	if err != nil {
+		if strings.Contains(err.Error(), "not found") {
+			return nil, errors.New(errors.ErrAgentNotFound, fmt.Sprintf("agent %q not found in this workspace", name), err)
+		}
+		return nil, err
+	}
+	return agent, nil
 }

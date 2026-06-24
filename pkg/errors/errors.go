@@ -22,6 +22,7 @@ const (
 	ErrFileNotFound      ErrorCode = "SYS-404"
 	ErrBinaryUnapproved  ErrorCode = "SEC-403"
 	ErrLogNotFound       ErrorCode = "LOG-404"
+	ErrAgentNotFound     ErrorCode = "AGE-404"
 	ErrUnknown           ErrorCode = "ERR-999"
 )
 

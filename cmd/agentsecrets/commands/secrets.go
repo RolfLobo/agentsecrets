@@ -11,6 +11,7 @@ import (
 
 	"github.com/The-17/agentsecrets/pkg/api"
 	"github.com/The-17/agentsecrets/pkg/config"
+	"github.com/The-17/agentsecrets/pkg/errors"
 	"github.com/The-17/agentsecrets/pkg/keyring"
 	"github.com/The-17/agentsecrets/pkg/secrets"
 	"github.com/The-17/agentsecrets/pkg/ui"
@@ -526,8 +527,36 @@ func runSecretsPush(cmd *cobra.Command, args []string) error {
 func runSecretsDelete(cmd *cobra.Command, args []string) error {
 	key := args[0]
 
-	// Confirm before deleting from production
+	project, err := config.LoadProjectConfig()
+	if err != nil || project == nil || project.ProjectID == "" {
+		return fmt.Errorf("no project configured in current directory")
+	}
+
 	env := config.ResolveEnvironment()
+
+	// Check if secret exists locally or remotely first
+	exists, err := keyring.SecretExists(project.ProjectID, env, key)
+	if err != nil {
+		return fmt.Errorf("failed to check if secret exists: %w", err)
+	}
+
+	if !exists {
+		// Fallback to checking remotely
+		if remoteKeys, err := secretsService.ListForEnv(env); err == nil {
+			for _, k := range remoteKeys {
+				if strings.EqualFold(k.Key, key) {
+					exists = true
+					break
+				}
+			}
+		}
+	}
+
+	if !exists {
+		return errors.New(errors.ErrSecretNotFound, fmt.Sprintf("secret %q does not exist in project", key), fmt.Errorf("Please verify the key name or switch environments"))
+	}
+
+	// Confirm before deleting from production
 	if env == "production" {
 		fmt.Printf("Delete %s from production? (y/n): ", key)
 		if !confirmYN() {

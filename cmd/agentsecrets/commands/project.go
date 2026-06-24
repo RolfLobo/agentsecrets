@@ -336,6 +336,20 @@ func runProjectDelete(cmd *cobra.Command, args []string) error {
 		}
 	}
 
+	var projectID string
+	if list, err := projectService.List(); err == nil {
+		for _, p := range list {
+			if p.Name == name || p.ID == name {
+				projectID = p.ID
+				break
+			}
+		}
+	}
+
+	if projectID == "" {
+		return fmt.Errorf("project %q not found", name)
+	}
+
 	var confirmed bool
 	if err := huh.NewConfirm().
 		Title(fmt.Sprintf("Are you sure you want to delete project '%s'? This cannot be undone.", name)).
@@ -346,16 +360,6 @@ func runProjectDelete(cmd *cobra.Command, args []string) error {
 
 	if err := verifyPasswordLocally(); err != nil {
 		return err
-	}
-
-	var projectID string
-	if list, err := projectService.List(); err == nil {
-		for _, p := range list {
-			if p.Name == name || p.ID == name {
-				projectID = p.ID
-				break
-			}
-		}
 	}
 
 	if err := ui.Spinner(fmt.Sprintf("Deleting project '%s'...", name), func() error {

@@ -11,6 +11,7 @@ import (
 
 	"github.com/The-17/agentsecrets/pkg/capabilities"
 	"github.com/The-17/agentsecrets/pkg/config"
+	"github.com/The-17/agentsecrets/pkg/errors"
 	"github.com/The-17/agentsecrets/pkg/keyring"
 	"github.com/The-17/agentsecrets/pkg/proxy"
 	"github.com/The-17/agentsecrets/pkg/ui"
@@ -86,18 +87,31 @@ func runSecretsPolicySet(cmd *cobra.Command, args []string) error {
 
 	env := config.ResolveEnvironment()
 
-	// Policy changes are security-sensitive — always require password verification.
-	if err := verifyPasswordLocally(); err != nil {
-		return err
-	}
-
-	// Validate that the secret key actually exists locally before allowing a policy.
+	// Validate that the secret key actually exists locally or remotely before prompting for password
 	exists, err := keyring.SecretExists(project.ProjectID, env, key)
 	if err != nil {
 		return fmt.Errorf("failed to check if secret exists: %w", err)
 	}
+
 	if !exists {
-		return fmt.Errorf("secret '%s' does not exist in the '%s' environment. Add it first with: agentsecrets secrets set %s=VALUE", key, env, key)
+		// Fallback to checking remotely
+		if remoteKeys, err := secretsService.ListForEnv(env); err == nil {
+			for _, k := range remoteKeys {
+				if strings.EqualFold(k.Key, key) {
+					exists = true
+					break
+				}
+			}
+		}
+	}
+
+	if !exists {
+		return errors.New(errors.ErrSecretNotFound, fmt.Sprintf("secret %q does not exist in project", key), fmt.Errorf("Please create the secret first with: agentsecrets secrets set %s=value", key, key))
+	}
+
+	// Policy changes are security-sensitive — always require password verification.
+	if err := verifyPasswordLocally(); err != nil {
+		return err
 	}
 
 	// Validate action
@@ -343,6 +357,28 @@ func runSecretsPolicyDelete(cmd *cobra.Command, args []string) error {
 	}
 
 	env := config.ResolveEnvironment()
+
+	// Check if secret exists locally or remotely first
+	exists, err := keyring.SecretExists(project.ProjectID, env, key)
+	if err != nil {
+		return fmt.Errorf("failed to check if secret exists: %w", err)
+	}
+
+	if !exists {
+		// Fallback to checking remotely
+		if remoteKeys, err := secretsService.ListForEnv(env); err == nil {
+			for _, k := range remoteKeys {
+				if strings.EqualFold(k.Key, key) {
+					exists = true
+					break
+				}
+			}
+		}
+	}
+
+	if !exists {
+		return errors.New(errors.ErrSecretNotFound, fmt.Sprintf("secret %q does not exist in project", key), fmt.Errorf("Please verify the key name or switch environments"))
+	}
 
 	// Policy changes are security-sensitive — always require password verification.
 	if err := verifyPasswordLocally(); err != nil {

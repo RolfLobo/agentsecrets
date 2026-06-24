@@ -158,6 +158,21 @@ func runAllowlistRemove(_ *cobra.Command, args []string) error {
 		return err
 	}
 
+	// Validate that the domain actually exists in the allowlist first
+	allowlist, alErr := keyring.GetWorkspaceAllowlist(workspaceID)
+	if alErr == nil && len(allowlist) > 0 {
+		found := false
+		for _, d := range allowlist {
+			if strings.EqualFold(d, domain) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return fmt.Errorf("%s is not in the allowlist.", domain)
+		}
+	}
+
 	if err := verifyPasswordLocally(); err != nil {
 		return err
 	}

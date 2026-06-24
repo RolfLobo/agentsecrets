@@ -120,6 +120,16 @@ var ErrorRegistry = map[errors.ErrorCode]ErrorDetails{
 		},
 		QuickAction: "agentsecrets secrets list",
 	},
+	errors.ErrAgentNotFound: {
+		Title:       "Agent Not Found",
+		Description: "The specified agent name does not exist in the active workspace.",
+		Suggestions: []string{
+			"Verify the agent name is spelled correctly.",
+			"Check the registered agents list by running 'agentsecrets agent list'.",
+			"If the agent is project-scoped, ensure your command runs inside the correct project directory.",
+		},
+		QuickAction: "agentsecrets agent list",
+	},
 	errors.ErrKeychainLocked: {
 		Title:       "OS Keychain Locked",
 		Description: "The native OS Keychain or Credential Manager is currently locked and unreachable.",
