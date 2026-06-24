@@ -10,13 +10,19 @@ import (
 
 	"github.com/The-17/agentsecrets/pkg/agents"
 	"github.com/The-17/agentsecrets/pkg/config"
+	"github.com/The-17/agentsecrets/pkg/errors"
 	"github.com/The-17/agentsecrets/pkg/keyring"
 	"github.com/The-17/agentsecrets/pkg/projects"
 	"github.com/The-17/agentsecrets/pkg/proxy"
+	"github.com/The-17/agentsecrets/pkg/secrets"
 	"github.com/The-17/agentsecrets/pkg/ui"
 )
 
-var agentService *agents.Service
+var (
+	agentService     *agents.Service
+	agentPolicyAllow []string
+	agentPolicyDeny  []string
+)
 
 var agentCmd = &cobra.Command{
 	Use:   "agent",
@@ -467,8 +473,8 @@ func init() {
 	agentPolicyCmd.AddCommand(agentPolicyGetCmd)
 	agentPolicyCmd.AddCommand(agentPolicySetCmd)
 
-	agentPolicySetCmd.Flags().String("allow", "", "comma-separated list of allowed secret keys")
-	agentPolicySetCmd.Flags().String("deny", "", "comma-separated list of denied secret keys")
+	agentPolicySetCmd.Flags().StringSliceVar(&agentPolicyAllow, "allow", nil, "comma-separated or repeatable list of allowed secret keys")
+	agentPolicySetCmd.Flags().StringSliceVar(&agentPolicyDeny, "deny", nil, "comma-separated or repeatable list of denied secret keys")
 
 	agentCmd.AddCommand(agentRegisterCmd)
 	agentCmd.AddCommand(agentListCmd)
@@ -558,8 +564,6 @@ var agentPolicySetCmd = &cobra.Command{
 	Args:  cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		name := args[0]
-		allowStr, _ := cmd.Flags().GetString("allow")
-		denyStr, _ := cmd.Flags().GetString("deny")
 
 		workspaceID := config.GetSelectedWorkspaceID()
 		if workspaceID == "" {
@@ -575,23 +579,42 @@ var agentPolicySetCmd = &cobra.Command{
 			return err
 		}
 
+		var projectID string
+		if agent.ProjectID != nil {
+			projectID = *agent.ProjectID
+		}
+		if projectID == "" {
+			if proj, err := config.LoadProjectConfig(); err == nil && proj != nil {
+				projectID = proj.ProjectID
+			}
+		}
+
 		var allowed []string
-		if allowStr != "" {
-			for _, s := range strings.Split(allowStr, ",") {
-				s = strings.TrimSpace(s)
-				if s != "" {
-					allowed = append(allowed, s)
-				}
+		for _, s := range agentPolicyAllow {
+			s = strings.TrimSpace(s)
+			if s != "" {
+				allowed = append(allowed, s)
 			}
 		}
 
 		var denied []string
-		if denyStr != "" {
-			for _, s := range strings.Split(denyStr, ",") {
-				s = strings.TrimSpace(s)
-				if s != "" {
-					denied = append(denied, s)
-				}
+		for _, s := range agentPolicyDeny {
+			s = strings.TrimSpace(s)
+			if s != "" {
+				denied = append(denied, s)
+			}
+		}
+
+		var allKeys []string
+		allKeys = append(allKeys, allowed...)
+		allKeys = append(allKeys, denied...)
+
+		if len(allKeys) > 0 {
+			if projectID == "" {
+				return fmt.Errorf("no project configured in current directory and agent is not associated with any project. Secret policies require a project context.")
+			}
+			if err := validateSecretsExist(projectID, allKeys); err != nil {
+				return err
 			}
 		}
 
@@ -606,7 +629,6 @@ var agentPolicySetCmd = &cobra.Command{
 		}
 
 		cfg, _ := config.LoadGlobalConfig()
-		var projectID string
 		if agent.ProjectID != nil {
 			projectID = *agent.ProjectID
 		}
@@ -615,6 +637,42 @@ var agentPolicySetCmd = &cobra.Command{
 		fmt.Println("\n" + ui.SuccessStyle.Render("Agent policy updated successfully"))
 		return nil
 	},
+}
+
+func validateSecretsExist(projectID string, keys []string) error {
+	if len(keys) == 0 {
+		return nil
+	}
+
+	knownKeys := make(map[string]bool)
+
+	// 1. Check local keyring
+	envs := []string{"development", "staging", "production"}
+	for _, env := range envs {
+		if localKeys, err := keyring.ListProjectKeyNames(projectID, env); err == nil {
+			for _, k := range localKeys {
+				knownKeys[strings.ToUpper(k)] = true
+			}
+		}
+	}
+
+	// 2. Check server-side keys
+	secService := secrets.NewService(apiClient)
+	for _, env := range envs {
+		if remoteKeys, err := secService.ListForEnv(env); err == nil {
+			for _, k := range remoteKeys {
+				knownKeys[strings.ToUpper(k.Key)] = true
+			}
+		}
+	}
+
+	for _, k := range keys {
+		if !knownKeys[strings.ToUpper(k)] {
+			return errors.New(errors.ErrSecretNotFound, fmt.Sprintf("secret %q does not exist in project", k), fmt.Errorf("Please create the secret first with: agentsecrets secrets set %s=value", k))
+		}
+	}
+
+	return nil
 }
 
 func resolveProjectID(workspaceID, projectNameOrID string) (string, error) {
