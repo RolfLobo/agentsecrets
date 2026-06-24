@@ -466,6 +466,12 @@ func runEnvClean(cmd *cobra.Command, args []string) error {
 		return nil
 	}
 
+	if activeEnv == "production" {
+		if err := verifyPasswordLocally(); err != nil {
+			return err
+		}
+	}
+
 	for _, s := range list {
 		if err := ui.Spinner(fmt.Sprintf("Deleting %s...", s.Key), func() error {
 			return secretsService.Delete(s.Key)

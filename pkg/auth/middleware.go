@@ -10,6 +10,7 @@ import (
 
 	"github.com/The-17/agentsecrets/pkg/config"
 	"github.com/The-17/agentsecrets/pkg/errors"
+	"github.com/The-17/agentsecrets/pkg/telemetry"
 	"github.com/The-17/agentsecrets/pkg/ui"
 )
 
@@ -58,7 +59,11 @@ func (s *Service) RefreshSession(refreshToken string) error {
 		"refresh": refreshToken,
 	}
 
+	start := time.Now()
 	resp, err := s.API.Call("auth.refresh", "POST", data, nil, nil)
+	duration := time.Since(start).Milliseconds()
+	telemetry.RecordSessionRefreshMs(duration)
+
 	if err != nil {
 		return err
 	}

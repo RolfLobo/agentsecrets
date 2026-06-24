@@ -57,6 +57,30 @@ func Execute() error {
 	// Ensure keychain-auth socket is closed on exit
 	defer keychainauth.Close()
 
+	// Register telemetry callbacks to avoid import cycles
+	telemetry.KeychainInitializedFunc = keychainauth.IsInitialized
+	telemetry.LoadProjectIDFunc = func() string {
+		if project, err := config.LoadProjectConfig(); err == nil && project != nil {
+			return project.ProjectID
+		}
+		return ""
+	}
+	telemetry.LoadGlobalConfigFunc = func() (string, string, string) {
+		if gc, err := config.LoadGlobalConfig(); err == nil && gc != nil {
+			wsType := "personal"
+			if gc.SelectedWorkspaceID != "" {
+				if ws, ok := gc.Workspaces[gc.SelectedWorkspaceID]; ok {
+					if ws.Type != "" {
+						wsType = ws.Type
+					}
+				}
+			}
+			return gc.SelectedWorkspaceID, gc.Email, wsType
+		}
+		return "", "", "personal"
+	}
+	telemetry.ResolveEnvironmentFunc = config.ResolveEnvironment
+
 	// Run update check. It's efficient (24h interval) and has a short timeout.
 	if res, _ := config.CheckForUpdates(Version); res != nil && res.NewVersionAvailable {
 		ui.Banner(fmt.Sprintf("Update Available: %s → %s", res.CurrentVersion, res.LatestVersion))
@@ -102,7 +126,6 @@ func init() {
 	workspaceCmd.PersistentPreRunE = keychainAuthMiddleware
 	projectCmd.PersistentPreRunE = keychainAuthMiddleware
 	environmentCmd.PersistentPreRunE = keychainAuthMiddleware
-	proxyCmd.PersistentPreRunE = keychainAuthMiddleware
 	agentCmd.PersistentPreRunE = func(cmd *cobra.Command, args []string) error {
 		if err := keychainAuthMiddleware(cmd, args); err != nil {
 			return err
@@ -119,12 +142,9 @@ func init() {
 	secretsCmd.PersistentPreRunE = keychainAuthMiddleware
 	callCmd.PersistentPreRunE = keychainAuthMiddleware
 
-	// Authentication/setup commands that need secure keychain-auth connection but
-	// do not require the user to be already authenticated.
-	initCmd.PersistentPreRunE = daemonOnlyMiddleware
-	loginCmd.PersistentPreRunE = daemonOnlyMiddleware
-	logoutCmd.PersistentPreRunE = daemonOnlyMiddleware
 	statusCmd.PersistentPreRunE = daemonOnlyMiddleware
+	loginCmd.PersistentPreRunE = daemonOnlyMiddleware
+	initCmd.PersistentPreRunE = daemonOnlyMiddleware
 
 	rootCmd.AddCommand(workspaceCmd)
 	rootCmd.AddCommand(projectCmd)
@@ -149,8 +169,8 @@ func ensureDaemonInitialized() error {
 		return nil
 	}
 
-	// Step 2: If keychain-auth isn't available or we're not fully configured, run auto-setup
-	if !keychainauth.IsAvailable() || !keychainauth.IsFullyConfigured() {
+	// Step 2: If keychain-auth isn't available, run auto-setup
+	if !keychainauth.IsAvailable() {
 		if runtime.GOOS == "linux" {
 			// Check if sudo is cached. If not, prompt the user before starting the spinner.
 			sudoCheck := exec.Command("sudo", "-n", "true")
@@ -223,7 +243,14 @@ func ensureDaemonInitialized() error {
 		// If the binary is unregistered or hash changed (e.g. after rebuild or upgrade),
 		// re-register and restart the daemon transparently.
 		var denied *keychainauth.DaemonDeniedError
-		if errors.As(err, &denied) && (denied.IsUnregistered() || denied.IsHashMismatch()) {
+		errStr := err.Error()
+		isClosedOrDenied := strings.Contains(errStr, "daemon closed connection immediately") ||
+			strings.Contains(errStr, "connection closed by daemon") ||
+			strings.Contains(errStr, "broken pipe") ||
+			strings.Contains(errStr, "connection reset by peer") ||
+			(errors.As(err, &denied) && (denied.IsUnregistered() || denied.IsHashMismatch()))
+
+		if isClosedOrDenied {
 			keychainauth.Close()
 
 			if runtime.GOOS == "linux" {

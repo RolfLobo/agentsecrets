@@ -269,8 +269,8 @@ agentsecrets agent token issue "billing-processor"
 client = AgentSecrets(agent_token="agt_ws01hxyz_...")
 
 # Audit by agent
-agentsecrets log list --agent billing-processor
-agentsecrets log list --identity anonymous   # find coverage gaps
+agentsecrets logs list --agent billing-processor
+agentsecrets logs list --identity anonymous   # find coverage gaps
 ```
 
 ---
@@ -484,13 +484,13 @@ agentsecrets env -- <command>
 
 ### Audit
 ```bash
-agentsecrets log [--tail] [--agent NAME] [--identity anonymous]
-agentsecrets log show <id>           # Detailed forensic audit trace
-agentsecrets log summary [--since 7d]
-agentsecrets log export --format csv
-agentsecrets log verify              # Verify log cryptographic chain integrity
-agentsecrets log replay <id>         # Step-by-step visual log playback
-agentsecrets log watch               # Live stream audit entries
+agentsecrets logs [--tail] [--agent NAME] [--identity anonymous]
+agentsecrets logs show <id>           # Detailed forensic audit trace
+agentsecrets logs summary [--since 7d]
+agentsecrets logs export --format csv
+agentsecrets logs verify              # Verify log cryptographic chain integrity
+agentsecrets logs replay <id>         # Step-by-step visual log playback
+agentsecrets logs watch               # Live stream audit entries
 ```
 
 ### Agent Identity

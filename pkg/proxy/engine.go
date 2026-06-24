@@ -22,6 +22,7 @@ import (
 	"github.com/The-17/agentsecrets/pkg/keyring"
 	"github.com/The-17/agentsecrets/pkg/telemetry"
 	"github.com/The-17/agentsecrets/pkg/workspaces"
+	"golang.org/x/term"
 )
 
 // resolveEnvForAudit returns the current environment for audit logging.
@@ -151,6 +152,7 @@ func NewEngine(projectID string) (*Engine, error) {
 			// Validate all resolved IPs
 			for _, resolvedIP := range ips {
 				if isPrivateOrLoopbackIP(resolvedIP) {
+					telemetry.RecordSSRFAttemptsBlocked()
 					return nil, fmt.Errorf("SSRF prevention: connection to private/loopback IP %s is blocked", resolvedIP)
 				}
 			}
@@ -255,6 +257,18 @@ func (e *Engine) Execute(req CallRequest) (*CallResult, error) {
 	// --- Telemetry ---
 	telemetry.RecordProxyCall()
 	telemetry.RecordIntegration("proxy")
+
+	if e.Transient {
+		telemetry.RecordProxyCallTransient()
+	} else {
+		telemetry.RecordProxyCallDaemon()
+	}
+
+	if req.AgentID == "mcp" {
+		telemetry.RecordProxyCallMcp()
+	} else {
+		telemetry.RecordProxyCallDirect()
+	}
 
 	// --- Validate ---
 	if req.TargetURL == "" {
@@ -412,9 +426,24 @@ func (e *Engine) Execute(req CallRequest) (*CallResult, error) {
 		for _, inj := range req.Injections {
 			if !isSecretAllowed(req.Capabilities, inj.SecretKey) {
 				msg := fmt.Sprintf("Agent '%s' is not allowed to access secret '%s' — update agent policy with 'agentsecrets agent policy set'", req.AgentID, inj.SecretKey)
+				telemetry.RecordCapabilityViolationBlocked()
 				return logBlocked("capability_denied", msg)
 			}
 		}
+	}
+
+	// Record identity calls
+	identityLevel := req.IdentityLevel
+	if identityLevel == "" {
+		identityLevel = "anonymous"
+	}
+	switch identityLevel {
+	case "anonymous":
+		telemetry.RecordIdentityAnonymousCall()
+	case "declared":
+		telemetry.RecordIdentityDeclaredCall()
+	case "issued":
+		telemetry.RecordIdentityIssuedCall()
 	}
 
 	// 4. Check Allowlist
@@ -441,6 +470,7 @@ func (e *Engine) Execute(req CallRequest) (*CallResult, error) {
 
 	if !allowed {
 		msg := fmt.Sprintf("%s is not in your workspace allowlist. To authorize it, run: agentsecrets workspace allowlist add %s", targetDomain, targetDomain)
+		telemetry.RecordAllowlistViolation()
 		return logBlocked("domain_not_in_allowlist", msg)
 	}
 
@@ -449,7 +479,7 @@ func (e *Engine) Execute(req CallRequest) (*CallResult, error) {
 	if e.ResolvePolicy != nil {
 		for _, inj := range req.Injections {
 			policy, _ := e.ResolvePolicy(inj.SecretKey)
-			if policy != nil && (len(policy.Domains) > 0 || len(policy.Methods) > 0) {
+			if policy != nil && (len(policy.Domains) > 0 || len(policy.Methods) > 0 || len(policy.Rules) > 0) {
 				hasPolicy = true
 			}
 			action := capabilities.EvaluateSecret(policy, targetDomain, method)
@@ -466,9 +496,46 @@ func (e *Engine) Execute(req CallRequest) (*CallResult, error) {
 					Method:    method,
 				}
 				if e.Approvals == nil || !e.Approvals.IsApproved(approvalKey) {
-					msg := fmt.Sprintf("Secret '%s' requires approval for %s to %s — run: agentsecrets proxy approve %s %s %s",
-						inj.SecretKey, method, targetDomain, inj.SecretKey, method, targetDomain)
-					return logBlocked("policy_approval_required", msg)
+					// Check if transient and interactive TTY
+					if e.Transient && term.IsTerminal(int(os.Stdin.Fd())) && term.IsTerminal(int(os.Stdout.Fd())) {
+						telemetry.RecordInteractivePromptShown()
+						fmt.Fprintf(os.Stdout, "\n[AgentSecrets] Secret '%s' requires approval for %s to %s.\n", inj.SecretKey, method, targetDomain)
+						fmt.Fprintf(os.Stdout, "Approve this request? (y/N): ")
+						var response string
+						_, err := fmt.Fscanln(os.Stdin, &response)
+						if err == nil {
+							response = strings.TrimSpace(strings.ToLower(response))
+							if response == "y" || response == "yes" {
+								if e.Approvals != nil {
+									e.Approvals.Approve(approvalKey)
+								}
+								continue
+							} else {
+								msg := fmt.Sprintf("Secret '%s' requires approval for %s to %s — request was denied by user",
+									inj.SecretKey, method, targetDomain)
+								return logBlocked("policy_approval_denied", msg)
+							}
+						}
+					}
+
+					// Otherwise, block and poll IsApproved for up to 30 seconds
+					telemetry.RecordInteractivePromptSkipped()
+					fmt.Fprintf(os.Stderr, "Secret '%s' requires approval for %s to %s — waiting up to 30s for 'agentsecrets proxy approve'...\n",
+						inj.SecretKey, method, targetDomain)
+					approved := false
+					for i := 0; i < 30; i++ {
+						time.Sleep(1 * time.Second)
+						if e.Approvals != nil && e.Approvals.IsApproved(approvalKey) {
+							approved = true
+							break
+						}
+					}
+
+					if !approved {
+						msg := fmt.Sprintf("Secret '%s' requires approval for %s to %s — run: agentsecrets proxy approve %s %s %s",
+							inj.SecretKey, method, targetDomain, inj.SecretKey, method, targetDomain)
+						return logBlocked("policy_approval_required", msg)
+					}
 				}
 			}
 		}
@@ -497,7 +564,10 @@ func (e *Engine) Execute(req CallRequest) (*CallResult, error) {
 	for _, inj := range req.Injections {
 		telemetry.RecordInjectionStyle(inj.Style)
 
+		startResolve := time.Now()
 		cred, err := e.ResolveSecret(inj.SecretKey)
+		duration := time.Since(startResolve).Milliseconds()
+		telemetry.RecordKeychainResolutionMs(duration)
 		if err != nil {
 			return nil, errors.New(
 				errors.ErrSecretNotFound,

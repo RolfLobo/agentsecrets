@@ -9,6 +9,8 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+
+	"github.com/The-17/agentsecrets/pkg/telemetry"
 )
 
 // conn holds the persistent connection to the keychain-auth daemon.
@@ -73,6 +75,7 @@ func Init() error {
 		if err := json.Unmarshal(sc.Bytes(), &env); err == nil {
 			if env.Status == "denied" || env.Status == "error" {
 				c.Close()
+				telemetry.RecordProcessVerificationsFailed()
 				return &DaemonDeniedError{Reason: env.Reason}
 			}
 		}
@@ -106,6 +109,7 @@ func Init() error {
 	scanner = sc
 	encoder = json.NewEncoder(c)
 	initialized = true
+	telemetry.RecordProcessVerificationsPassed()
 
 	// Step 4: Perform a protocol sanity check (ping) to ensure the running
 	// daemon understands the v2.0+ REQUEST/RESPONSE protocol.
@@ -153,6 +157,15 @@ func Init() error {
 		encoder = nil
 		initialized = false
 		return fmt.Errorf("keychainauth: protocol mismatch (outdated daemon version)")
+	}
+
+	if resp.Status == "denied" || resp.Status == "error" {
+		c.Close()
+		conn = nil
+		scanner = nil
+		encoder = nil
+		initialized = false
+		return &DaemonDeniedError{Reason: resp.Reason}
 	}
 
 	return nil
@@ -384,25 +397,57 @@ func sendRequest(req request) (*response, error) {
 	}
 	defer sessionMu.Unlock()
 
-	if !initialized {
-		return nil, fmt.Errorf("keychainauth: not initialized — call Init() first")
+	// Helper to ensure initialized
+	ensureConn := func() error {
+		if !initialized {
+			sessionMu.Unlock()
+			initErr := Init()
+			sessionMu.Lock()
+			if initErr != nil {
+				return fmt.Errorf("keychainauth: not initialized (failed to auto-reconnect: %w)", initErr)
+			}
+		}
+		return nil
+	}
+
+	if err := ensureConn(); err != nil {
+		return nil, err
 	}
 
 	req.Type = typeRequest
 
-	// Send request as a single newline-delimited JSON line
+	// Try sending request. If it fails, try to reconnect once and retry.
 	if err := encoder.Encode(req); err != nil {
 		initialized = false
-		return nil, fmt.Errorf("keychainauth: failed to send request: %w", err)
+		if reconnectErr := ensureConn(); reconnectErr != nil {
+			return nil, fmt.Errorf("keychainauth: failed to send request: %w (reconnect failed: %v)", err, reconnectErr)
+		}
+		if err = encoder.Encode(req); err != nil {
+			initialized = false
+			return nil, fmt.Errorf("keychainauth: failed to send request on retry: %w", err)
+		}
 	}
 
-	// Read response
+	// Read response. If it fails, try to reconnect once and retry the whole request.
 	if !scanner.Scan() {
 		initialized = false
-		if err := scanner.Err(); err != nil {
-			return nil, fmt.Errorf("keychainauth: connection lost: %w", err)
+		if reconnectErr := ensureConn(); reconnectErr != nil {
+			if scanErr := scanner.Err(); scanErr != nil {
+				return nil, fmt.Errorf("keychainauth: connection lost: %w (reconnect failed: %v)", scanErr, reconnectErr)
+			}
+			return nil, fmt.Errorf("keychainauth: connection closed by daemon (reconnect failed: %v)", reconnectErr)
 		}
-		return nil, fmt.Errorf("keychainauth: connection closed by daemon")
+		if err := encoder.Encode(req); err != nil {
+			initialized = false
+			return nil, fmt.Errorf("keychainauth: failed to resend request on retry: %w", err)
+		}
+		if !scanner.Scan() {
+			initialized = false
+			if scanErr := scanner.Err(); scanErr != nil {
+				return nil, fmt.Errorf("keychainauth: connection lost on retry: %w", scanErr)
+			}
+			return nil, fmt.Errorf("keychainauth: connection closed by daemon on retry")
+		}
 	}
 
 	var resp response

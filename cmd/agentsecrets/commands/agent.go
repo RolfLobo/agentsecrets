@@ -435,6 +435,10 @@ var agentDeleteCmd = &cobra.Command{
 			}
 		}
 
+		if err := verifyPasswordLocally(); err != nil {
+			return err
+		}
+
 		agent, err := agentService.GetByName(workspaceID, name)
 		if err != nil {
 			return err

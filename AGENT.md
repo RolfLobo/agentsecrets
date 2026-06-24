@@ -231,10 +231,10 @@ agentsecrets secrets diff
 
 ### Logging & Audit
 ```bash
-agentsecrets log list [--tail]
-agentsecrets log export --format csv
-agentsecrets log summary
-agentsecrets log detail <id>
+agentsecrets logs list [--tail]
+agentsecrets logs export --format csv
+agentsecrets logs summary
+agentsecrets logs detail <id>
 ```
 
 ### Agent Identity

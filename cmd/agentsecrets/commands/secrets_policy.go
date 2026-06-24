@@ -20,6 +20,7 @@ var (
 	policyDomains []string
 	policyMethods []string
 	policyAction  string
+	policyRules   []string
 )
 
 var secretsPolicyCmd = &cobra.Command{
@@ -59,6 +60,7 @@ func init() {
 	secretsPolicySetCmd.Flags().StringSliceVar(&policyDomains, "domains", nil, "Comma-separated list of allowed domains (e.g. api.stripe.com)")
 	secretsPolicySetCmd.Flags().StringSliceVar(&policyMethods, "methods", nil, "Comma-separated list of allowed HTTP methods (e.g. GET,POST)")
 	secretsPolicySetCmd.Flags().StringVar(&policyAction, "action", "deny", "Violation action: deny or request_permission")
+	secretsPolicySetCmd.Flags().StringSliceVar(&policyRules, "rule", nil, "Domain-specific rule in format domain:METHOD=ACTION (repeatable, e.g. api.stripe.com:GET=allow,POST=request_permission)")
 
 	secretsPolicySetCmd.ValidArgsFunction = autocompleteSecretKeys
 	secretsPolicyGetCmd.ValidArgsFunction = autocompleteSecretKeys
@@ -146,9 +148,78 @@ func runSecretsPolicySet(cmd *cobra.Command, args []string) error {
 		}
 	}
 
+	var rules []capabilities.PolicyRule
+	if len(policyRules) > 0 {
+		rulesMap := make(map[string]map[string]capabilities.Action)
+		for _, rStr := range policyRules {
+			rStr = strings.TrimSpace(rStr)
+			if rStr == "" {
+				continue
+			}
+			parts := strings.SplitN(rStr, ":", 2)
+			if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+				return fmt.Errorf("invalid rule format %q — must be domain:METHOD=ACTION", rStr)
+			}
+			domain := strings.ToLower(strings.TrimSpace(parts[0]))
+			methodsPart := strings.TrimSpace(parts[1])
+
+			methodsMapForDom, exists := rulesMap[domain]
+			if !exists {
+				methodsMapForDom = make(map[string]capabilities.Action)
+				rulesMap[domain] = methodsMapForDom
+			}
+
+			pairs := strings.Split(methodsPart, ",")
+			for _, pair := range pairs {
+				pair = strings.TrimSpace(pair)
+				if pair == "" {
+					continue
+				}
+				eqParts := strings.SplitN(pair, "=", 2)
+				if len(eqParts) != 2 || eqParts[0] == "" || eqParts[1] == "" {
+					return fmt.Errorf("invalid method-action pair %q in rule %q — must be METHOD=ACTION", pair, rStr)
+				}
+				m := strings.ToUpper(strings.TrimSpace(eqParts[0]))
+				actStr := strings.ToLower(strings.TrimSpace(eqParts[1]))
+				act := capabilities.Action(actStr)
+				if act != capabilities.Allow && act != capabilities.Deny && act != capabilities.RequestPermission {
+					return fmt.Errorf("invalid action %q for method %s — must be 'allow', 'deny', or 'request_permission'", actStr, m)
+				}
+				methodsMapForDom[m] = act
+			}
+		}
+
+		var sortedDomains []string
+		for dom := range rulesMap {
+			sortedDomains = append(sortedDomains, dom)
+		}
+		sort.Strings(sortedDomains)
+
+		for _, dom := range sortedDomains {
+			if project.WorkspaceID != "" {
+				allowlist, alErr := keyring.GetWorkspaceAllowlist(project.WorkspaceID)
+				if alErr == nil && len(allowlist) > 0 {
+					allowlistSet := make(map[string]bool, len(allowlist))
+					for _, d := range allowlist {
+						allowlistSet[strings.ToLower(d)] = true
+					}
+					if !allowlistSet[dom] {
+						return fmt.Errorf("domain '%s' is not in your workspace allowlist. Add it first with: agentsecrets workspace allowlist add %s", dom, dom)
+					}
+				}
+			}
+
+			rules = append(rules, capabilities.PolicyRule{
+				Domain:  dom,
+				Methods: rulesMap[dom],
+			})
+		}
+	}
+
 	policy := capabilities.SecretPolicy{
 		Domains: domains,
 		Methods: methodsMap,
+		Rules:   rules,
 	}
 
 	policyBytes, err := json.Marshal(policy)
@@ -211,21 +282,37 @@ func runSecretsPolicyGet(cmd *cobra.Command, args []string) error {
 	}
 
 	fmt.Printf("\nSecret Policy for %s:\n", key)
-	if len(policy.Domains) > 0 {
-		fmt.Printf("  Allowed Domains: %s\n", strings.Join(policy.Domains, ", "))
-	} else {
-		fmt.Println("  Allowed Domains: (any)")
-	}
-
-	if len(policy.Methods) > 0 {
-		var methods []string
-		for m, act := range policy.Methods {
-			methods = append(methods, fmt.Sprintf("%s (%s)", m, act))
+	if len(policy.Rules) > 0 {
+		fmt.Println("  Rules:")
+		for _, rule := range policy.Rules {
+			var methods []string
+			if len(rule.Methods) > 0 {
+				for m, act := range rule.Methods {
+					methods = append(methods, fmt.Sprintf("%s (%s)", m, act))
+				}
+				sort.Strings(methods)
+				fmt.Printf("    - %s: %s (all other methods denied)\n", rule.Domain, strings.Join(methods, ", "))
+			} else {
+				fmt.Printf("    - %s: (any method allowed)\n", rule.Domain)
+			}
 		}
-		sort.Strings(methods)
-		fmt.Printf("  Allowed Methods: %s\n", strings.Join(methods, ", "))
 	} else {
-		fmt.Println("  Allowed Methods: (any)")
+		if len(policy.Domains) > 0 {
+			fmt.Printf("  Allowed Domains: %s (all other domains denied)\n", strings.Join(policy.Domains, ", "))
+		} else {
+			fmt.Println("  Allowed Domains: (any)")
+		}
+
+		if len(policy.Methods) > 0 {
+			var methods []string
+			for m, act := range policy.Methods {
+				methods = append(methods, fmt.Sprintf("%s (%s)", m, act))
+			}
+			sort.Strings(methods)
+			fmt.Printf("  Allowed Methods: %s (all other methods denied)\n", strings.Join(methods, ", "))
+		} else {
+			fmt.Println("  Allowed Methods: (any)")
+		}
 	}
 	fmt.Println()
 
@@ -309,17 +396,33 @@ func runSecretsPolicyList(cmd *cobra.Command, _ []string) error {
 			var policy capabilities.SecretPolicy
 			if err := json.Unmarshal(policyBytes, &policy); err == nil {
 				domains := "(any)"
-				if len(policy.Domains) > 0 {
-					domains = strings.Join(policy.Domains, ", ")
-				}
 				methods := "(any)"
-				if len(policy.Methods) > 0 {
-					var mList []string
-					for m, act := range policy.Methods {
-						mList = append(mList, fmt.Sprintf("%s (%s)", m, act))
+				if len(policy.Rules) > 0 {
+					var ruleDomains []string
+					var ruleMethods []string
+					for _, r := range policy.Rules {
+						ruleDomains = append(ruleDomains, r.Domain)
+						for m, act := range r.Methods {
+							ruleMethods = append(ruleMethods, fmt.Sprintf("%s:%s (%s)", r.Domain, m, act))
+						}
 					}
-					sort.Strings(mList)
-					methods = strings.Join(mList, ", ")
+					domains = strings.Join(ruleDomains, ", ")
+					if len(ruleMethods) > 0 {
+						sort.Strings(ruleMethods)
+						methods = strings.Join(ruleMethods, ", ")
+					}
+				} else {
+					if len(policy.Domains) > 0 {
+						domains = strings.Join(policy.Domains, ", ")
+					}
+					if len(policy.Methods) > 0 {
+						var mList []string
+						for m, act := range policy.Methods {
+							mList = append(mList, fmt.Sprintf("%s (%s)", m, act))
+						}
+						sort.Strings(mList)
+						methods = strings.Join(mList, ", ")
+					}
 				}
 				list = append(list, keyPolicy{
 					Key:     key,

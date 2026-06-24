@@ -191,8 +191,6 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	} else if agentID != "" {
 		identityLevel = "declared"
 	}
-
-	// Parse injection headers
 	injections := parseInjections(r.Header)
 	if len(injections) == 0 {
 		writeError(w, 400, "At least one X-AS-Inject-* header is required")

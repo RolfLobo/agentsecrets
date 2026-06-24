@@ -107,8 +107,10 @@ func runEnv(cmd *cobra.Command, args []string) error {
 	childCmd := exec.Command(commandPath, args[1:]...)
 	childCmd.Env = env
 	childCmd.Stdin = os.Stdin
-	childCmd.Stdout = &MaskingWriter{underlying: os.Stdout, secrets: maskingSecrets}
-	childCmd.Stderr = &MaskingWriter{underlying: os.Stderr, secrets: maskingSecrets}
+	stdoutMasker := &MaskingWriter{underlying: os.Stdout, secrets: maskingSecrets}
+	stderrMasker := &MaskingWriter{underlying: os.Stderr, secrets: maskingSecrets}
+	childCmd.Stdout = stdoutMasker
+	childCmd.Stderr = stderrMasker
 
 	// Forward signals to child
 	sigChan := make(chan os.Signal, 1)
@@ -138,11 +140,15 @@ func runEnv(cmd *cobra.Command, args []string) error {
 	}
 
 	// Run and exit with child's exit code
-	if err := childCmd.Run(); err != nil {
-		if exitErr, ok := err.(*exec.ExitError); ok {
+	runErr := childCmd.Run()
+	_ = stdoutMasker.Flush()
+	_ = stderrMasker.Flush()
+
+	if runErr != nil {
+		if exitErr, ok := runErr.(*exec.ExitError); ok {
 			os.Exit(exitErr.ExitCode())
 		}
-		return err
+		return runErr
 	}
 
 	return nil
@@ -258,10 +264,11 @@ func generateVariants(secrets map[string]string) []string {
 	return variants
 }
 
-// MaskingWriter masks secrets in output streams
+// MaskingWriter masks secrets in output streams by buffering partial matches across boundaries.
 type MaskingWriter struct {
 	underlying io.Writer
 	secrets    []string
+	buf        []byte
 }
 
 func (mw *MaskingWriter) Write(p []byte) (n int, err error) {
@@ -269,14 +276,50 @@ func (mw *MaskingWriter) Write(p []byte) (n int, err error) {
 		return mw.underlying.Write(p)
 	}
 
-	content := string(p)
+	mw.buf = append(mw.buf, p...)
+
+	// Perform replacements on the accumulated buffer
+	content := string(mw.buf)
 	for _, secret := range mw.secrets {
 		content = strings.ReplaceAll(content, secret, "[REDACTED]")
 	}
+	mw.buf = []byte(content)
 
-	_, err = mw.underlying.Write([]byte(content))
-	if err != nil {
-		return 0, err
+	// Find the longest suffix of mw.buf that is a prefix of any secret
+	keepLen := 0
+	for _, secret := range mw.secrets {
+		for i := 1; i <= len(secret); i++ {
+			prefix := secret[:i]
+			// Check if buffer ends with this prefix
+			if len(mw.buf) >= i && string(mw.buf[len(mw.buf)-i:]) == prefix {
+				if i > keepLen {
+					keepLen = i
+				}
+			}
+		}
 	}
+
+	if keepLen > len(mw.buf) {
+		keepLen = len(mw.buf)
+	}
+
+	writeLen := len(mw.buf) - keepLen
+	if writeLen > 0 {
+		_, err = mw.underlying.Write(mw.buf[:writeLen])
+		if err != nil {
+			return 0, err
+		}
+		mw.buf = mw.buf[writeLen:]
+	}
+
 	return len(p), nil
+}
+
+func (mw *MaskingWriter) Flush() error {
+	if len(mw.buf) > 0 {
+		_, err := mw.underlying.Write(mw.buf)
+		mw.buf = nil
+		return err
+	}
+	return nil
 }

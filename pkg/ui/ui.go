@@ -215,8 +215,8 @@ var ErrorRegistry = map[errors.ErrorCode]ErrorDetails{
 		Description: "The requested log ID was not found in your local database.",
 		Suggestions: []string{
 			"Verify that you specified the actual Log ID (e.g. 'log_01J0A...'), not the list index number.",
-			"Run 'agentsecrets log' and enter the row index number interactively to view detailed forensic details.",
-			"Export all logs in JSON format via 'agentsecrets log export --since 24h --format jsonl' to find the correct Log ID.",
+			"Run 'agentsecrets logs' and enter the row index number interactively to view detailed forensic details.",
+			"Export all logs in JSON format via 'agentsecrets logs export --since 24h --format jsonl' to find the correct Log ID.",
 		},
 	},
 	errors.ErrUnknown: {
@@ -385,7 +385,7 @@ func RenderTable(headers []string, rows [][]string) string {
 	// Style headers and rows
 	t.StyleFunc(func(row, col int) lipgloss.Style {
 		style := lipgloss.NewStyle().Padding(0, 1).Align(lipgloss.Left)
-		if row == 0 {
+		if row == table.HeaderRow {
 			style = style.Foreground(PrimaryColor).Bold(true)
 		}
 		return style

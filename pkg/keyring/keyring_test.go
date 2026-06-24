@@ -3,9 +3,18 @@ package keyring
 import (
 	"strings"
 	"testing"
+
+	"github.com/The-17/agentsecrets/pkg/keychainauth"
 )
 
 func TestKeyringDelegation(t *testing.T) {
+	// Override socket path to nonexistent to guarantee Init() fails and returns 'not initialized' error
+	keychainauth.SetSocketPathOverride("/nonexistent")
+	defer keychainauth.SetSocketPathOverride("")
+
+	// Ensure not initialized state
+	keychainauth.Close()
+
 	// Since keyring is a pure delegation layer to keychainauth,
 	// calling any function when keychainauth is not initialized
 	// should return a "not initialized" error.

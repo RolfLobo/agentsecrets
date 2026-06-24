@@ -102,6 +102,7 @@ func runProjectList(cmd *cobra.Command, args []string) error {
 
 	// Fetch global config to map workspace IDs to names
 	cfg, _ := config.LoadGlobalConfig()
+	currentProj, _ := config.LoadProjectConfig()
 
 	headers := []string{"Project", "Workspace", "Description"}
 	rows := make([][]string, len(projs))
@@ -119,7 +120,12 @@ func runProjectList(cmd *cobra.Command, args []string) error {
 			desc = "—"
 		}
 
-		rows[i] = []string{p.Name, wsName, desc}
+		pName := "  " + p.Name
+		if currentProj != nil && currentProj.ProjectID == p.ID {
+			pName = ui.BrandStyle.Render("→ " + p.Name)
+		}
+
+		rows[i] = []string{pName, wsName, desc}
 	}
 
 	renderedTable := ui.RenderTable(headers, rows)
@@ -336,6 +342,10 @@ func runProjectDelete(cmd *cobra.Command, args []string) error {
 		Value(&confirmed).
 		Run(); err != nil || !confirmed {
 		return nil
+	}
+
+	if err := verifyPasswordLocally(); err != nil {
+		return err
 	}
 
 	var projectID string

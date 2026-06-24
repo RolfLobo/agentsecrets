@@ -86,6 +86,10 @@ func init() {
 	proxyLogsCmd.Flags().IntVar(&logsLastFlag, "last", 20, "Number of recent log entries to show")
 	proxyLogsCmd.Flags().StringVar(&logsEnvFlag, "env", "", "Filter logs by environment (development, staging, production)")
 
+	proxyStartCmd.PreRunE = keychainAuthMiddleware
+	proxySyncCmd.PreRunE = keychainAuthMiddleware
+	proxyLogsCmd.PreRunE = keychainAuthMiddleware
+
 	proxyCmd.AddCommand(proxyStartCmd)
 	proxyCmd.AddCommand(proxyStatusCmd)
 	proxyCmd.AddCommand(proxyStopCmd)

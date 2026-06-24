@@ -7,9 +7,19 @@ import (
 	"time"
 )
 
+var socketPathOverride string
+
+// SetSocketPathOverride overrides the socket path for unit testing.
+func SetSocketPathOverride(path string) {
+	socketPathOverride = path
+}
+
 // SocketPath returns the keychain-auth Unix socket path or named pipe path on Windows.
 // It uses platform-specific, user-writable directories to avoid permission issues.
 func SocketPath() string {
+	if socketPathOverride != "" {
+		return socketPathOverride
+	}
 	if runtime.GOOS == "windows" {
 		return `\\.\pipe\keychain-auth`
 	}
@@ -18,6 +28,12 @@ func SocketPath() string {
 	}
 
 	// Linux / WSL
+	if runtime.GOOS == "linux" {
+		if _, err := os.Stat("/run/keychain-auth"); err == nil {
+			return "/run/keychain-auth/agent.sock"
+		}
+	}
+
 	runtimeDir := os.Getenv("XDG_RUNTIME_DIR")
 	if runtimeDir != "" {
 		// Verify the directory actually exists (WSL often exports this env var but the directory

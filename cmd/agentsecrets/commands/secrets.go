@@ -49,6 +49,15 @@ var secretsSetCmd = &cobra.Command{
 var secretsListCmd = &cobra.Command{
 	Use:   "list",
 	Short: "List all secret keys in the cloud",
+	PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
+		if err := ensureDaemonInitialized(); err != nil {
+			return err
+		}
+		if listRemote {
+			return authService.EnsureAuth(cmd, args)
+		}
+		return nil
+	},
 	RunE:  runSecretsList,
 }
 
@@ -524,6 +533,9 @@ func runSecretsDelete(cmd *cobra.Command, args []string) error {
 		if !confirmYN() {
 			ui.Info("Delete cancelled.")
 			return nil
+		}
+		if err := verifyPasswordLocally(); err != nil {
+			return err
 		}
 	}
 

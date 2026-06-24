@@ -62,6 +62,18 @@ func EnsureInstalled() (string, error) {
 	if runtime.GOOS == "windows" {
 		binaryName = "keychain-auth.exe"
 	}
+
+	// On Linux, prefer the system-wide installed binary at /usr/local/bin/keychain-auth
+	// since the system daemon service runs it.
+	if runtime.GOOS == "linux" {
+		sysBinPath := "/usr/local/bin/keychain-auth"
+		if _, err := os.Stat(sysBinPath); err == nil {
+			if v, vErr := queryInstalledVersion(sysBinPath); vErr == nil && compareVersions(v, RequiredDaemonVersion) >= 0 {
+				return sysBinPath, nil
+			}
+		}
+	}
+
 	goBinPath := filepath.Join(homeDir, "go", "bin", binaryName)
 
 	// 1. Prefer our locally built binary in ~/go/bin
@@ -148,49 +160,11 @@ func installViaBrew() (string, error) {
 
 // IsFullyConfigured returns true if the current binary is registered and has proper namespaces allowed.
 func IsFullyConfigured() bool {
-	selfPath, err := os.Executable()
-	if err != nil {
-		return false
+	if IsInitialized() {
+		return true
 	}
-	selfPath, err = filepath.EvalSymlinks(selfPath)
-	if err != nil {
-		return false
-	}
-	selfHash, err := computeHash(selfPath)
-	if err != nil {
-		return false
-	}
-
-	cfgPath := keychainAuthConfigPath()
-	data, err := os.ReadFile(cfgPath)
-	if err != nil {
-		return false
-	}
-	var cfg kcConfig
-	if err := json.Unmarshal(data, &cfg); err != nil {
-		return false
-	}
-
-	for _, rb := range cfg.RegisteredBinaries {
-		if rb.Path == selfPath && rb.Hash == selfHash {
-			hasRead := false
-			for _, s := range rb.AllowedReadServices {
-				if s == serviceName {
-					hasRead = true
-					break
-				}
-			}
-			hasWrite := false
-			for _, s := range rb.AllowedWriteServices {
-				if s == serviceName {
-					hasWrite = true
-					break
-				}
-			}
-			if hasRead && hasWrite && rb.CanSearch {
-				return true
-			}
-		}
+	if err := Init(); err == nil {
+		return true
 	}
 	return false
 }
@@ -209,142 +183,43 @@ func EnsureRegistered(keychainAuthPath string) error {
 	if err != nil {
 		return fmt.Errorf("cannot determine own binary path: %w", err)
 	}
-	// Resolve symlinks so we register the real physical path, not a symlink.
-	// On macOS, Homebrew symlinks /opt/homebrew/bin/agentsecrets → Cellar/…/bin/agentsecrets.
-	// The daemon resolves via proc_pidpath to the Cellar path, so we must register that.
 	selfPath, err = filepath.EvalSymlinks(selfPath)
 	if err != nil {
 		return fmt.Errorf("cannot resolve binary symlinks: %w", err)
 	}
 
-	cfgPath := keychainAuthConfigPath()
-	data, err := os.ReadFile(cfgPath)
-	action := "register"
-
-	if err == nil {
-		var cfg kcConfig
-		if err := json.Unmarshal(data, &cfg); err == nil {
-			for _, rb := range cfg.RegisteredBinaries {
-				if rb.Path == selfPath {
-					action = "upgrade"
-					break
-				}
-			}
-		}
-	}
-
 	var cmd *exec.Cmd
-	if runtime.GOOS == "linux" && keychainAuthConfigPath() == "/etc/keychain-auth/config.json" {
-		cmd = exec.Command("sudo", keychainAuthPath, action, selfPath)
+	if requiresSudoForRegistration(keychainAuthPath) {
+		cmd = exec.Command("sudo", keychainAuthPath, "authorize", selfPath, serviceName)
 		cmd.Stdin = os.Stdin
 	} else {
-		cmd = exec.Command(keychainAuthPath, action, selfPath)
+		cmd = exec.Command(keychainAuthPath, "authorize", selfPath, serviceName)
 	}
 	output, err := cmd.CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("failed to %s with keychain-auth: %w\nOutput: %s", action, err, strings.TrimSpace(string(output)))
-	}
-
-	// Post-registration: update keychain-auth config to auto-grant AgentSecrets namespace permissions.
-	// This ensures zero-trust process-level verification works invisibly without manual approval.
-	data, err = os.ReadFile(cfgPath) // re-read because register/upgrade modifies it
-	if err == nil {
-		var cfg kcConfig
-		if err := json.Unmarshal(data, &cfg); err == nil {
-			modified := false
-			for i, rb := range cfg.RegisteredBinaries {
-				if rb.Path == selfPath {
-					hasRead := false
-					for _, s := range rb.AllowedReadServices {
-						if s == serviceName {
-							hasRead = true
-							break
-						}
-					}
-					hasWrite := false
-					for _, s := range rb.AllowedWriteServices {
-						if s == serviceName {
-							hasWrite = true
-							break
-						}
-					}
-					if !hasRead || !hasWrite || !rb.CanSearch {
-						// Filter out any existing serviceName to avoid duplicates
-						newRead := []string{}
-						for _, s := range rb.AllowedReadServices {
-							if s != serviceName {
-								newRead = append(newRead, s)
-							}
-						}
-						newWrite := []string{}
-						for _, s := range rb.AllowedWriteServices {
-							if s != serviceName {
-								newWrite = append(newWrite, s)
-							}
-						}
-
-						cfg.RegisteredBinaries[i].AllowedReadServices = append(newRead, serviceName)
-						cfg.RegisteredBinaries[i].AllowedWriteServices = append(newWrite, serviceName)
-						cfg.RegisteredBinaries[i].CanSearch = true
-						modified = true
-					}
-					break
-				}
-			}
-			if modified {
-				newData, err := json.MarshalIndent(cfg, "", "  ")
-				if err == nil {
-					_ = os.WriteFile(cfgPath, newData, 0600)
-					// Restart the daemon so it reloads the config immediately
-					_ = RestartDaemon()
-				}
-			}
-		}
-	} else {
-		fmt.Printf("[DEBUG] Failed to read config.json after register: %v\n", err)
+		return fmt.Errorf("failed to authorize binary with keychain-auth: %w\nOutput: %s", err, strings.TrimSpace(string(output)))
 	}
 
 	return nil
 }
 
-type kcRegisteredBinary struct {
-	Path                 string   `json:"path"`
-	Hash                 string   `json:"hash"`
-	RegisteredAt         string   `json:"registered_at"`
-	AllowedReadServices  []string `json:"allowed_read_services"`
-	AllowedWriteServices []string `json:"allowed_write_services"`
-	CanSearch            bool     `json:"can_search"`
-}
-
-type kcConfig struct {
-	RegisteredBinaries []kcRegisteredBinary `json:"registered_binaries"`
-	ProtocolVersion    string               `json:"protocol_version,omitempty"`
-}
-
-func keychainAuthConfigPath() string {
-	if runtime.GOOS == "linux" {
-		sysPath := "/etc/keychain-auth/config.json"
-		if _, err := os.Stat(sysPath); err == nil {
-			return sysPath
+func requiresSudoForRegistration(keychainAuthPath string) bool {
+	if runtime.GOOS != "linux" {
+		return false
+	}
+	// Query keychain-auth status command
+	cmd := exec.Command(keychainAuthPath, "status", "--json")
+	output, err := cmd.Output()
+	if err == nil {
+		var status struct {
+			RequiresSudo bool `json:"requires_sudo"`
+		}
+		if json.Unmarshal(output, &status) == nil {
+			return status.RequiresSudo
 		}
 	}
-	home, _ := os.UserHomeDir()
-	if runtime.GOOS == "windows" {
-		dir := os.Getenv("APPDATA")
-		if dir == "" {
-			dir = filepath.Join(home, "AppData", "Roaming")
-		}
-		return filepath.Join(dir, "keychain-auth", "config.json")
-	}
-	if runtime.GOOS == "darwin" {
-		return filepath.Join(home, "Library", "Application Support", "keychain-auth", "config.json")
-	}
-	// Linux fallback
-	dir := os.Getenv("XDG_CONFIG_HOME")
-	if dir == "" {
-		dir = filepath.Join(home, ".config")
-	}
-	return filepath.Join(dir, "keychain-auth", "config.json")
+	// Fallback to checking socket path
+	return SocketPath() == "/run/keychain-auth/agent.sock"
 }
 
 // EnsureDaemonRunning checks if the keychain-auth daemon is running by probing
@@ -610,20 +485,10 @@ func compareVersions(v1, v2 string) int {
 	}
 	return 0
 }
-
 func ensureSandboxInstalled(keychainAuthPath string) error {
-	// If system-wide configuration is already set up, we are good
-	if _, err := os.Stat("/etc/keychain-auth/config.json"); err == nil {
+	// If system-wide configuration is already set up (even if we get permission denied), we are good
+	if _, err := os.Stat("/etc/keychain-auth/config.json"); err == nil || !os.IsNotExist(err) {
 		return nil
-	}
-
-	selfPath, err := os.Executable()
-	if err != nil {
-		return fmt.Errorf("cannot determine own binary path: %w", err)
-	}
-	selfPath, err = filepath.EvalSymlinks(selfPath)
-	if err != nil {
-		return fmt.Errorf("cannot resolve own binary symlinks: %w", err)
 	}
 
 	// Run install command via sudo
@@ -632,36 +497,6 @@ func ensureSandboxInstalled(keychainAuthPath string) error {
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("keychain-auth system installer command failed: %w\nOutput: %s", err, string(output))
-	}
-
-	// Register the calling agentsecrets binary
-	regCmd := exec.Command("sudo", "/usr/local/bin/keychain-auth", "register", selfPath)
-	regCmd.Stdin = os.Stdin
-	regOutput, err := regCmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("failed to register binary: %w\nOutput: %s", err, string(regOutput))
-	}
-
-	// Update permissions in the config file to allow read/write for agentsecrets
-	pyScript := fmt.Sprintf(`
-import json
-path = "/etc/keychain-auth/config.json"
-with open(path, "r") as f:
-    cfg = json.load(f)
-for i, rb in enumerate(cfg.get("registered_binaries", [])):
-    if rb["path"] == "%[1]s":
-        cfg["registered_binaries"][i]["allowed_read_services"] = ["agentsecrets"]
-        cfg["registered_binaries"][i]["allowed_write_services"] = ["agentsecrets"]
-        cfg["registered_binaries"][i]["can_search"] = True
-with open(path, "w") as f:
-    json.dump(cfg, f, indent=2)
-`, selfPath)
-
-	authCmd := exec.Command("sudo", "python3", "-c", pyScript)
-	authCmd.Stdin = os.Stdin
-	authOutput, err := authCmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("failed to authorize AgentSecrets namespace: %w\nOutput: %s", err, string(authOutput))
 	}
 
 	return nil

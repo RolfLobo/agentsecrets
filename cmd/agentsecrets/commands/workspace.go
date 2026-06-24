@@ -74,6 +74,13 @@ func init() {
 			Args:  cobra.ExactArgs(1),
 			RunE:  runWorkspaceDemote,
 		},
+		&cobra.Command{
+			Use:   "delete [name]",
+			Short: "Delete a workspace",
+			Args:  cobra.MaximumNArgs(1),
+			RunE:  runWorkspaceDelete,
+			ValidArgsFunction: autocompleteWorkspaces,
+		},
 	)
 }
 
@@ -518,4 +525,70 @@ func autocompleteWorkspaces(cmd *cobra.Command, args []string, toComplete string
 		}
 	}
 	return completions, cobra.ShellCompDirectiveNoFileComp
+}
+
+func runWorkspaceDelete(cmd *cobra.Command, args []string) error {
+	var name string
+	if len(args) > 0 {
+		name = args[0]
+	}
+
+	if name == "" {
+		if err := huh.NewInput().
+			Title("Workspace Name").
+			Description("Which workspace do you want to delete?").
+			Value(&name).
+			Run(); err != nil {
+			return nil
+		}
+	}
+
+	cfg, err := config.LoadGlobalConfig()
+	if err != nil || cfg == nil {
+		return fmt.Errorf("failed to load global config: %w", err)
+	}
+
+	var targetID string
+	var wsType string
+	var wsName string
+	for id, ws := range cfg.Workspaces {
+		if ws.Name == name || id == name || (name == "personal" && strings.EqualFold(ws.Type, "personal")) {
+			targetID = id
+			wsType = ws.Type
+			wsName = ws.Name
+			break
+		}
+	}
+
+	if targetID == "" {
+		return fmt.Errorf("workspace '%s' not found", name)
+	}
+
+	if strings.EqualFold(wsType, "personal") {
+		return fmt.Errorf("cannot delete your personal workspace")
+	}
+
+	var confirmed bool
+	if err := huh.NewConfirm().
+		Title(fmt.Sprintf("Are you sure you want to delete workspace '%s'? This cannot be undone.", wsName)).
+		Value(&confirmed).
+		Run(); err != nil || !confirmed {
+		return nil
+	}
+
+	if err := verifyPasswordLocally(); err != nil {
+		return err
+	}
+
+	if err := ui.Spinner(fmt.Sprintf("Deleting workspace '%s'...", wsName), func() error {
+		return workspaceService.Delete(targetID)
+	}); err != nil {
+		ui.Error("Failed to delete workspace: " + err.Error())
+		return nil
+	}
+
+	_ = proxy.LogManagementEvent("DELETE", "workspace", fmt.Sprintf("Deleted workspace %s", wsName), cfg.Email, targetID, "", config.ResolveEnvironment())
+
+	ui.Success(fmt.Sprintf("Workspace '%s' deleted!", wsName))
+	return nil
 }
