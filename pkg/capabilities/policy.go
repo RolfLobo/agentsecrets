@@ -39,37 +39,43 @@ func EvaluateSecret(c *SecretPolicy, domain, method string) Action {
 	}
 
 	// 1. Check domain-specific Rules if present
+	var matchedRule *PolicyRule
 	if len(c.Rules) > 0 {
-		var matchedRule *PolicyRule
 		for i := range c.Rules {
 			if strings.EqualFold(c.Rules[i].Domain, domain) {
 				matchedRule = &c.Rules[i]
 				break
 			}
 		}
+	}
 
-		if matchedRule == nil {
-			return Deny // domain not allowed by any rule
-		}
-
+	if matchedRule != nil {
 		// Domain matched! Now check method inside this rule
 		if len(matchedRule.Methods) > 0 {
 			action, exists := matchedRule.Methods[strings.ToUpper(method)]
-			if !exists {
-				return Deny // unlisted methods denied for this domain
+			if exists {
+				return action
 			}
-			return action
 		}
-
-		return Allow // domain matched, no methods configured = allow all methods for this domain
+		// If the method is not explicitly in the specific rule, fall back to global methods if configured
+		if len(c.Methods) > 0 {
+			globalAction, globalExists := c.Methods[strings.ToUpper(method)]
+			if globalExists {
+				return globalAction
+			}
+		}
+		return Allow // default to Allow for unlisted methods
 	}
 
-	// 2. Legacy fallback
-	if len(c.Domains) == 0 && len(c.Methods) == 0 {
-		return Allow
+	// 2. No domain-specific rule matched. Fall back to global constraints.
+
+	// If there are domain-specific rules, but no global constraints are configured:
+	// any unlisted domain is denied.
+	if len(c.Rules) > 0 && len(c.Domains) == 0 && len(c.Methods) == 0 {
+		return Deny
 	}
 
-	// Domain check
+	// Global Domain check
 	if len(c.Domains) > 0 {
 		matched := false
 		for _, d := range c.Domains {
@@ -79,17 +85,17 @@ func EvaluateSecret(c *SecretPolicy, domain, method string) Action {
 			}
 		}
 		if !matched {
-			return Deny
+			return Deny // domain not allowed globally
 		}
 	}
 
-	// Method check
+	// Global Method check
 	if len(c.Methods) > 0 {
 		action, exists := c.Methods[strings.ToUpper(method)]
-		if !exists {
-			return Deny // unlisted methods denied when methods are configured
+		if exists {
+			return action
 		}
-		return action
+		return Allow // default to Allow for unlisted methods
 	}
 
 	return Allow

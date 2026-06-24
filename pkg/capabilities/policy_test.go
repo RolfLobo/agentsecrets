@@ -50,8 +50,8 @@ func TestEvaluateSecret(t *testing.T) {
 	if EvaluateSecret(methodPolicy, "any-domain.com", "PUT") != Deny {
 		t.Error("expected PUT to be denied")
 	}
-	if EvaluateSecret(methodPolicy, "any-domain.com", "DELETE") != Deny {
-		t.Error("expected unlisted method DELETE to be denied when methods are configured")
+	if EvaluateSecret(methodPolicy, "any-domain.com", "DELETE") != Allow {
+		t.Error("expected unlisted method DELETE to be allowed when not configured")
 	}
 
 	// Case 5: Combined domains and methods
@@ -64,10 +64,67 @@ func TestEvaluateSecret(t *testing.T) {
 	if EvaluateSecret(combined, "api.stripe.com", "GET") != Allow {
 		t.Error("expected matching domain and method to allow")
 	}
-	if EvaluateSecret(combined, "api.stripe.com", "POST") != Deny {
-		t.Error("expected unlisted method to deny even if domain matches")
+	if EvaluateSecret(combined, "api.stripe.com", "POST") != Allow {
+		t.Error("expected unlisted method to default to allow if domain matches")
 	}
 	if EvaluateSecret(combined, "api.openai.com", "GET") != Deny {
 		t.Error("expected unlisted domain to deny even if method matches")
+	}
+
+	// Case 6: Domain-specific rules and fallback logic
+	rulesPolicy := &SecretPolicy{
+		Rules: []PolicyRule{
+			{
+				Domain: "api.stripe.com",
+				Methods: map[string]Action{
+					"POST": RequestPermission,
+				},
+			},
+			{
+				Domain: "httpbin.org",
+				Methods: map[string]Action{
+					"GET": Allow,
+				},
+			},
+		},
+		Methods: map[string]Action{
+			"POST": RequestPermission,
+		},
+	}
+
+	// Domain matches rule, method matches rule method:
+	if EvaluateSecret(rulesPolicy, "api.stripe.com", "POST") != RequestPermission {
+		t.Error("expected POST on stripe to require permission")
+	}
+	// Domain matches rule, method does not match rule method (specific rule overrides global fallback, but unlisted defaults to allow):
+	if EvaluateSecret(rulesPolicy, "api.stripe.com", "GET") != Allow {
+		t.Error("expected GET on stripe to allow because it is unlisted")
+	}
+	// Domain matches another rule:
+	if EvaluateSecret(rulesPolicy, "httpbin.org", "GET") != Allow {
+		t.Error("expected GET on httpbin to be allowed")
+	}
+	// Domain does not match any rule, method matches global method:
+	if EvaluateSecret(rulesPolicy, "api.github.com", "POST") != RequestPermission {
+		t.Error("expected POST on github to fall back to global and require permission")
+	}
+	// Domain does not match any rule, method does not match global method:
+	if EvaluateSecret(rulesPolicy, "api.github.com", "GET") != Allow {
+		t.Error("expected GET on github to default to allow")
+	}
+
+	// Case 7: Rules configured but no global constraints (unlisted domain should deny)
+	onlyRulesPolicy := &SecretPolicy{
+		Rules: []PolicyRule{
+			{
+				Domain: "api.stripe.com",
+				Methods: map[string]Action{
+					"POST": RequestPermission,
+				},
+			},
+		},
+	}
+	if EvaluateSecret(onlyRulesPolicy, "api.github.com", "POST") != Deny {
+		t.Error("expected unlisted domain to deny when rules are present and no global constraints exist")
 	}
 }

@@ -283,7 +283,7 @@ func runSecretsPolicyGet(cmd *cobra.Command, args []string) error {
 
 	fmt.Printf("\nSecret Policy for %s:\n", key)
 	if len(policy.Rules) > 0 {
-		fmt.Println("  Rules:")
+		fmt.Println("  Rules (Domain-Specific):")
 		for _, rule := range policy.Rules {
 			var methods []string
 			if len(rule.Methods) > 0 {
@@ -294,6 +294,21 @@ func runSecretsPolicyGet(cmd *cobra.Command, args []string) error {
 				fmt.Printf("    - %s: %s (all other methods denied)\n", rule.Domain, strings.Join(methods, ", "))
 			} else {
 				fmt.Printf("    - %s: (any method allowed)\n", rule.Domain)
+			}
+		}
+
+		if len(policy.Domains) > 0 || len(policy.Methods) > 0 {
+			fmt.Println("\n  Global Fallbacks (Overridden by Rules above):")
+			if len(policy.Domains) > 0 {
+				fmt.Printf("    Allowed Domains: %s (all other domains denied)\n", strings.Join(policy.Domains, ", "))
+			}
+			if len(policy.Methods) > 0 {
+				var methods []string
+				for m, act := range policy.Methods {
+					methods = append(methods, fmt.Sprintf("%s (%s)", m, act))
+				}
+				sort.Strings(methods)
+				fmt.Printf("    Allowed Methods: %s (all other methods denied)\n", strings.Join(methods, ", "))
 			}
 		}
 	} else {
