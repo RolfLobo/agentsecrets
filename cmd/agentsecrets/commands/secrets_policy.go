@@ -291,7 +291,7 @@ func runSecretsPolicyGet(cmd *cobra.Command, args []string) error {
 					methods = append(methods, fmt.Sprintf("%s (%s)", m, act))
 				}
 				sort.Strings(methods)
-				fmt.Printf("    - %s: %s (all other methods denied)\n", rule.Domain, strings.Join(methods, ", "))
+				fmt.Printf("    - %s: %s\n", rule.Domain, strings.Join(methods, ", "))
 			} else {
 				fmt.Printf("    - %s: (any method allowed)\n", rule.Domain)
 			}
@@ -308,7 +308,7 @@ func runSecretsPolicyGet(cmd *cobra.Command, args []string) error {
 					methods = append(methods, fmt.Sprintf("%s (%s)", m, act))
 				}
 				sort.Strings(methods)
-				fmt.Printf("    Allowed Methods: %s (all other methods denied)\n", strings.Join(methods, ", "))
+				fmt.Printf("    Allowed Methods: %s\n", strings.Join(methods, ", "))
 			}
 		}
 	} else {
@@ -324,7 +324,7 @@ func runSecretsPolicyGet(cmd *cobra.Command, args []string) error {
 				methods = append(methods, fmt.Sprintf("%s (%s)", m, act))
 			}
 			sort.Strings(methods)
-			fmt.Printf("  Allowed Methods: %s (all other methods denied)\n", strings.Join(methods, ", "))
+			fmt.Printf("  Allowed Methods: %s\n", strings.Join(methods, ", "))
 		} else {
 			fmt.Println("  Allowed Methods: (any)")
 		}
