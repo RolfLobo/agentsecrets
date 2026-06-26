@@ -10,11 +10,21 @@ import (
 	"strings"
 	"time"
 
+	"github.com/The-17/agentsecrets/pkg/config"
+	"github.com/The-17/agentsecrets/pkg/errors"
 	"github.com/The-17/agentsecrets/pkg/log"
+	"github.com/The-17/agentsecrets/pkg/projects"
 	"github.com/The-17/agentsecrets/pkg/proxy"
 	"github.com/The-17/agentsecrets/pkg/ui"
 	"github.com/spf13/cobra"
 )
+
+func displayTokenID(id string) string {
+	if len(id) <= 8 {
+		return id
+	}
+	return id[:4] + "..." + id[len(id)-4:]
+}
 
 var (
 	logService  *log.Service
@@ -29,12 +39,14 @@ var logWatchCmd = &cobra.Command{
 	},
 }
 
-var logCmd = &cobra.Command{
-	Use:   "log",
+var logsCmd = &cobra.Command{
+	Use:   "logs",
 	Short: "View and filter the credential call audit log",
 	Long:  "Every call made through the AgentSecrets proxy is logged here.\nThe log records which agent made the call, which credential was\nreferenced, which API was called, and what happened — but never\nthe credential value.",
 	PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
-		// Run root's persistent pre-run if exists (or init auth)
+		if err := ensureDaemonInitialized(); err != nil {
+			return err
+		}
 		if err := authService.EnsureAuth(cmd, args); err != nil {
 			return err
 		}
@@ -54,59 +66,31 @@ var logShowCmd = &cobra.Command{
 	Args:  cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		id := args[0]
-		entry, err := logService.GetLog(id)
+		cfg, _ := config.LoadGlobalConfig()
+		wsID := config.GetSelectedWorkspaceID()
+		var entry *proxy.AuditEvent
+		var err error
+
+		if cfg != nil && wsID != "" && strings.EqualFold(cfg.Workspaces[wsID].Type, "shared") {
+			entry, err = logService.GetRemoteLog(id)
+			if err != nil {
+				return errors.New(errors.ErrLogNotFound, fmt.Sprintf("log entry %q not found remotely: %v", id, err), err)
+			}
+			showLogDetail(*entry)
+			return nil
+		}
+
+		fe, err := logService.GetForensicLog(id)
+		if err == nil {
+			showForensicLogDetail(fe)
+			return nil
+		}
+
+		entry, err = logService.GetLog(id)
 		if err != nil {
-			return err
+			return errors.New(errors.ErrLogNotFound, fmt.Sprintf("log entry %q not found locally", id), err)
 		}
-
-		fmt.Println("─────────────────────────────────────────────────────────")
-		fmt.Printf("LOG ENTRY  %s\n", entry.ID)
-		fmt.Println("─────────────────────────────────────────────────────────")
-		fmt.Printf("Timestamp        %s\n\n", entry.Timestamp.Format("2006-01-02 15:04:05.000 MST"))
-
-		ws := entry.WorkspaceID
-		if ws == "" {
-			ws = "(none)"
-		}
-		pr := entry.ProjectID
-		if pr == "" {
-			pr = "(none)"
-		}
-
-		fmt.Printf("Workspace        %s\n", ws)
-		fmt.Printf("Project          %s\n\n", pr)
-
-		agent := entry.AgentID
-		if agent == "" {
-			agent = "(none)"
-		}
-
-		fmt.Printf("Agent            %s\n", agent)
-		fmt.Printf("Token            %s\n", entry.TokenID)
-		fmt.Printf("Environment      %s\n", entry.Environment)
-		fmt.Printf("Identity level   %s\n\n", entry.IdentityLevel)
-
-		fmt.Printf("Credential       %s\n", strings.Join(entry.SecretKeys, ", "))
-		fmt.Printf("Injection        %s\n\n", strings.Join(entry.AuthStyles, ", "))
-
-		fmt.Printf("Target           %s %s\n", strings.ToUpper(entry.Method), entry.TargetURL)
-		fmt.Printf("Domain           %s\n\n", entry.Domain)
-
-		statusText := fmt.Sprintf("%d", entry.StatusCode)
-		if entry.Status == "BLOCKED" {
-			statusText = "BLOCKED (" + entry.Reason + ")"
-		}
-
-		fmt.Printf("Status           %s\n", statusText)
-		fmt.Printf("Duration         %dms\n", entry.DurationMs)
-		redactedStr := "no"
-		if entry.Redacted {
-			redactedStr = "yes"
-		}
-		fmt.Printf("Redacted         %s\n", redactedStr)
-		fmt.Printf("Resolution       %s\n\n", entry.ResolutionPath)
-		fmt.Printf("Caller role      %s\n", entry.CallerRole)
-		fmt.Println("─────────────────────────────────────────────────────────")
+		showLogDetail(*entry)
 		return nil
 	},
 }
@@ -118,7 +102,7 @@ var logSummaryCmd = &cobra.Command{
 		since, _ := cmd.Flags().GetString("since")
 		filter := buildFilter(cmd, since)
 
-		logs, err := logService.QueryLocal(filter)
+		logs, err := queryLogs(filter)
 		if err != nil {
 			return err
 		}
@@ -235,7 +219,7 @@ var logExportCmd = &cobra.Command{
 			filter.Until = parseDuration(untilStr)
 		}
 
-		logs, err := logService.QueryLocal(filter)
+		logs, err := queryLogs(filter)
 		if err != nil {
 			return err
 		}
@@ -390,6 +374,7 @@ func buildFilter(cmd *cobra.Command, sinceStr string) log.Filter {
 	f.ProjectID, _ = cmd.Flags().GetString("project")
 	f.Environment, _ = cmd.Flags().GetString("env")
 	f.Limit, _ = cmd.Flags().GetInt("limit")
+	f.ExcludeManagement = true
 
 	untilStr, _ := cmd.Flags().GetString("until")
 	if sinceStr != "" {
@@ -420,9 +405,38 @@ func colorStatus(statusCode int, status string) string {
 	}
 }
 
-func runLogList(cmd *cobra.Command, args []string) error {
-	sinceStr, _ := cmd.Flags().GetString("since")
-	filter := buildFilter(cmd, sinceStr)
+func queryLogs(filter log.Filter) ([]proxy.AuditEvent, error) {
+	cfg, err := config.LoadGlobalConfig()
+	if err != nil {
+		return nil, err
+	}
+	wsID := config.GetSelectedWorkspaceID()
+	if wsID == "" {
+		return nil, fmt.Errorf("no workspace selected")
+	}
+	filter.WorkspaceID = wsID
+
+	// Resolve project name/slug to project UUID if provided
+	if filter.ProjectID != "" {
+		projSvc := projects.NewService(apiClient)
+		if list, err := projSvc.List(); err == nil {
+			for _, p := range list {
+				if strings.EqualFold(p.ID, filter.ProjectID) || strings.EqualFold(p.Name, filter.ProjectID) {
+					filter.ProjectID = p.ID
+					break
+				}
+			}
+		}
+	}
+
+	ws := cfg.Workspaces[wsID]
+	if strings.EqualFold(ws.Type, "shared") {
+		return logService.QueryRemote(wsID, filter)
+	}
+	return logService.QueryLocal(filter)
+}
+
+func runLogListWithFilter(cmd *cobra.Command, filter log.Filter) error {
 	useJSON, _ := cmd.Flags().GetBool("json")
 	useTail, _ := cmd.Flags().GetBool("tail")
 
@@ -431,7 +445,7 @@ func runLogList(cmd *cobra.Command, args []string) error {
 	}
 
 	if useJSON {
-		logs, err := logService.QueryLocal(filter)
+		logs, err := queryLogs(filter)
 		if err != nil {
 			return err
 		}
@@ -446,7 +460,7 @@ func runLogList(cmd *cobra.Command, args []string) error {
 	for {
 		filter.Limit = logPageSize
 		filter.Offset = offset
-		logs, err := logService.QueryLocal(filter)
+		logs, err := queryLogs(filter)
 		if err != nil {
 			return err
 		}
@@ -500,7 +514,7 @@ func runLogList(cmd *cobra.Command, args []string) error {
 		// Anonymous call hint
 		if anonymousCount > 0 {
 			fmt.Println("\n" + ui.WarningStyle.Render(fmt.Sprintf("%d anonymous calls detected.", anonymousCount)))
-			fmt.Println("Run: agentsecrets log --identity anonymous")
+			fmt.Println("Run: agentsecrets logs --identity anonymous")
 		}
 
 		fmt.Println("\n" + ui.DimStyle.Render("Navigation: [n]ext, [p]rev, [1-20] for detail, [q]uit"))
@@ -525,13 +539,45 @@ func runLogList(cmd *cobra.Command, args []string) error {
 			idx := 0
 			if _, err := fmt.Sscanf(input, "%d", &idx); err == nil {
 				if idx > 0 && idx <= len(logs) {
-					showLogDetail(logs[idx-1])
+					fe, err := logService.GetForensicLog(logs[idx-1].ID)
+					if err == nil {
+						showForensicLogDetail(fe)
+					} else {
+						showLogDetail(logs[idx-1])
+					}
 					fmt.Println("\nPress Enter to return to list...")
 					fmt.Scanln()
 				}
 			}
 		}
 	}
+}
+
+func runLogList(cmd *cobra.Command, args []string) error {
+	sinceStr, _ := cmd.Flags().GetString("since")
+	filter := buildFilter(cmd, sinceStr)
+	return runLogListWithFilter(cmd, filter)
+}
+
+func runProjectLogs(cmd *cobra.Command, args []string) error {
+	sinceStr, _ := cmd.Flags().GetString("since")
+	filter := buildFilter(cmd, sinceStr)
+
+	var projectID string
+	if pc, err := config.LoadProjectConfig(); err == nil && pc != nil {
+		projectID = pc.ProjectID
+	} else {
+		cfg, _ := config.LoadGlobalConfig()
+		if cfg != nil {
+			projectID = cfg.SelectedProjectID
+		}
+	}
+	if projectID == "" {
+		return fmt.Errorf("no project selected — run 'agentsecrets project use' first")
+	}
+	filter.ProjectID = projectID
+
+	return runLogListWithFilter(cmd, filter)
 }
 
 // displayLogBasic prints a single log entry in the spec format:
@@ -591,11 +637,297 @@ func showLogDetail(entry proxy.AuditEvent) {
 	fmt.Println("─────────────────────────────────────────────────────────")
 }
 
+func showForensicLogDetail(fe *proxy.ForensicAuditEvent) {
+	fmt.Println("─────────────────────────────────────────────────────────")
+	fmt.Printf("FORENSIC LOG ENTRY  %s\n", fe.ID)
+	fmt.Println("─────────────────────────────────────────────────────────")
+	ui.StatusRow("Timestamp", fe.CreatedAt.Format("2006-01-02 15:04:05.000 MST"))
+	ui.StatusRow("Schema Version", fe.Version)
+	ui.StatusRow("Workspace ID", fe.WorkspaceID)
+	ui.StatusRow("Project ID", fe.ProjectID)
+	ui.StatusRow("Chain Hash", fe.ChainHash)
+	fmt.Println()
+
+	fmt.Println(ui.BrandStyle.Render("● EVENT DETAILS"))
+	ui.StatusRow("  Type", fe.Event.Type)
+	ui.StatusRow("  Environment", fe.Event.Environment)
+	ui.StatusRow("  Key Name", fe.Event.KeyName)
+	ui.StatusRow("  Target", fmt.Sprintf("%s https://%s%s", strings.ToUpper(fe.Event.Method), fe.Event.Domain, fe.Event.Path))
+	ui.StatusRow("  Domain", fe.Event.Domain)
+	ui.StatusRow("  Path", fe.Event.Path)
+	ui.StatusRow("  Status Code", fmt.Sprintf("%d", fe.Event.StatusCode))
+	ui.StatusRow("  Outcome", fe.Event.Outcome)
+	ui.StatusRow("  Latency", fmt.Sprintf("%dms", fe.Event.LatencyMs))
+	if fe.Event.AgentIdentity != nil {
+		ui.StatusRow("  Agent ID", fe.Event.AgentIdentity.TokenName)
+		ui.StatusRow("  Agent Token ID", fe.Event.AgentIdentity.TokenID)
+		ui.StatusRow("  Identity Level", fe.Event.AgentIdentity.IdentityLevel)
+		procVer := "no"
+		if fe.Event.AgentIdentity.ProcessVerified {
+			procVer = "yes"
+		}
+		ui.StatusRow("  Process Verified", procVer)
+	}
+	fmt.Println()
+
+	fmt.Println(ui.BrandStyle.Render("● ENFORCEMENT LAYER"))
+	ui.StatusRow("  Decision", fe.Enforcement.Decision)
+	ui.StatusRow("  Decided By", fe.Enforcement.DecidedBy)
+	if fe.Enforcement.FirstFailureLayer != "" {
+		ui.StatusRow("  First Failure", ui.ErrorStyle.Render(fe.Enforcement.FirstFailureLayer))
+	}
+	fmt.Println("  Layers Evaluated:")
+	for _, l := range fe.Enforcement.LayersEvaluated {
+		resStr := ui.SuccessStyle.Render("pass")
+		if l.Result == "fail" {
+			resStr = ui.ErrorStyle.Render("fail")
+		}
+		fmt.Printf("    - %-20s [%s]  %s\n", l.Layer, resStr, l.Reason)
+		if l.ActionRequired != "" {
+			fmt.Printf("      %s %s\n", ui.WarningStyle.Render("Action Required:"), l.ActionRequired)
+		}
+	}
+	fmt.Println()
+
+	fmt.Println(ui.BrandStyle.Render("● RESOLUTION LAYER"))
+	injectedStr := "no"
+	if fe.Resolution.CredentialInjected {
+		injectedStr = "yes"
+	}
+	ui.StatusRow("  Cred Injected", injectedStr)
+	if fe.Resolution.InjectionStyle != "" {
+		ui.StatusRow("  Injection Style", fe.Resolution.InjectionStyle)
+	}
+	scannedStr := "no"
+	if fe.Resolution.ResponseScanned {
+		scannedStr = "yes"
+	}
+	ui.StatusRow("  Resp Scanned", scannedStr)
+	redactedStr := "no"
+	if fe.Resolution.RedactionTriggered {
+		redactedStr = "yes"
+	}
+	ui.StatusRow("  Redaction Triggered", redactedStr)
+	if fe.Resolution.RedactionPattern != "" {
+		ui.StatusRow("  Redact Pattern", fe.Resolution.RedactionPattern)
+	}
+	if fe.Resolution.RedactedField != "" {
+		ui.StatusRow("  Redacted Field", fe.Resolution.RedactedField)
+	}
+	ssrfStr := "no"
+	if fe.Resolution.SSRFCheckPassed {
+		ssrfStr = "yes"
+	}
+	ui.StatusRow("  SSRF Check Passed", ssrfStr)
+	ui.StatusRow("  Response Status", fmt.Sprintf("%d", fe.Resolution.ResponseStatus))
+	fmt.Println()
+
+	fmt.Println(ui.BrandStyle.Render("● SNAPSHOT STATE AT EVENT TIME"))
+	ui.StatusRow("  Captured At", fe.Snapshot.CapturedAt.Format("2006-01-02 15:04:05.000 MST"))
+	ui.StatusRow("  Workspace ID", fe.Snapshot.Workspace.ID)
+	ui.StatusRow("  Workspace Name", fe.Snapshot.Workspace.Name)
+	ui.StatusRow("  Workspace Allowlist", strings.Join(fe.Snapshot.Workspace.Allowlist, ", "))
+	ui.StatusRow("  Project ID", fe.Snapshot.Project.ID)
+	ui.StatusRow("  Project Name", fe.Snapshot.Project.Name)
+	ui.StatusRow("  Project Env", fe.Snapshot.Project.Environment)
+	ui.StatusRow("  Secrets Count", fmt.Sprintf("%d", fe.Snapshot.SecretsCount))
+	ui.StatusRow("  Secrets In Scope", strings.Join(fe.Snapshot.SecretsInScope, ", "))
+
+	if fe.Snapshot.AgentCapabilities != nil {
+		fmt.Println("  Agent Capabilities:")
+		ui.StatusRow("    Token Name", fe.Snapshot.AgentCapabilities.TokenName)
+		ui.StatusRow("    Allowed Projects", strings.Join(fe.Snapshot.AgentCapabilities.AllowedProjects, ", "))
+		ui.StatusRow("    Allowed Secrets", strings.Join(fe.Snapshot.AgentCapabilities.AllowedSecrets, ", "))
+		ui.StatusRow("    Scopes", strings.Join(fe.Snapshot.AgentCapabilities.Scopes, ", "))
+	}
+	if fe.Snapshot.SecretsPolicy != nil {
+		fmt.Println("  Secrets Policy:")
+		ui.StatusRow("    Key Name", fe.Snapshot.SecretsPolicy.KeyName)
+		ui.StatusRow("    Allowed Domains", strings.Join(fe.Snapshot.SecretsPolicy.AllowedDomains, ", "))
+		ui.StatusRow("    Allowed Methods", strings.Join(fe.Snapshot.SecretsPolicy.AllowedMethods, ", "))
+		ui.StatusRow("    Violation Action", fe.Snapshot.SecretsPolicy.ViolationAction)
+		ui.StatusRow("    Policy Version", fe.Snapshot.SecretsPolicy.PolicyVersion)
+	}
+	fmt.Println("  Keychain Auth:")
+	authK := "no"
+	if fe.Snapshot.KeychainAuth.Authenticated {
+		authK = "yes"
+	}
+	ui.StatusRow("    Authenticated", authK)
+	procH := "no"
+	if fe.Snapshot.KeychainAuth.ProcessHashVerified {
+		procH = "yes"
+	}
+	ui.StatusRow("    Process Hash Verified", procH)
+	sessB := "no"
+	if fe.Snapshot.KeychainAuth.SessionBound {
+		sessB = "yes"
+	}
+	ui.StatusRow("    Session Bound", sessB)
+
+	fmt.Println("  Proxy Snapshot:")
+	ui.StatusRow("    Version", fe.Snapshot.Proxy.Version)
+	ui.StatusRow("    Port", fmt.Sprintf("%d", fe.Snapshot.Proxy.Port))
+	transP := "no"
+	if fe.Snapshot.Proxy.Transient {
+		transP = "yes"
+	}
+	ui.StatusRow("    Transient", transP)
+	fmt.Println("─────────────────────────────────────────────────────────")
+}
+
+var logVerifyCmd = &cobra.Command{
+	Use:   "verify",
+	Short: "Verify the cryptographic integrity of the forensic log chain",
+	RunE: func(cmd *cobra.Command, args []string) error {
+		fmt.Println("Verifying cryptographic chain integrity...")
+		err := logService.VerifyChain()
+		if err != nil {
+			fmt.Printf("%s Chain integrity failure detected!\n", ui.ErrorStyle.Render("FAIL:"))
+			fmt.Printf("  Reason: %v\n", err)
+			return fmt.Errorf("cryptographic audit log verification failed")
+		}
+
+		fmt.Println(ui.SuccessStyle.Render("Chain integrity: OK"))
+		return nil
+	},
+}
+
+var logReplayCmd = &cobra.Command{
+	Use:   "replay <log_id>",
+	Short: "Replay the proxy enforcement decision state for a single log",
+	Args:  cobra.ExactArgs(1),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		id := args[0]
+		fe, err := logService.GetForensicLog(id)
+		if err != nil {
+			return errors.New(errors.ErrLogNotFound, fmt.Sprintf("forensic log entry %q not found locally", id), err)
+		}
+
+		fmt.Println("─────────────────────────────────────────────────────────")
+		fmt.Printf("REPLAY STATE FOR EVENT %s\n", fe.ID)
+		fmt.Println("─────────────────────────────────────────────────────────")
+		fmt.Printf("Timestamp:   %s\n", fe.CreatedAt.Format("2006-01-02 15:04:05.000 MST"))
+		fmt.Printf("Action:      %s %s\n", strings.ToUpper(fe.Event.Method), "https://"+fe.Event.Domain+fe.Event.Path)
+		fmt.Printf("Environment: %s\n", fe.Event.Environment)
+		fmt.Println()
+
+		fmt.Println(ui.BrandStyle.Render("[1/3] Evaluated Agent Capabilities"))
+		if fe.Snapshot.AgentCapabilities != nil {
+			fmt.Printf("  Agent Token:      %s\n", fe.Snapshot.AgentCapabilities.TokenName)
+			fmt.Printf("  Allowed Projects: %s\n", strings.Join(fe.Snapshot.AgentCapabilities.AllowedProjects, ", "))
+			fmt.Printf("  Allowed Secrets:  %s\n", strings.Join(fe.Snapshot.AgentCapabilities.AllowedSecrets, ", "))
+			fmt.Printf("  Active Scopes:    %s\n", strings.Join(fe.Snapshot.AgentCapabilities.Scopes, ", "))
+		} else {
+			fmt.Println("  Agent Token:      None (Anonymous mode)")
+		}
+
+		capsResult := "PASS"
+		capsReason := "Agent has unrestricted access"
+		for _, layer := range fe.Enforcement.LayersEvaluated {
+			if layer.Layer == "agent_capabilities" {
+				if layer.Result == "fail" {
+					capsResult = "FAIL"
+				}
+				capsReason = layer.Reason
+			}
+		}
+		if capsResult == "PASS" {
+			fmt.Printf("  Result:           %s (%s)\n", ui.SuccessStyle.Render("PASS"), capsReason)
+		} else {
+			fmt.Printf("  Result:           %s (%s)\n", ui.ErrorStyle.Render("FAIL"), capsReason)
+		}
+		fmt.Println()
+
+		fmt.Println(ui.BrandStyle.Render("[2/3] Evaluated Workspace Allowlist"))
+		fmt.Printf("  Target Domain:    %s\n", fe.Event.Domain)
+		fmt.Printf("  Allowlist count:  %d domains allowed\n", fe.Snapshot.Workspace.AllowlistCount)
+		if len(fe.Snapshot.Workspace.Allowlist) > 0 {
+			fmt.Printf("  Allowlist:        %s\n", strings.Join(fe.Snapshot.Workspace.Allowlist, ", "))
+		}
+		
+		allowResult := "PASS"
+		allowReason := fmt.Sprintf("Domain %s is permitted by allowlist", fe.Event.Domain)
+		for _, layer := range fe.Enforcement.LayersEvaluated {
+			if layer.Layer == "workspace_allowlist" {
+				if layer.Result == "fail" {
+					allowResult = "FAIL"
+				}
+				allowReason = layer.Reason
+			}
+		}
+		if allowResult == "PASS" {
+			fmt.Printf("  Result:           %s (%s)\n", ui.SuccessStyle.Render("PASS"), allowReason)
+		} else {
+			fmt.Printf("  Result:           %s (%s)\n", ui.ErrorStyle.Render("FAIL"), allowReason)
+		}
+		fmt.Println()
+
+		fmt.Println(ui.BrandStyle.Render("[3/3] Evaluated Secret Policies"))
+		fmt.Printf("  Injected Secret:  %s\n", fe.Event.KeyName)
+		if fe.Snapshot.SecretsPolicy != nil {
+			fmt.Printf("  Active Policy:    Yes (allowed domains: %s, methods: %s, action: %s)\n",
+				strings.Join(fe.Snapshot.SecretsPolicy.AllowedDomains, ", "),
+				strings.Join(fe.Snapshot.SecretsPolicy.AllowedMethods, ", "),
+				fe.Snapshot.SecretsPolicy.ViolationAction,
+			)
+		} else {
+			fmt.Println("  Active Policy:    None (No restrictions on this key)")
+		}
+
+		policyResult := "PASS"
+		policyReason := "No violations detected"
+		for _, layer := range fe.Enforcement.LayersEvaluated {
+			if layer.Layer == "secrets_policy" {
+				if layer.Result == "fail" {
+					policyResult = "FAIL"
+				}
+				policyReason = layer.Reason
+			}
+		}
+		if policyResult == "PASS" {
+			fmt.Printf("  Result:           %s (%s)\n", ui.SuccessStyle.Render("PASS"), policyReason)
+		} else {
+			fmt.Printf("  Result:           %s (%s)\n", ui.ErrorStyle.Render("FAIL"), policyReason)
+		}
+		fmt.Println()
+
+		fmt.Println("─────────────────────────────────────────────────────────")
+		fmt.Println(ui.BrandStyle.Render("FINAL ENFORCEMENT DECISION SUMMARY"))
+		fmt.Println("─────────────────────────────────────────────────────────")
+		decisionColor := ui.SuccessStyle.Render(strings.ToUpper(fe.Enforcement.Decision))
+		if fe.Enforcement.Decision == "blocked" || fe.Enforcement.Decision == "policy_denied" {
+			decisionColor = ui.ErrorStyle.Render(strings.ToUpper(fe.Enforcement.Decision))
+		} else if fe.Enforcement.Decision == "policy_escalated" {
+			decisionColor = ui.WarningStyle.Render(strings.ToUpper(fe.Enforcement.Decision))
+		}
+		ui.StatusRow("Final Decision", decisionColor)
+		ui.StatusRow("Decided By", fe.Enforcement.DecidedBy)
+		
+		injStr := "Not injected"
+		if fe.Resolution.CredentialInjected {
+			injStr = fmt.Sprintf("Injected successfully via %s", fe.Resolution.InjectionStyle)
+		}
+		ui.StatusRow("Credential State", injStr)
+
+		redactStr := "No redaction"
+		if fe.Resolution.RedactionTriggered {
+			redactStr = ui.WarningStyle.Render("Redaction triggered — secret returned in response was masked")
+		}
+		ui.StatusRow("Response Redact", redactStr)
+		fmt.Println("─────────────────────────────────────────────────────────")
+
+		return nil
+	},
+}
+
 func init() {
-	logCmd.AddCommand(logShowCmd)
-	logCmd.AddCommand(logSummaryCmd)
-	logCmd.AddCommand(logWatchCmd)
-	logCmd.AddCommand(logExportCmd)
+	logsCmd.AddCommand(logShowCmd)
+	logsCmd.AddCommand(logSummaryCmd)
+	logsCmd.AddCommand(logWatchCmd)
+	logsCmd.AddCommand(logExportCmd)
+	logsCmd.AddCommand(logVerifyCmd)
+	logsCmd.AddCommand(logReplayCmd)
 
 	addFilterFlags := func(c *cobra.Command) {
 		c.Flags().String("agent", "", "filter by agent name")
@@ -616,12 +948,12 @@ func init() {
 		c.Flags().Int("limit", 50, "number of entries to show (default 50)")
 	}
 
-	addFilterFlags(logCmd)
-	logCmd.Flags().Bool("verbose", false, "full record including allowlist snapshot")
-	logCmd.Flags().Bool("json", false, "output as newline-delimited JSON")
-	logCmd.Flags().Bool("csv", false, "output as CSV with headers")
-	logCmd.Flags().Bool("no-color", false, "disable color output")
-	logCmd.Flags().Bool("tail", false, "live stream new entries (same as log watch)")
+	addFilterFlags(logsCmd)
+	logsCmd.Flags().Bool("verbose", false, "full record including allowlist snapshot")
+	logsCmd.Flags().Bool("json", false, "output as newline-delimited JSON")
+	logsCmd.Flags().Bool("csv", false, "output as CSV with headers")
+	logsCmd.Flags().Bool("no-color", false, "disable color output")
+	logsCmd.Flags().Bool("tail", false, "live stream new entries (same as log watch)")
 
 	logSummaryCmd.Flags().String("since", "7d", "default: 7d")
 	logSummaryCmd.Flags().String("until", "", "")
@@ -653,7 +985,7 @@ func watchLogs(svc *log.Service) error {
 			Since: lastSeen,
 			Limit: 20,
 		}
-		logs, err := svc.QueryLocal(filter)
+		logs, err := queryLogs(filter)
 		if err == nil && len(logs) > 0 {
 			// Logs come in newest first
 			for i := len(logs) - 1; i >= 0; i-- {

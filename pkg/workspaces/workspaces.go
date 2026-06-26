@@ -403,6 +403,33 @@ func (s *Service) LogAllowlist(workspaceID string) ([]AllowlistLogEntry, error) 
 	return res.Data, nil
 }
 
+// Delete deletes a workspace by its ID.
+func (s *Service) Delete(workspaceID string) error {
+	resp, err := s.API.Call("workspaces.delete", "DELETE", nil, map[string]string{
+		"workspace_id": workspaceID,
+	}, nil)
+	if err != nil {
+		return fmt.Errorf("delete workspace: API call failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNoContent {
+		return s.API.DecodeError(resp)
+	}
+
+	// Remove it from the local global config if it's cached there
+	cfg, err := config.LoadGlobalConfig()
+	if err == nil && cfg != nil {
+		delete(cfg.Workspaces, workspaceID)
+		if cfg.SelectedWorkspaceID == workspaceID {
+			cfg.SelectedWorkspaceID = ""
+		}
+		_ = config.SaveGlobalConfig(cfg)
+	}
+
+	return nil
+}
+
 // b64Enc is a shorthand for base64 standard encoding.
 func b64Enc(b []byte) string {
 	return base64.StdEncoding.EncodeToString(b)

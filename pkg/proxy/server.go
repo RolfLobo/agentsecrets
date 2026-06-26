@@ -8,28 +8,53 @@ import (
 	"os"
 	"strings"
 	"time"
+
+	"github.com/The-17/agentsecrets/pkg/api"
+	"github.com/The-17/agentsecrets/pkg/capabilities"
+	"github.com/The-17/agentsecrets/pkg/keyring"
 )
 
 // Server is the HTTP proxy server that wraps the Engine.
 // It listens for incoming requests with X-AS-* headers, builds
 // CallRequests, executes them through the engine, and returns responses.
 type Server struct {
-	Port   int
-	Engine *Engine
-	mux    *http.ServeMux
+	Port         int
+	Engine       *Engine
+	TokenCache   *TokenCache
+	APIClient    *api.Client
+	SessionToken string
+	mux          *http.ServeMux
 }
 
 // NewServer creates a proxy server bound to the given port and engine.
 func NewServer(port int, engine *Engine) *Server {
 	s := &Server{
-		Port:   port,
-		Engine: engine,
-		mux:    http.NewServeMux(),
+		Port:       port,
+		Engine:     engine,
+		TokenCache: NewTokenCache(5 * time.Minute),
+		mux:        http.NewServeMux(),
 	}
-	s.mux.HandleFunc("/proxy", s.handleProxy)
+	s.mux.HandleFunc("/proxy", s.validateSession(s.handleProxy))
 	s.mux.HandleFunc("/health", s.handleHealth)
-	s.mux.HandleFunc("/sync", s.handleSync)
+	s.mux.HandleFunc("/sync", s.validateSession(s.handleSync))
+	s.mux.HandleFunc("/approve", s.validateSession(s.handleApprove))
+	s.mux.HandleFunc("/rotate-session", s.validateSession(s.handleRotateSession))
 	return s
+}
+
+func (s *Server) validateSession(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if s.SessionToken == "" {
+			next(w, r)
+			return
+		}
+		token := r.Header.Get("X-AS-Session-Token")
+		if token == "" || token != s.SessionToken {
+			writeError(w, http.StatusUnauthorized, "Invalid or missing session token")
+			return
+		}
+		next(w, r)
+	}
 }
 
 // Start begins listening and serving. This blocks until the server is stopped.
@@ -111,19 +136,61 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		agentToken = os.Getenv("AS_AGENT_TOKEN")
 	}
 
+	// Resolve agent token references like <AGENTNAME>_TOKEN from the OS keychain
+	if agentToken != "" && strings.HasSuffix(strings.ToUpper(agentToken), "_TOKEN") && len(agentToken) > 6 {
+		agentName := agentToken[:len(agentToken)-6]
+		retrievedToken, err := keyring.GetAgentToken(agentName)
+		if err != nil {
+			// Fallback to lowercase agent name
+			retrievedToken, err = keyring.GetAgentToken(strings.ToLower(agentName))
+		}
+		if err != nil {
+			writeError(w, 401, fmt.Sprintf("Agent token reference %q was not found in the OS Keychain: %v", agentToken, err))
+			return
+		}
+		agentToken = retrievedToken
+	}
+
 	identityLevel := "anonymous"
 	tokenID := ""
+	var callReqCaps *capabilities.AgentCapabilities
+
 	if agentToken != "" {
 		identityLevel = "issued"
-		tokenID = agentToken // or parsed token if identifiable
-		// If the token matches the environment token, that's what we use.
-		// For now, the backend will validate it; we just pass it along.
-		// If agentID is empty, backend will infer it from token.
+		tokenID = maskToken(agentToken)
+
+		// Validate token and extract capabilities
+		if s.TokenCache != nil && s.APIClient != nil {
+			cached, err := s.TokenCache.Validate(agentToken, s.APIClient)
+			if err != nil {
+				writeError(w, 401, fmt.Sprintf("Agent token validation failed: %v", err))
+				return
+			}
+			if agentID == "" {
+				agentID = cached.AgentName
+			}
+			if cached.TokenID != "" {
+				tokenID = cached.TokenID
+			}
+			callReqCaps = &cached.Capabilities
+
+			// Verify scope restrictions (Workspace and Project and Environment)
+			if cached.WorkspaceID != "" && cached.WorkspaceID != s.Engine.WorkspaceID {
+				writeError(w, 403, fmt.Sprintf("Agent '%s' is not authorized to access workspace '%s'.", agentID, s.Engine.WorkspaceID))
+				return
+			}
+			if cached.ProjectID != "" && cached.ProjectID != s.Engine.ProjectID {
+				writeError(w, 403, fmt.Sprintf("Agent '%s' is not authorized to access project '%s'.", agentID, s.Engine.ProjectID))
+				return
+			}
+			if cached.Environment != "" && !strings.EqualFold(cached.Environment, resolveEnvForAudit()) {
+				writeError(w, 403, fmt.Sprintf("Agent '%s' is not authorized to access the '%s' environment.", agentID, resolveEnvForAudit()))
+				return
+			}
+		}
 	} else if agentID != "" {
 		identityLevel = "declared"
 	}
-
-	// Parse injection headers
 	injections := parseInjections(r.Header)
 	if len(injections) == 0 {
 		writeError(w, 400, "At least one X-AS-Inject-* header is required")
@@ -160,6 +227,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		AgentID:       agentID,
 		IdentityLevel: identityLevel,
 		TokenID:       tokenID,
+		Capabilities:  callReqCaps,
 	})
 
 	if err != nil {
@@ -221,4 +289,93 @@ func writeError(w http.ResponseWriter, statusCode int, message string) {
 	json.NewEncoder(w).Encode(map[string]string{
 		"error": message,
 	})
+}
+
+// handleApprove grants a session-based approval for a secret+domain+method combination.
+func (s *Server) handleApprove(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, 405, "POST required")
+		return
+	}
+
+	var req struct {
+		SecretKey string `json:"secret_key"`
+		Method    string `json:"method"`
+		Domain    string `json:"domain"`
+		AgentID   string `json:"agent_id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, 400, "Invalid JSON body")
+		return
+	}
+
+	if req.SecretKey == "" || req.Method == "" || req.Domain == "" {
+		writeError(w, 400, "secret_key, method, and domain are required")
+		return
+	}
+
+	if s.Engine.Approvals == nil {
+		writeError(w, 500, "Approval store not initialized")
+		return
+	}
+
+	key := ApprovalKey{
+		AgentID:   req.AgentID,
+		SecretKey: strings.ToUpper(req.SecretKey),
+		Domain:    strings.ToLower(req.Domain),
+		Method:    strings.ToUpper(req.Method),
+	}
+	s.Engine.Approvals.Approve(key)
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(200)
+	json.NewEncoder(w).Encode(map[string]string{
+		"status":     "approved",
+		"secret_key": key.SecretKey,
+		"method":     key.Method,
+		"domain":     key.Domain,
+	})
+}
+
+// handleRotateSession handles rotating the server's session token.
+func (s *Server) handleRotateSession(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "POST required")
+		return
+	}
+
+	var req struct {
+		NewToken string `json:"new_token"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "Invalid JSON body")
+		return
+	}
+
+	if req.NewToken == "" {
+		writeError(w, http.StatusBadRequest, "new_token is required")
+		return
+	}
+
+	s.SessionToken = req.NewToken
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]string{
+		"status":  "ok",
+		"message": "session token rotated successfully",
+	})
+}
+
+func maskToken(token string) string {
+	if token == "" {
+		return ""
+	}
+	if strings.HasPrefix(token, "agt_") {
+		return token // DB IDs are safe to log in full
+	}
+	if len(token) <= 10 {
+		return "[REDACTED]"
+	}
+	return token[:6] + "..." + token[len(token)-4:]
 }

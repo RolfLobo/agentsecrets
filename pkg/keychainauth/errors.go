@@ -1,6 +1,11 @@
 package keychainauth
 
-import "fmt"
+import (
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+)
 
 // DaemonDeniedError is returned when keychain-auth denies a connection or request.
 type DaemonDeniedError struct {
@@ -43,22 +48,45 @@ func UserMessage(err error) string {
 	case *DaemonDeniedError:
 		return deniedMessage(e.Reason)
 	case *DaemonNotRunningError:
+		if e.Cause != nil && (os.IsPermission(e.Cause) || strings.Contains(e.Cause.Error(), "permission denied")) {
+			return "Permission denied connecting to keychain-auth socket.\n" +
+				"Your user is not authorized or your active shell group membership is not active.\n" +
+				"Please run:\n" +
+				"  newgrp agentgroup\n" +
+				"Or restart your terminal session."
+		}
 		return daemonNotRunningMessage(e.SocketPath)
 	default:
 		return err.Error()
 	}
 }
 
+func getSelfPath() string {
+	selfPath, err := os.Executable()
+	if err == nil {
+		if resolved, err := filepath.EvalSymlinks(selfPath); err == nil {
+			return resolved
+		}
+		return selfPath
+	}
+	return "agentsecrets"
+}
+
 func deniedMessage(reason reasonCode) string {
+	selfPath := getSelfPath()
 	switch reason {
 	case reasonUnregisteredBinary:
-		return "This AgentSecrets binary is not yet registered with keychain-auth.\n" +
-			"This usually resolves automatically. If it persists, run:\n" +
-			"  agentsecrets init"
+		return fmt.Sprintf("This AgentSecrets binary is not yet registered/authorized with keychain-auth.\n"+
+			"Please authorize it by running:\n"+
+			"  sudo keychain-auth authorize %s agentsecrets\n"+
+			"And then restart the daemon:\n"+
+			"  sudo systemctl restart keychain-auth", selfPath)
 	case reasonHashMismatch:
-		return "Security check failed: the AgentSecrets binary has changed since it was registered.\n" +
-			"This usually resolves automatically after an upgrade. If it persists, run:\n" +
-			"  agentsecrets init"
+		return fmt.Sprintf("Security check failed: the AgentSecrets binary has changed since it was registered.\n"+
+			"Please re-authorize it by running:\n"+
+			"  sudo keychain-auth authorize %s agentsecrets\n"+
+			"And then restart the daemon:\n"+
+			"  sudo systemctl restart keychain-auth", selfPath)
 	case reasonActionNotInPolicy:
 		return "keychain-auth policy does not allow this operation for AgentSecrets.\n" +
 			"Check your keychain-auth configuration."
@@ -79,16 +107,18 @@ func deniedMessage(reason reasonCode) string {
 }
 
 func daemonNotRunningMessage(socketPath string) string {
+	selfPath := getSelfPath()
 	return fmt.Sprintf(`keychain-auth daemon is not running.
 
 AgentSecrets requires keychain-auth to read secrets securely.
-This is a one-time setup that protects your credentials from unauthorized access.
 
-Run this to set it up:
-  agentsecrets init
+To install and start the keychain-auth daemon, please run:
+  sudo keychain-auth install
+  sudo systemctl start keychain-auth
 
-Or start it manually:
-  keychain-auth start
+And then authorize this binary:
+  sudo keychain-auth authorize %s agentsecrets
+  sudo systemctl restart keychain-auth
 
-Socket expected at: %s`, socketPath)
+Socket expected at: %s`, selfPath, socketPath)
 }

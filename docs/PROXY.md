@@ -273,6 +273,7 @@ agentsecrets env -- npm run dev
 ## Security
 
 - **Zero-Trust Workspace Allowlist**: The proxy enforces a deny-by-default domain allowlist synced from your workspace. Unauthorized domains are blocked with 403 Forbidden. Add domains via `agentsecrets workspace allowlist add <domain> [domain...]`. Allowlist modifications require admin role and password.
+- **Optimized Check Pipeline**: The proxy executes validation in a strict, performance-optimized "shortest path to block" order. It performs purely offline checks (secret presence, HTTPS validation) first, followed by calling agent identity/scope checks (verifying that the agent's token matches the authorized workspace, project, and environment), then workspace allowlist checks, and secret-level policies before decrypting any credentials from the secure OS store.
 - **Response Body Redaction**: If an API echoes back the injected credential, the proxy replaces it with `[REDACTED_BY_AGENTSECRETS]` before the response reaches the agent. Logged as `credential_echo`.
 - Secret values are **resolved at execution time** from the OS keychain — they exist in memory only during the request
 - The AI agent **never receives** secret values in any response

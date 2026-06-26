@@ -9,6 +9,7 @@ import (
 
 	"github.com/The-17/agentsecrets/pkg/api"
 	"github.com/The-17/agentsecrets/pkg/config"
+	"github.com/The-17/agentsecrets/pkg/keychainauth"
 )
 
 func TestSignupFlow(t *testing.T) {
@@ -17,6 +18,10 @@ func TestSignupFlow(t *testing.T) {
 	oldHome := config.HomeDirHook
 	config.HomeDirHook = func() (string, error) { return tmpDir, nil }
 	defer func() { config.HomeDirHook = oldHome }()
+
+	// Set up the in-memory test stub for keychain-auth
+	keychainauth.SetupTestStub()
+	defer keychainauth.TeardownTestStub()
 
 	// Initialize config directory
 	if err := config.InitGlobalConfig(); err != nil {
@@ -80,6 +85,10 @@ func TestLoginFlow(t *testing.T) {
 	config.HomeDirHook = func() (string, error) { return tmpDir, nil }
 	defer func() { config.HomeDirHook = oldHome }()
 
+	// Set up the in-memory test stub for keychain-auth
+	keychainauth.SetupTestStub()
+	defer keychainauth.TeardownTestStub()
+
 	if err := config.InitGlobalConfig(); err != nil {
 		t.Fatalf("InitGlobalConfig failed: %v", err)
 	}
@@ -120,6 +129,10 @@ func TestLoginFailure(t *testing.T) {
 	oldHome := config.HomeDirHook
 	config.HomeDirHook = func() (string, error) { return tmpDir, nil }
 	defer func() { config.HomeDirHook = oldHome }()
+
+	// Set up the in-memory test stub for keychain-auth
+	keychainauth.SetupTestStub()
+	defer keychainauth.TeardownTestStub()
 
 	if err := config.InitGlobalConfig(); err != nil {
 		t.Fatalf("InitGlobalConfig failed: %v", err)

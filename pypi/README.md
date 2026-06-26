@@ -459,10 +459,10 @@ agentsecrets mcp install                      # Auto-configure AI tools
 
 ### Logging & Audit
 ```bash
-agentsecrets log list [--tail]               # View or stream global backend logs
-agentsecrets log export --format csv         # Export global logs to CSV/JSON
-agentsecrets log summary                     # View global statistics and usage metrics
-agentsecrets log detail <id>                 # Inspect a specific request deeply
+agentsecrets logs list [--tail]               # View or stream global backend logs
+agentsecrets logs export --format csv         # Export global logs to CSV/JSON
+agentsecrets logs summary                     # View global statistics and usage metrics
+agentsecrets logs detail <id>                 # Inspect a specific request deeply
 ```
 
 ### Agent Identity

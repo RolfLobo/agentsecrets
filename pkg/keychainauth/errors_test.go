@@ -56,7 +56,7 @@ func TestUserMessage_DaemonNotRunning(t *testing.T) {
 	if !strings.Contains(got, "/tmp/sock") {
 		t.Errorf("Expected message to contain socket path, got: %s", got)
 	}
-	if !strings.Contains(got, "keychain-auth start") {
+	if !strings.Contains(got, "systemctl start keychain-auth") {
 		t.Errorf("Expected message to contain start instructions, got: %s", got)
 	}
 }

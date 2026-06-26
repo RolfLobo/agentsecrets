@@ -2,15 +2,27 @@ package commands
 
 import (
 	"fmt"
+	"strings"
 
+	"github.com/charmbracelet/huh"
 	"github.com/spf13/cobra"
+	"github.com/The-17/agentsecrets/pkg/capabilities"
 
 	"github.com/The-17/agentsecrets/pkg/agents"
 	"github.com/The-17/agentsecrets/pkg/config"
+	"github.com/The-17/agentsecrets/pkg/errors"
+	"github.com/The-17/agentsecrets/pkg/keyring"
+	"github.com/The-17/agentsecrets/pkg/projects"
+	"github.com/The-17/agentsecrets/pkg/proxy"
+	"github.com/The-17/agentsecrets/pkg/secrets"
 	"github.com/The-17/agentsecrets/pkg/ui"
 )
 
-var agentService *agents.Service
+var (
+	agentService     *agents.Service
+	agentPolicyAllow []string
+	agentPolicyDeny  []string
+)
 
 var agentCmd = &cobra.Command{
 	Use:   "agent",
@@ -33,8 +45,11 @@ var agentRegisterCmd = &cobra.Command{
 	Short: "Register a new agent and issue its first token",
 	Args:  cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
+		if err := verifyPasswordLocally(); err != nil {
+			return err
+		}
 		name := args[0]
-		projectID, _ := cmd.Flags().GetString("project")
+		projectFlag, _ := cmd.Flags().GetString("project")
 		label, _ := cmd.Flags().GetString("label")
 		expires, _ := cmd.Flags().GetString("expires")
 		environment, _ := cmd.Flags().GetString("env")
@@ -46,6 +61,11 @@ var agentRegisterCmd = &cobra.Command{
 		workspaceID := config.GetSelectedWorkspaceID()
 		if workspaceID == "" {
 			return fmt.Errorf("no workspace selected — run 'agentsecrets workspace switch' first")
+		}
+
+		projectID, err := resolveProjectID(workspaceID, projectFlag)
+		if err != nil {
+			return err
 		}
 
 		resp, err := agentService.Register(agents.RegisterRequest{
@@ -60,9 +80,23 @@ var agentRegisterCmd = &cobra.Command{
 			return fmt.Errorf("agent registration failed: %w", err)
 		}
 
+		cfg, _ := config.LoadGlobalConfig()
+		_ = proxy.LogManagementEvent("CREATE", "agent", fmt.Sprintf("Registered agent %s", resp.Agent.Name), cfg.Email, workspaceID, projectID, environment)
+
 		scope := "workspace"
 		if projectID != "" {
-			scope = projectID
+			projService := projects.NewService(apiClient)
+			projectsList, err := projService.List()
+			if err == nil {
+				for _, p := range projectsList {
+					if p.ID == projectID {
+						scope = p.Name
+						break
+					}
+				}
+			} else {
+				scope = projectID
+			}
 		}
 
 		fmt.Println("\n" + ui.SuccessStyle.Render("Agent registered"))
@@ -74,7 +108,29 @@ var agentRegisterCmd = &cobra.Command{
 		}
 
 		fmt.Println("\n" + ui.WarningStyle.Render("Store this token securely. It will not be shown again."))
-		fmt.Printf("To use it: export AS_AGENT_TOKEN=%s\n\n", resp.Token)
+		fmt.Printf("To use it: export AS_AGENT_TOKEN=%s\n", resp.Token)
+
+		var storeInKeychain bool
+		var confirmErr error
+		if cmd.Flags().Changed("save-token") {
+			storeInKeychain, _ = cmd.Flags().GetBool("save-token")
+		} else {
+			confirmErr = huh.NewConfirm().
+				Title("Would you like to store this agent token in your local OS Keychain?").
+				Description(fmt.Sprintf("This allows referencing it in your code via %s_TOKEN", strings.ToUpper(resp.Agent.Name))).
+				Value(&storeInKeychain).
+				Run()
+		}
+
+		if confirmErr == nil && storeInKeychain {
+			if err := keyring.SetAgentToken(resp.Agent.Name, resp.Token); err != nil {
+				ui.Error(fmt.Sprintf("Failed to store agent token in keychain: %v", err))
+			} else {
+				fmt.Println()
+				ui.Success(fmt.Sprintf("Stored agent token in keychain! You can now reference it via: %s_TOKEN", strings.ToUpper(resp.Agent.Name)))
+			}
+		}
+		fmt.Println()
 		return nil
 	},
 }
@@ -83,16 +139,53 @@ var agentListCmd = &cobra.Command{
 	Use:   "list",
 	Short: "List registered agents",
 	RunE: func(cmd *cobra.Command, args []string) error {
-		projectID, _ := cmd.Flags().GetString("project")
+		projectFlag, _ := cmd.Flags().GetString("project")
 
 		workspaceID := config.GetSelectedWorkspaceID()
 		if workspaceID == "" {
 			return fmt.Errorf("no workspace selected — run 'agentsecrets workspace switch' first")
 		}
 
-		list, err := agentService.List(workspaceID, projectID)
-		if err != nil {
-			return fmt.Errorf("failed to list agents: %w", err)
+		// Load projects to resolve IDs to Names in display
+		projectNames := make(map[string]string)
+		projService := projects.NewService(apiClient)
+		projectsList, err := projService.List()
+		if err == nil {
+			for _, p := range projectsList {
+				projectNames[p.ID] = p.Name
+			}
+		}
+
+		var list []agents.Agent
+		if projectFlag != "" {
+			var projectID string
+			projectID, err = resolveProjectID(workspaceID, projectFlag)
+			if err != nil {
+				return err
+			}
+			list, err = agentService.List(workspaceID, projectID)
+			if err != nil {
+				return fmt.Errorf("failed to list agents: %w", err)
+			}
+		} else {
+			// Fetch all agents (workspace and project-scoped) in a single fast call
+			list, err = agentService.ListAll(workspaceID)
+			if err != nil {
+				// Fallback to sequential listing if backend does not support include_projects
+				list, err = agentService.List(workspaceID, "")
+				if err != nil {
+					return fmt.Errorf("failed to list agents: %w", err)
+				}
+
+				for _, p := range projectsList {
+					if p.WorkspaceID == workspaceID {
+						projAgents, err := agentService.List(workspaceID, p.ID)
+						if err == nil {
+							list = append(list, projAgents...)
+						}
+					}
+				}
+			}
 		}
 
 		if len(list) == 0 {
@@ -105,7 +198,11 @@ var agentListCmd = &cobra.Command{
 		for _, a := range list {
 			scope := "workspace"
 			if a.ProjectID != nil {
-				scope = *a.ProjectID
+				if name, ok := projectNames[*a.ProjectID]; ok {
+					scope = name
+				} else {
+					scope = *a.ProjectID
+				}
 			}
 			lastUsed := "never"
 			if a.LastUsed != nil {
@@ -142,8 +239,12 @@ var agentTokenIssueCmd = &cobra.Command{
 			return fmt.Errorf("no workspace selected — run 'agentsecrets workspace switch' first")
 		}
 
-		agent, err := agentService.GetByName(workspaceID, name)
+		agent, err := getAgentByName(workspaceID, name)
 		if err != nil {
+			return err
+		}
+
+		if err := verifyPasswordLocally(); err != nil {
 			return err
 		}
 
@@ -156,6 +257,9 @@ var agentTokenIssueCmd = &cobra.Command{
 			return fmt.Errorf("token issuance failed: %w", err)
 		}
 
+		cfg, _ := config.LoadGlobalConfig()
+		_ = proxy.LogManagementEvent("ISSUE", "token", fmt.Sprintf("Issued token for agent %s", name), cfg.Email, workspaceID, "", environment)
+
 		fmt.Println("\n" + ui.SuccessStyle.Render("Token issued"))
 		fmt.Printf("  Agent    %s\n", name)
 		fmt.Printf("  Token    %s\n", resp.Token)
@@ -166,6 +270,28 @@ var agentTokenIssueCmd = &cobra.Command{
 			fmt.Printf("  Expires  %s\n", resp.ExpiresAt.Format("2006-01-02"))
 		}
 		fmt.Println("\n" + ui.WarningStyle.Render("Store this token securely. It will not be shown again."))
+
+		var storeInKeychain bool
+		var confirmErr error
+		if cmd.Flags().Changed("save-token") {
+			storeInKeychain, _ = cmd.Flags().GetBool("save-token")
+		} else {
+			confirmErr = huh.NewConfirm().
+				Title("Would you like to store this agent token in your local OS Keychain?").
+				Description(fmt.Sprintf("This allows referencing it in your code via %s_TOKEN", strings.ToUpper(name))).
+				Value(&storeInKeychain).
+				Run()
+		}
+
+		if confirmErr == nil && storeInKeychain {
+			if err := keyring.SetAgentToken(name, resp.Token); err != nil {
+				ui.Error(fmt.Sprintf("Failed to store agent token in keychain: %v", err))
+			} else {
+				fmt.Println()
+				ui.Success(fmt.Sprintf("Stored agent token in keychain! You can now reference it via: %s_TOKEN", strings.ToUpper(name)))
+			}
+		}
+		fmt.Println()
 		return nil
 	},
 }
@@ -182,7 +308,7 @@ var agentTokenListCmd = &cobra.Command{
 			return fmt.Errorf("no workspace selected — run 'agentsecrets workspace switch' first")
 		}
 
-		agent, err := agentService.GetByName(workspaceID, name)
+		agent, err := getAgentByName(workspaceID, name)
 		if err != nil {
 			return err
 		}
@@ -248,7 +374,7 @@ var agentTokenRevokeCmd = &cobra.Command{
 				}
 			}
 
-			agent, err := agentService.GetByName(workspaceID, agentName)
+			agent, err := getAgentByName(workspaceID, agentName)
 			if err != nil {
 				return err
 			}
@@ -278,7 +404,7 @@ var agentTokenRevokeCmd = &cobra.Command{
 			}
 		}
 
-		agent, err := agentService.GetByName(workspaceID, agentName)
+		agent, err := getAgentByName(workspaceID, agentName)
 		if err != nil {
 			return err
 		}
@@ -306,6 +432,11 @@ var agentDeleteCmd = &cobra.Command{
 			return fmt.Errorf("no workspace selected — run 'agentsecrets workspace switch' first")
 		}
 
+		agent, err := getAgentByName(workspaceID, name)
+		if err != nil {
+			return err
+		}
+
 		if !confirm {
 			fmt.Printf("Delete agent %q and revoke all active tokens? [y/N] ", name)
 			var response string
@@ -316,8 +447,7 @@ var agentDeleteCmd = &cobra.Command{
 			}
 		}
 
-		agent, err := agentService.GetByName(workspaceID, name)
-		if err != nil {
+		if err := verifyPasswordLocally(); err != nil {
 			return err
 		}
 
@@ -325,6 +455,14 @@ var agentDeleteCmd = &cobra.Command{
 		if err != nil {
 			return fmt.Errorf("failed to delete agent: %w", err)
 		}
+
+		cfg, _ := config.LoadGlobalConfig()
+		var projectID string
+		if agent.ProjectID != nil {
+			projectID = *agent.ProjectID
+		}
+		_ = proxy.LogManagementEvent("DELETE", "agent", fmt.Sprintf("Deleted agent %s", name), cfg.Email, workspaceID, projectID, config.ResolveEnvironment())
+
 		fmt.Println("\nAgent deleted.")
 		return nil
 	},
@@ -332,6 +470,13 @@ var agentDeleteCmd = &cobra.Command{
 
 func init() {
 	// Root subcommands
+	agentCmd.AddCommand(agentPolicyCmd)
+	agentPolicyCmd.AddCommand(agentPolicyGetCmd)
+	agentPolicyCmd.AddCommand(agentPolicySetCmd)
+
+	agentPolicySetCmd.Flags().StringSliceVar(&agentPolicyAllow, "allow", nil, "comma-separated or repeatable list of allowed secret keys")
+	agentPolicySetCmd.Flags().StringSliceVar(&agentPolicyDeny, "deny", nil, "comma-separated or repeatable list of denied secret keys")
+
 	agentCmd.AddCommand(agentRegisterCmd)
 	agentCmd.AddCommand(agentListCmd)
 	agentCmd.AddCommand(agentTokenCmd)
@@ -348,6 +493,7 @@ func init() {
 	agentRegisterCmd.Flags().StringP("expires", "e", "", "token expiry (e.g. 30d, 90d)")
 	agentRegisterCmd.Flags().String("env", "", "environment for the token (development, staging, production)")
 	agentRegisterCmd.Flags().Bool("output-json", false, "output as JSON instead of formatted text") // Add this if needed later
+	agentRegisterCmd.Flags().Bool("save-token", false, "save the issued token to the OS Keychain without prompting")
 
 	// Flags for list
 	agentListCmd.Flags().StringP("project", "p", "", "filter to a specific project")
@@ -358,6 +504,7 @@ func init() {
 	agentTokenIssueCmd.Flags().StringP("expires", "e", "", "token expiry (e.g. 30d, 90d)")
 	agentTokenIssueCmd.Flags().String("env", "", "environment for the token (development, staging, production)")
 	agentTokenIssueCmd.Flags().Bool("output-json", false, "output as JSON")
+	agentTokenIssueCmd.Flags().Bool("save-token", false, "save the issued token to the OS Keychain without prompting")
 
 	// Flags for token list
 	agentTokenListCmd.Flags().Bool("output-json", false, "output as JSON")
@@ -369,4 +516,193 @@ func init() {
 
 	// Flags for delete
 	agentDeleteCmd.Flags().Bool("confirm", false, "skip confirmation prompt")
+}
+
+var agentPolicyCmd = &cobra.Command{
+	Use:   "policy",
+	Short: "Manage agent capabilities/policy",
+}
+
+var agentPolicyGetCmd = &cobra.Command{
+	Use:   "get <name>",
+	Short: "Get policy/capabilities for an agent",
+	Args:  cobra.ExactArgs(1),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		name := args[0]
+		workspaceID := config.GetSelectedWorkspaceID()
+		if workspaceID == "" {
+			return fmt.Errorf("no workspace selected — run 'agentsecrets workspace switch' first")
+		}
+
+		agent, err := getAgentByName(workspaceID, name)
+		if err != nil {
+			return err
+		}
+
+		caps, err := agentService.GetCapabilities(workspaceID, agent.ID)
+		if err != nil {
+			return fmt.Errorf("failed to get agent policy: %w", err)
+		}
+
+		fmt.Printf("\nAgent Policy for %s:\n", name)
+		if len(caps.AllowedSecrets) > 0 {
+			fmt.Printf("  Allowed Secrets: %s\n", strings.Join(caps.AllowedSecrets, ", "))
+		} else {
+			fmt.Println("  Allowed Secrets: (none)")
+		}
+		if len(caps.DeniedSecrets) > 0 {
+			fmt.Printf("  Denied Secrets:  %s\n", strings.Join(caps.DeniedSecrets, ", "))
+		} else {
+			fmt.Println("  Denied Secrets:  (none)")
+		}
+		return nil
+	},
+}
+
+var agentPolicySetCmd = &cobra.Command{
+	Use:   "set <name>",
+	Short: "Set policy/capabilities for an agent",
+	Args:  cobra.ExactArgs(1),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		name := args[0]
+
+		workspaceID := config.GetSelectedWorkspaceID()
+		if workspaceID == "" {
+			return fmt.Errorf("no workspace selected — run 'agentsecrets workspace switch' first")
+		}
+
+		agent, err := getAgentByName(workspaceID, name)
+		if err != nil {
+			return err
+		}
+
+		var projectID string
+		if agent.ProjectID != nil {
+			projectID = *agent.ProjectID
+		}
+		if projectID == "" {
+			if proj, err := config.LoadProjectConfig(); err == nil && proj != nil {
+				projectID = proj.ProjectID
+			}
+		}
+
+		var allowed []string
+		for _, s := range agentPolicyAllow {
+			s = strings.TrimSpace(s)
+			if s != "" {
+				allowed = append(allowed, s)
+			}
+		}
+
+		var denied []string
+		for _, s := range agentPolicyDeny {
+			s = strings.TrimSpace(s)
+			if s != "" {
+				denied = append(denied, s)
+			}
+		}
+
+		var allKeys []string
+		allKeys = append(allKeys, allowed...)
+		allKeys = append(allKeys, denied...)
+
+		if len(allKeys) > 0 {
+			if projectID == "" {
+				return fmt.Errorf("no project configured in current directory and agent is not associated with any project. Secret policies require a project context.")
+			}
+			if err := validateSecretsExist(projectID, allKeys); err != nil {
+				return err
+			}
+		}
+
+		if err := verifyPasswordLocally(); err != nil {
+			return err
+		}
+
+		caps := capabilities.AgentCapabilities{
+			AllowedSecrets: allowed,
+			DeniedSecrets:  denied,
+		}
+
+		_, err = agentService.SetCapabilities(workspaceID, agent.ID, caps)
+		if err != nil {
+			return fmt.Errorf("failed to set agent policy: %w", err)
+		}
+
+		cfg, _ := config.LoadGlobalConfig()
+		if agent.ProjectID != nil {
+			projectID = *agent.ProjectID
+		}
+		_ = proxy.LogManagementEvent("UPDATE", "policy", fmt.Sprintf("Updated policy for agent %s", name), cfg.Email, workspaceID, projectID, config.ResolveEnvironment())
+
+		fmt.Println("\n" + ui.SuccessStyle.Render("Agent policy updated successfully"))
+		return nil
+	},
+}
+
+func validateSecretsExist(projectID string, keys []string) error {
+	if len(keys) == 0 {
+		return nil
+	}
+
+	knownKeys := make(map[string]bool)
+
+	// 1. Check local keyring
+	envs := []string{"development", "staging", "production"}
+	for _, env := range envs {
+		if localKeys, err := keyring.ListProjectKeyNames(projectID, env); err == nil {
+			for _, k := range localKeys {
+				knownKeys[strings.ToUpper(k)] = true
+			}
+		}
+	}
+
+	// 2. Check server-side keys
+	secService := secrets.NewService(apiClient)
+	for _, env := range envs {
+		if remoteKeys, err := secService.ListForEnv(env); err == nil {
+			for _, k := range remoteKeys {
+				knownKeys[strings.ToUpper(k.Key)] = true
+			}
+		}
+	}
+
+	for _, k := range keys {
+		if !knownKeys[strings.ToUpper(k)] {
+			return errors.New(errors.ErrSecretNotFound, fmt.Sprintf("secret %q does not exist in project", k), fmt.Errorf("Please create the secret first with: agentsecrets secrets set %s=value", k))
+		}
+	}
+
+	return nil
+}
+
+func resolveProjectID(workspaceID, projectNameOrID string) (string, error) {
+	if projectNameOrID == "" {
+		return "", nil
+	}
+
+	projService := projects.NewService(apiClient)
+	projList, err := projService.List()
+	if err != nil {
+		return "", err
+	}
+
+	for _, p := range projList {
+		if p.ID == projectNameOrID || strings.EqualFold(p.Name, projectNameOrID) {
+			return p.ID, nil
+		}
+	}
+
+	return "", fmt.Errorf("project %q not found in workspace", projectNameOrID)
+}
+
+func getAgentByName(workspaceID, name string) (*agents.Agent, error) {
+	agent, err := agentService.GetByName(workspaceID, name)
+	if err != nil {
+		if strings.Contains(err.Error(), "not found") {
+			return nil, errors.New(errors.ErrAgentNotFound, fmt.Sprintf("agent %q not found in this workspace", name), err)
+		}
+		return nil, err
+	}
+	return agent, nil
 }

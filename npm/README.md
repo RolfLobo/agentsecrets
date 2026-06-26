@@ -58,7 +58,7 @@ pip install agentsecrets-cli
 
 **Go:**
 ```bash
-go install github.com/The-17/agentsecrets/cmd/agentsecrets@latest
+go install github.com/The-17/agentsecrets/cmd/agentsecrets@v3.0.0
 ```
 
 ---

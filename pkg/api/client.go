@@ -11,9 +11,12 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/The-17/agentsecrets/pkg/errors"
 )
 
 // DefaultBaseURL is the SecretsCLI API endpoint
@@ -28,11 +31,13 @@ var endpointMap = map[string]map[string]string{
 		"refresh": "auth/refresh/",
 	},
 	"secrets": {
-		"list":   "secrets/{project_id}/",
-		"create": "secrets/",
-		"get":    "secrets/{project_id}/{environment}/{key}/",
-		"update": "secrets/{project_id}/{environment}/{key}/",
-		"delete": "secrets/{project_id}/{environment}/{key}/",
+		"list":            "secrets/{project_id}/",
+		"create":          "secrets/",
+		"get":             "secrets/{project_id}/{environment}/{key}/",
+		"update":          "secrets/{project_id}/{environment}/{key}/",
+		"delete":          "secrets/{project_id}/{environment}/{key}/",
+		"get_policy": "secrets/{project_id}/{environment}/{key}/policy/",
+		"set_policy": "secrets/{project_id}/{environment}/{key}/policy/",
 	},
 	"projects": {
 		"list":   "projects/",
@@ -66,6 +71,9 @@ var endpointMap = map[string]map[string]string{
 		"token_issue":      "workspaces/{workspace_id}/agents/{registration_id}/tokens/",
 		"token_list":       "workspaces/{workspace_id}/agents/{registration_id}/tokens/",
 		"token_revoke":     "workspaces/{workspace_id}/agents/{registration_id}/tokens/{token_id}/",
+		"get_capabilities": "workspaces/{workspace_id}/agents/{registration_id}/capabilities/",
+		"set_capabilities": "workspaces/{workspace_id}/agents/{registration_id}/capabilities/",
+		"token_validate":   "internal/agents/verify/",
 	},
 	"log": {
 		"list":    "audit/logs/",
@@ -105,8 +113,12 @@ type Client struct {
 
 // NewClient creates a new API client with the default base URL.
 func NewClient(tokenFunc func() string) *Client {
+	baseURL := DefaultBaseURL
+	if envURL := os.Getenv("AGENTSECRETS_API_URL"); envURL != "" {
+		baseURL = envURL
+	}
 	return &Client{
-		BaseURL:    DefaultBaseURL,
+		BaseURL:    baseURL,
 		HTTPClient: &http.Client{Timeout: 30 * time.Second},
 		getToken:   tokenFunc,
 	}
@@ -273,8 +285,21 @@ func (c *Client) DecodeError(resp *http.Response) error {
 		}
 	}
 
-	if resp.StatusCode == 401 {
-		return fmt.Errorf("%w. Your session may have expired. Please run 'agentsecrets login' to authenticate again.", baseErr)
+	switch resp.StatusCode {
+	case 401:
+		isLoginOrSignup := false
+		if resp.Request != nil && resp.Request.URL != nil {
+			path := resp.Request.URL.Path
+			isLoginOrSignup = strings.Contains(path, "/auth/login/") || strings.Contains(path, "/auth/register/")
+		}
+		if isLoginOrSignup {
+			return errors.New(errors.ErrInvalidCredentials, baseErr.Error(), baseErr)
+		}
+		return errors.New(errors.ErrUnauthorized, fmt.Sprintf("%v. Your session may have expired. Please run 'agentsecrets login' to authenticate again.", baseErr), baseErr)
+	case 403:
+		return errors.New(errors.ErrForbidden, fmt.Sprintf("%v. Permission denied.", baseErr), baseErr)
+	case 500:
+		return errors.New(errors.ErrServerInternal, fmt.Sprintf("%v. Internal server error.", baseErr), baseErr)
 	}
 
 	return baseErr

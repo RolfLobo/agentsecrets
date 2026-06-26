@@ -85,3 +85,49 @@ func TestWorkspaceMembers(t *testing.T) {
 		t.Errorf("Unexpected members list: %v", members)
 	}
 }
+
+func TestWorkspaceDelete(t *testing.T) {
+	// Setup
+	tmpDir := t.TempDir()
+	oldHome := config.HomeDirHook
+	config.HomeDirHook = func() (string, error) { return tmpDir, nil }
+	defer func() { config.HomeDirHook = oldHome }()
+
+	if err := config.InitGlobalConfig(); err != nil {
+		t.Fatalf("InitGlobalConfig failed: %v", err)
+	}
+
+	cfg, _ := config.LoadGlobalConfig()
+	cfg.Workspaces = map[string]config.WorkspaceCacheEntry{
+		"ws-123": {Name: "Test Workspace", Type: "shared"},
+	}
+	cfg.SelectedWorkspaceID = "ws-123"
+	_ = config.SaveGlobalConfig(cfg)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == "DELETE" && r.URL.Path == "/workspaces/ws-123/" {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer server.Close()
+
+	client := api.NewClient(func() string { return "token" })
+	client.BaseURL = server.URL
+	svc := NewService(client)
+
+	err := svc.Delete("ws-123")
+	if err != nil {
+		t.Fatalf("Delete failed: %v", err)
+	}
+
+	cfg, _ = config.LoadGlobalConfig()
+	if _, exists := cfg.Workspaces["ws-123"]; exists {
+		t.Error("Workspace ws-123 was not removed from local config")
+	}
+	if cfg.SelectedWorkspaceID == "ws-123" {
+		t.Error("SelectedWorkspaceID was not cleared")
+	}
+}
+

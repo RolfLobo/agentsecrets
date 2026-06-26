@@ -1,7 +1,11 @@
 package commands
 
 import (
+	"encoding/base64"
+	"encoding/hex"
 	"fmt"
+	"io"
+	"net/url"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -37,6 +41,11 @@ func NewEnvCmd() *cobra.Command {
 
 func runEnv(cmd *cobra.Command, args []string) error {
 	telemetry.RecordIntegration("env")
+
+	// Intercept help flags since DisableFlagParsing is active
+	if len(args) > 0 && (args[0] == "--help" || args[0] == "-h") {
+		return cmd.Help()
+	}
 
 	// Strip leading -- if present
 	if len(args) > 0 && args[0] == "--" {
@@ -91,12 +100,17 @@ func runEnv(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("command not found: %s", args[0])
 	}
 
+	// Generate secret variants for masking
+	maskingSecrets := generateVariants(secrets)
+
 	// Build child process
 	childCmd := exec.Command(commandPath, args[1:]...)
 	childCmd.Env = env
 	childCmd.Stdin = os.Stdin
-	childCmd.Stdout = os.Stdout
-	childCmd.Stderr = os.Stderr
+	stdoutMasker := &MaskingWriter{underlying: os.Stdout, secrets: maskingSecrets}
+	stderrMasker := &MaskingWriter{underlying: os.Stderr, secrets: maskingSecrets}
+	childCmd.Stdout = stdoutMasker
+	childCmd.Stderr = stderrMasker
 
 	// Forward signals to child
 	sigChan := make(chan os.Signal, 1)
@@ -126,11 +140,15 @@ func runEnv(cmd *cobra.Command, args []string) error {
 	}
 
 	// Run and exit with child's exit code
-	if err := childCmd.Run(); err != nil {
-		if exitErr, ok := err.(*exec.ExitError); ok {
+	runErr := childCmd.Run()
+	_ = stdoutMasker.Flush()
+	_ = stderrMasker.Flush()
+
+	if runErr != nil {
+		if exitErr, ok := runErr.(*exec.ExitError); ok {
 			os.Exit(exitErr.ExitCode())
 		}
-		return err
+		return runErr
 	}
 
 	return nil
@@ -182,6 +200,126 @@ func ensureKeychainAuthForEnv() error {
 
 	if err := keychainauth.Init(); err != nil {
 		return fmt.Errorf("%s", keychainauth.UserMessage(err))
+	}
+	return nil
+}
+
+// generateVariants returns all potential encoding/case variants of a secret value.
+func generateVariants(secrets map[string]string) []string {
+	var variants []string
+	seen := make(map[string]bool)
+
+	add := func(v string) {
+		if v != "" && !seen[v] && len(v) >= 4 { // Don't mask very short strings to avoid false positives
+			variants = append(variants, v)
+			seen[v] = true
+		}
+	}
+
+	for _, value := range secrets {
+		if value == "" {
+			continue
+		}
+		// 1. Raw secret
+		add(value)
+
+		// 2. Case variants
+		add(strings.ToLower(value))
+		add(strings.ToUpper(value))
+
+		// 3. Base64 variants
+		b64Std := base64.StdEncoding.EncodeToString([]byte(value))
+		add(b64Std)
+		add(strings.ToLower(b64Std))
+		add(strings.ToUpper(b64Std))
+		// Raw (unpadded) Std
+		b64StdRaw := strings.TrimRight(b64Std, "=")
+		add(b64StdRaw)
+		add(strings.ToLower(b64StdRaw))
+		add(strings.ToUpper(b64StdRaw))
+
+		b64URL := base64.URLEncoding.EncodeToString([]byte(value))
+		add(b64URL)
+		add(strings.ToLower(b64URL))
+		add(strings.ToUpper(b64URL))
+		// Raw (unpadded) URL
+		b64URLRaw := strings.TrimRight(b64URL, "=")
+		add(b64URLRaw)
+		add(strings.ToLower(b64URLRaw))
+		add(strings.ToUpper(b64URLRaw))
+
+		// 4. Hex variant
+		hx := hex.EncodeToString([]byte(value))
+		add(hx)
+		add(strings.ToUpper(hx))
+		// Prefixed Hex
+		add("0x" + hx)
+		add("0x" + strings.ToUpper(hx))
+		add("0X" + hx)
+		add("0X" + strings.ToUpper(hx))
+
+		// 5. URL Query Escape
+		add(url.QueryEscape(value))
+	}
+	return variants
+}
+
+// MaskingWriter masks secrets in output streams by buffering partial matches across boundaries.
+type MaskingWriter struct {
+	underlying io.Writer
+	secrets    []string
+	buf        []byte
+}
+
+func (mw *MaskingWriter) Write(p []byte) (n int, err error) {
+	if len(mw.secrets) == 0 {
+		return mw.underlying.Write(p)
+	}
+
+	mw.buf = append(mw.buf, p...)
+
+	// Perform replacements on the accumulated buffer
+	content := string(mw.buf)
+	for _, secret := range mw.secrets {
+		content = strings.ReplaceAll(content, secret, "[REDACTED]")
+	}
+	mw.buf = []byte(content)
+
+	// Find the longest suffix of mw.buf that is a prefix of any secret
+	keepLen := 0
+	for _, secret := range mw.secrets {
+		for i := 1; i <= len(secret); i++ {
+			prefix := secret[:i]
+			// Check if buffer ends with this prefix
+			if len(mw.buf) >= i && string(mw.buf[len(mw.buf)-i:]) == prefix {
+				if i > keepLen {
+					keepLen = i
+				}
+			}
+		}
+	}
+
+	if keepLen > len(mw.buf) {
+		keepLen = len(mw.buf)
+	}
+
+	writeLen := len(mw.buf) - keepLen
+	if writeLen > 0 {
+		_, err = mw.underlying.Write(mw.buf[:writeLen])
+		if err != nil {
+			return 0, err
+		}
+		mw.buf = mw.buf[writeLen:]
+	}
+
+	return len(p), nil
+}
+
+func (mw *MaskingWriter) Flush() error {
+	if len(mw.buf) > 0 {
+		_, err := mw.underlying.Write(mw.buf)
+		mw.buf = nil
+		return err
 	}
 	return nil
 }

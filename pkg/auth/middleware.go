@@ -9,6 +9,8 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/The-17/agentsecrets/pkg/config"
+	"github.com/The-17/agentsecrets/pkg/errors"
+	"github.com/The-17/agentsecrets/pkg/telemetry"
 	"github.com/The-17/agentsecrets/pkg/ui"
 )
 
@@ -17,34 +19,18 @@ import (
 // assuming a valid refresh token exists.
 func (s *Service) EnsureAuth(cmd *cobra.Command, args []string) error {
 	if !config.IsAuthenticated() {
-		return fmt.Errorf("you must be logged in to perform this action. Run 'agentsecrets login'")
+		return errors.New(errors.ErrUnauthorized, "you must be logged in to perform this action", nil)
 	}
 
-	var needsRefresh bool
-	var refreshToken string
-
-	// 1. Instantly check local token state
-	tokens, err := config.LoadTokens()
-	if err != nil || tokens == nil {
-		return fmt.Errorf("failed to load session tokens")
-	}
-
-	if tokens.ExpiresAt != "" {
-		exp, err := time.Parse(time.RFC3339, tokens.ExpiresAt)
-		if err == nil {
-			if time.Until(exp) < 5*time.Minute {
-				needsRefresh = true
-				refreshToken = tokens.RefreshToken
-			}
+	if config.IsTokenExpired() {
+		tokens, err := config.LoadTokens()
+		if err != nil || tokens == nil || tokens.RefreshToken == "" {
+			return errors.New(errors.ErrUnauthorized, "session expired, please run 'agentsecrets login' again", nil)
 		}
-	}
-
-	// 2. Perform background HTTP network refresh if required
-	if needsRefresh {
 		if err := ui.Spinner("Refreshing expired session token...", func() error {
-			return s.RefreshSession(refreshToken)
+			return s.RefreshSession(tokens.RefreshToken)
 		}); err != nil {
-			ui.Warning("Session refresh failed, you may need to log in again: " + err.Error())
+			return errors.New(errors.ErrUnauthorized, "session refresh failed, you may need to log in again", err)
 		}
 	}
 
@@ -73,7 +59,11 @@ func (s *Service) RefreshSession(refreshToken string) error {
 		"refresh": refreshToken,
 	}
 
+	start := time.Now()
 	resp, err := s.API.Call("auth.refresh", "POST", data, nil, nil)
+	duration := time.Since(start).Milliseconds()
+	telemetry.RecordSessionRefreshMs(duration)
+
 	if err != nil {
 		return err
 	}

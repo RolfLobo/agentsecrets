@@ -10,7 +10,9 @@ import (
 	"strings"
 	"time"
 
+	"github.com/The-17/agentsecrets/pkg/agents"
 	"github.com/The-17/agentsecrets/pkg/api"
+	"github.com/The-17/agentsecrets/pkg/capabilities"
 	"github.com/The-17/agentsecrets/pkg/config"
 	"github.com/The-17/agentsecrets/pkg/crypto"
 	"github.com/The-17/agentsecrets/pkg/keyring"
@@ -175,9 +177,10 @@ func (s *Service) Get(key string) (string, error) {
 
 // SecretMetadata holds the secret metadata from the API.
 type SecretMetadata struct {
-	Key       string `json:"key"`
-	Value     string `json:"value,omitempty"` // Encrypted value
-	UpdatedAt string `json:"updated_at"`
+	Key       string                      `json:"key"`
+	Value     string                      `json:"value,omitempty"` // Encrypted value
+	UpdatedAt string                      `json:"updated_at"`
+	Policy    *capabilities.SecretPolicy  `json:"policy,omitempty"` // Secret-level target constraints
 }
 
 // List returns all secret keys for the project in the active environment.
@@ -257,6 +260,16 @@ func (s *Service) Pull(targetKeys []string) error {
 		}
 		secretsMap[s.Key] = plaintext
 		_ = keyring.SetSecret(project.ProjectID, env, s.Key, plaintext)
+
+		// Cache secret policy locally for proxy enforcement
+		if s.Policy != nil && (len(s.Policy.Domains) > 0 || len(s.Policy.Methods) > 0) {
+			policyBytes, err := json.Marshal(s.Policy)
+			if err == nil {
+				_ = keyring.SetSecretPolicy(project.ProjectID, env, s.Key, policyBytes)
+			}
+		} else {
+			_ = keyring.SetSecretPolicy(project.ProjectID, env, s.Key, nil)
+		}
 	}
 
 	telemetry.RecordSecretCount(len(secretsMap))
@@ -272,6 +285,23 @@ func (s *Service) Pull(targetKeys []string) error {
 	// Update project last_pull timestamp
 	project.LastPull = time.Now().Format(time.RFC3339)
 	_ = config.SaveProjectConfig(project)
+
+	// Pull agent policies/capabilities and cache them locally in keyring
+	if project.WorkspaceID != "" {
+		agentSvc := agents.NewService(s.API)
+		agentsList, err := agentSvc.ListAll(project.WorkspaceID)
+		if err == nil {
+			for _, a := range agentsList {
+				caps, err := agentSvc.GetCapabilities(project.WorkspaceID, a.ID)
+				if err == nil && caps != nil {
+					capsBytes, err := json.Marshal(caps)
+					if err == nil {
+						_ = keyring.SetAgentCapabilities(a.Name, capsBytes)
+					}
+				}
+			}
+		}
+	}
 
 	_ = s.UpdateEnvExampleFromLocal()
 	return nil

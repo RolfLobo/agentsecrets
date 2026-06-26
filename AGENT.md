@@ -104,6 +104,7 @@ There is no code path that puts a credential value into agent context.
 The proxy enforces a **deny-by-default** security posture:
 
 - **Domain Allowlist:** Every outbound request must target a domain explicitly authorized in the workspace allowlist. Unauthorized domains are blocked with 403 Forbidden.
+- **Scope Restriction Enforcement:** When an agent's cryptographically issued token is validated, the proxy verifies that the agent is authorized to work in the current workspace, project, and environment. Any mismatch rejects the call immediately with `agent_workspace_mismatch`, `agent_project_mismatch`, or `agent_environment_mismatch` (403 Forbidden).
 - **Response Body Redaction:** If an external API echoes back the injected credential in its response, the proxy replaces the value with `[REDACTED_BY_AGENTSECRETS]` before returning it. The audit log records the event with reason `credential_echo`.
 - **Admin-Only Allowlist:** Only workspace admins can modify the allowlist (requires password verification). Use `agentsecrets workspace promote/demote` to manage roles.
 
@@ -221,7 +222,6 @@ agentsecrets project delete NAME
 ### Secrets
 ```bash
 agentsecrets secrets set KEY=value
-agentsecrets secrets get KEY
 agentsecrets secrets list [--project NAME]
 agentsecrets secrets push
 agentsecrets secrets pull
@@ -231,10 +231,10 @@ agentsecrets secrets diff
 
 ### Logging & Audit
 ```bash
-agentsecrets log list [--tail]
-agentsecrets log export --format csv
-agentsecrets log summary
-agentsecrets log detail <id>
+agentsecrets logs list [--tail]
+agentsecrets logs export --format csv
+agentsecrets logs summary
+agentsecrets logs detail <id>
 ```
 
 ### Agent Identity

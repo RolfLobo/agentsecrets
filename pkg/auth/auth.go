@@ -23,6 +23,25 @@ import (
 	"github.com/The-17/agentsecrets/pkg/keyring"
 )
 
+// NewAuthenticatedClient returns a new api.Client configured with dynamic token refresh callback.
+func NewAuthenticatedClient() *api.Client {
+	client := api.NewClient(func() string {
+		return config.GetAccessToken()
+	})
+	authSvc := NewService(client)
+	client.SetRefreshTokenCallback(func() (string, error) {
+		tokens, err := config.LoadTokens()
+		if err != nil || tokens.RefreshToken == "" {
+			return "", fmt.Errorf("no refresh token available")
+		}
+		if err := authSvc.RefreshSession(tokens.RefreshToken); err != nil {
+			return "", err
+		}
+		return config.GetAccessToken(), nil
+	})
+	return client
+}
+
 // Service provides authentication operations.
 // It wires together the API client, crypto, config, and keyring packages.
 type Service struct {

@@ -7,6 +7,8 @@ import (
 	"time"
 
 	"github.com/The-17/agentsecrets/pkg/api"
+	"github.com/The-17/agentsecrets/pkg/capabilities"
+	"github.com/The-17/agentsecrets/pkg/projects"
 )
 
 // Agent represents a registered agent identity.
@@ -17,7 +19,7 @@ type Agent struct {
 	ProjectID   *string    `json:"project_id,omitempty"`
 	CreatedAt   time.Time  `json:"created_at"`
 	TokenCount  int        `json:"token_count"`
-	LastUsed    *time.Time `json:"last_used"`
+	LastUsed    *time.Time `json:"last_used_at"`
 }
 
 // Token represents a token issued to an agent.
@@ -27,7 +29,7 @@ type Token struct {
 	Label     string     `json:"label"`
 	CreatedAt time.Time  `json:"created_at"`
 	ExpiresAt *time.Time `json:"expires_at,omitempty"`
-	LastUsed  *time.Time `json:"last_used,omitempty"`
+	LastUsed  *time.Time `json:"last_used_at,omitempty"`
 	Status    string     `json:"status"` // e.g., "active", "revoked", "expired"
 }
 
@@ -138,17 +140,77 @@ func (s *Service) List(workspaceID, projectID string) ([]Agent, error) {
 	return wrapper.Data, nil
 }
 
-// GetByName returns an agent by its exact name within the given workspace.
-func (s *Service) GetByName(workspaceID, name string) (*Agent, error) {
-	agents, err := s.List(workspaceID, "")
-	if err != nil {
-		return nil, err
+// ListAll returns all agents in the workspace, including project-scoped ones.
+func (s *Service) ListAll(workspaceID string) ([]Agent, error) {
+	if workspaceID == "" {
+		return nil, fmt.Errorf("workspaceID is required to list agents")
 	}
-	for _, a := range agents {
-		if a.Name == name {
-			return &a, nil
+
+	endpointKey := "agents.list"
+	urlParams := map[string]string{"workspace_id": workspaceID}
+	queryParams := map[string]string{"include_projects": "true"}
+
+	resp, err := s.client.Call(endpointKey, "GET", nil, urlParams, queryParams)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list all agents: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 400 {
+		return nil, s.client.DecodeError(resp)
+	}
+
+	var wrapper struct {
+		Data []Agent `json:"data"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&wrapper); err != nil {
+		return nil, fmt.Errorf("failed to decode response: %w", err)
+	}
+	return wrapper.Data, nil
+}
+
+// GetByName returns an agent by its exact name within the given workspace.
+// It searches both workspace-scoped agents and all project-scoped agents.
+func (s *Service) GetByName(workspaceID, name string) (*Agent, error) {
+	// Try single fast request first
+	agentsList, err := s.ListAll(workspaceID)
+	if err == nil {
+		for _, a := range agentsList {
+			if a.Name == name {
+				return &a, nil
+			}
+		}
+	} else {
+		// Fallback to sequential lookups if backend doesn't support ListAll (include_projects)
+		// 1. Check workspace-scoped agents
+		agentsList, err = s.List(workspaceID, "")
+		if err == nil {
+			for _, a := range agentsList {
+				if a.Name == name {
+					return &a, nil
+				}
+			}
+		}
+
+		// 2. Check project-scoped agents
+		projService := projects.NewService(s.client)
+		projectsList, err := projService.List()
+		if err == nil {
+			for _, p := range projectsList {
+				if p.WorkspaceID == workspaceID {
+					projAgents, err := s.List(workspaceID, p.ID)
+					if err == nil {
+						for _, a := range projAgents {
+							if a.Name == name {
+								return &a, nil
+							}
+						}
+					}
+				}
+			}
 		}
 	}
+
 	return nil, fmt.Errorf("agent '%s' not found in this workspace", name)
 }
 
@@ -258,4 +320,52 @@ func (s *Service) Delete(workspaceID, registrationID string) error {
 		return s.client.DecodeError(resp)
 	}
 	return nil
+}
+
+// GetCapabilities retrieves the agent's capabilities restrictions.
+func (s *Service) GetCapabilities(workspaceID, registrationID string) (*capabilities.AgentCapabilities, error) {
+	resp, err := s.client.Call("agents.get_capabilities", "GET", nil, map[string]string{
+		"workspace_id":    workspaceID,
+		"registration_id": registrationID,
+	}, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get agent capabilities: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 400 {
+		return nil, s.client.DecodeError(resp)
+	}
+
+	var wrapper struct {
+		Data capabilities.AgentCapabilities `json:"data"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&wrapper); err != nil {
+		return nil, fmt.Errorf("failed to decode capabilities response: %w", err)
+	}
+	return &wrapper.Data, nil
+}
+
+// SetCapabilities updates the agent's capabilities restrictions.
+func (s *Service) SetCapabilities(workspaceID, registrationID string, caps capabilities.AgentCapabilities) (*capabilities.AgentCapabilities, error) {
+	resp, err := s.client.Call("agents.set_capabilities", "PUT", caps, map[string]string{
+		"workspace_id":    workspaceID,
+		"registration_id": registrationID,
+	}, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to set agent capabilities: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 400 {
+		return nil, s.client.DecodeError(resp)
+	}
+
+	var wrapper struct {
+		Data capabilities.AgentCapabilities `json:"data"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&wrapper); err != nil {
+		return nil, fmt.Errorf("failed to decode capabilities response: %w", err)
+	}
+	return &wrapper.Data, nil
 }

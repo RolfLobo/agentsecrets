@@ -11,6 +11,7 @@ import (
 
 	"github.com/The-17/agentsecrets/pkg/api"
 	"github.com/The-17/agentsecrets/pkg/config"
+	"github.com/The-17/agentsecrets/pkg/errors"
 	"github.com/The-17/agentsecrets/pkg/keyring"
 	"github.com/The-17/agentsecrets/pkg/secrets"
 	"github.com/The-17/agentsecrets/pkg/ui"
@@ -35,7 +36,7 @@ func InitSecretsService(client *api.Client) {
 var secretsCmd = &cobra.Command{
 	Use:   "secrets",
 	Short: "Manage your secrets",
-	Long:  `Add, retrieve, and synchronize secrets for your projects. Secrets are encrypted locally before being stored in the cloud.`,
+	Long:  `Add and synchronize secrets for your projects. Secrets are encrypted locally before being stored in the cloud.`,
 }
 
 var secretsSetCmd = &cobra.Command{
@@ -45,16 +46,19 @@ var secretsSetCmd = &cobra.Command{
 	RunE:  runSecretsSet,
 }
 
-var secretsGetCmd = &cobra.Command{
-	Use:   "get [key]",
-	Short: "Retrieve and decrypt a single secret",
-	Args:  cobra.ExactArgs(1),
-	RunE:  runSecretsGet,
-}
 
 var secretsListCmd = &cobra.Command{
 	Use:   "list",
 	Short: "List all secret keys in the cloud",
+	PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
+		if err := ensureDaemonInitialized(); err != nil {
+			return err
+		}
+		if listRemote {
+			return authService.EnsureAuth(cmd, args)
+		}
+		return nil
+	},
 	RunE:  runSecretsList,
 }
 
@@ -91,9 +95,13 @@ func init() {
 	secretsDiffCmd.Flags().StringVar(&diffFrom, "from", "", "Source environment for cross-environment diff")
 	secretsDiffCmd.Flags().StringVar(&diffTo, "to", "", "Target environment for cross-environment diff")
 
+	secretsDeleteCmd.ValidArgsFunction = autocompleteSecretKeys
+
+	_ = secretsDiffCmd.RegisterFlagCompletionFunc("from", autocompleteEnvironments)
+	_ = secretsDiffCmd.RegisterFlagCompletionFunc("to", autocompleteEnvironments)
+
 	secretsCmd.AddCommand(
 		secretsSetCmd,
-		secretsGetCmd,
 		secretsListCmd,
 		secretsPullCmd,
 		secretsPushCmd,
@@ -129,6 +137,10 @@ func runSecretsSet(cmd *cobra.Command, args []string) error {
 			return nil
 		}
 
+		if err := verifyPasswordLocally(); err != nil {
+			return err
+		}
+
 		for _, env := range []string{"development", "staging", "production"} {
 			if err := ui.Spinner(fmt.Sprintf("Setting in %s...", env), func() error {
 				return secretsService.BatchSet(kv, env)
@@ -139,6 +151,13 @@ func runSecretsSet(cmd *cobra.Command, args []string) error {
 			ui.Success(fmt.Sprintf("Set in %s", env))
 		}
 		return nil
+	}
+
+	env := config.ResolveEnvironment()
+	if env == "production" {
+		if err := verifyPasswordLocally(); err != nil {
+			return err
+		}
 	}
 
 	if err := ui.Spinner(fmt.Sprintf("Encrypting and syncing %d secrets...", len(kv)), func() error {
@@ -153,22 +172,6 @@ func runSecretsSet(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-func runSecretsGet(cmd *cobra.Command, args []string) error {
-	key := args[0]
-	var val string
-
-	if err := ui.Spinner(fmt.Sprintf("Retrieving %s...", key), func() error {
-		var e error
-		val, e = secretsService.Get(key)
-		return e
-	}); err != nil {
-		ui.Error(fmt.Sprintf("Get secret: %v", err))
-		return nil
-	}
-
-	fmt.Printf("\n%s\n", val)
-	return nil
-}
 
 func runSecretsList(cmd *cobra.Command, args []string) error {
 	if listRemote {
@@ -341,7 +344,7 @@ func runSecretsPull(cmd *cobra.Command, args []string) error {
 		return nil
 	}
 
-	hasConflicts := len(diff.Changed) > 0 || len(diff.Removed) > 0
+	hasConflicts := len(diff.Changed) > 0
 	var targetKeys []string // nil means pull all
 
 	if hasConflicts && !pullForce {
@@ -524,13 +527,44 @@ func runSecretsPush(cmd *cobra.Command, args []string) error {
 func runSecretsDelete(cmd *cobra.Command, args []string) error {
 	key := args[0]
 
-	// Confirm before deleting from production
+	project, err := config.LoadProjectConfig()
+	if err != nil || project == nil || project.ProjectID == "" {
+		return fmt.Errorf("no project configured in current directory")
+	}
+
 	env := config.ResolveEnvironment()
+
+	// Check if secret exists locally or remotely first
+	exists, err := keyring.SecretExists(project.ProjectID, env, key)
+	if err != nil {
+		return fmt.Errorf("failed to check if secret exists: %w", err)
+	}
+
+	if !exists {
+		// Fallback to checking remotely
+		if remoteKeys, err := secretsService.ListForEnv(env); err == nil {
+			for _, k := range remoteKeys {
+				if strings.EqualFold(k.Key, key) {
+					exists = true
+					break
+				}
+			}
+		}
+	}
+
+	if !exists {
+		return errors.New(errors.ErrSecretNotFound, fmt.Sprintf("secret %q does not exist in project", key), fmt.Errorf("Please verify the key name or switch environments"))
+	}
+
+	// Confirm before deleting from production
 	if env == "production" {
 		fmt.Printf("Delete %s from production? (y/n): ", key)
 		if !confirmYN() {
 			ui.Info("Delete cancelled.")
 			return nil
+		}
+		if err := verifyPasswordLocally(); err != nil {
+			return err
 		}
 	}
 
@@ -682,4 +716,24 @@ func upperFirst(s string) string {
 		return s
 	}
 	return strings.ToUpper(s[:1]) + s[1:]
+}
+
+func autocompleteSecretKeys(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
+	project, err := config.LoadProjectConfig()
+	if err != nil || project == nil || project.ProjectID == "" {
+		return nil, cobra.ShellCompDirectiveNoFileComp
+	}
+	env := config.ResolveEnvironment()
+	keys, err := keyring.ListProjectKeyNames(project.ProjectID, env)
+	if err != nil {
+		return nil, cobra.ShellCompDirectiveNoFileComp
+	}
+
+	var completions []string
+	for _, k := range keys {
+		if strings.HasPrefix(strings.ToLower(k), strings.ToLower(toComplete)) {
+			completions = append(completions, k)
+		}
+	}
+	return completions, cobra.ShellCompDirectiveNoFileComp
 }

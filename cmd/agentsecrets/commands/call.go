@@ -1,13 +1,17 @@
 package commands
 
 import (
+	"encoding/json"
 	"fmt"
+	"net/url"
+	"os"
 	"strings"
+	"time"
 
 	"github.com/spf13/cobra"
 
-	"github.com/The-17/agentsecrets/pkg/config"
 	"github.com/The-17/agentsecrets/pkg/proxy"
+	"github.com/The-17/agentsecrets/pkg/ui"
 )
 
 var (
@@ -16,6 +20,7 @@ var (
 	callBody       string
 	callBearer     string
 	callBasic      string
+	callToken      string
 	callHeaders    []string // "X-API-Key=SECRET_NAME"
 	callQueries    []string // "api_key=SECRET_NAME"
 	callBodyFields []string // "json.path=SECRET_NAME"
@@ -59,11 +64,15 @@ func init() {
 	callCmd.Flags().StringVar(&callBody, "body", "", "Request body (JSON string)")
 	callCmd.Flags().StringVar(&callBearer, "bearer", "", "Bearer token secret key name")
 	callCmd.Flags().StringVar(&callBasic, "basic", "", "Basic auth secret key name")
+	callCmd.Flags().StringVar(&callToken, "token", "", "Agent token (optional, or reads AS_AGENT_TOKEN)")
 	callCmd.Flags().StringArrayVar(&callHeaders, "header", nil, "Header injection: HeaderName=SECRET_KEY (repeatable)")
 	callCmd.Flags().StringArrayVar(&callQueries, "query", nil, "Query injection: param=SECRET_KEY (repeatable)")
 	callCmd.Flags().StringArrayVar(&callBodyFields, "body-field", nil, "Body injection: json.path=SECRET_KEY (repeatable)")
 	callCmd.Flags().StringArrayVar(&callFormFields, "form-field", nil, "Form injection: field=SECRET_KEY (repeatable)")
 	_ = callCmd.MarkFlagRequired("url")
+
+	_ = callCmd.RegisterFlagCompletionFunc("bearer", autocompleteSecretKeys)
+	_ = callCmd.RegisterFlagCompletionFunc("basic", autocompleteSecretKeys)
 }
 
 func runCall(cmd *cobra.Command, args []string) error {
@@ -120,32 +129,76 @@ func runCall(cmd *cobra.Command, args []string) error {
 		)
 	}
 
-	// Load project config
-	project, err := config.LoadProjectConfig()
-	if err != nil || project.ProjectID == "" {
-		return fmt.Errorf("no project configured — run 'agentsecrets init' first")
-	}
-
-	// Create engine and execute
-	engine, err := proxy.NewEngine(project.ProjectID)
-	if err != nil {
-		return fmt.Errorf("failed to initialize engine: %w", err)
-	}
-
 	var body []byte
 	if callBody != "" {
 		body = []byte(callBody)
 	}
 
-	result, err := engine.Execute(proxy.CallRequest{
+	// If the proxy holds the connection waiting for a policy approval, show a
+	// hint in THIS terminal after 2 seconds so the user knows what's happening
+	// and what to do — without having to switch terminals.
+	callDone := make(chan struct{})
+	defer close(callDone)
+	go func() {
+		select {
+		case <-callDone:
+			return // response arrived fast — nothing to show
+		case <-time.After(2 * time.Second):
+		}
+
+		// Parse the domain from the URL for the approve command hint.
+		domain := ""
+		if u, err := url.Parse(callURL); err == nil {
+			domain = u.Hostname()
+		}
+		method := strings.ToUpper(callMethod)
+		if method == "" {
+			method = "GET"
+		}
+
+		fmt.Fprintln(os.Stderr)
+		fmt.Fprintln(os.Stderr, ui.WarningStyle.Render("⏳ Waiting for approval..."))
+		fmt.Fprintln(os.Stderr, ui.DimStyle.Render("   A secret policy requires manual approval for this request."))
+		fmt.Fprintln(os.Stderr, ui.DimStyle.Render("   → Check the proxy terminal and respond to the prompt there, or run:"))
+		fmt.Fprintln(os.Stderr)
+		for _, inj := range injections {
+			if domain != "" {
+				fmt.Fprintf(os.Stderr, "     %s\n",
+					ui.BrandStyle.Render(fmt.Sprintf("agentsecrets proxy approve %s %s %s", inj.SecretKey, method, domain)),
+				)
+			}
+		}
+		fmt.Fprintln(os.Stderr)
+	}()
+
+	result, err := proxy.CallViaProxy(proxy.CallRequest{
 		TargetURL:  callURL,
 		Method:     callMethod,
 		Body:       body,
 		Injections: injections,
-		AgentID:    "cli",
+		AgentToken: callToken,
 	})
 	if err != nil {
 		return fmt.Errorf("API call failed: %w", err)
+	}
+
+	if result.StatusCode >= 400 {
+		var errData struct {
+			Error   string `json:"error"`
+			Message string `json:"message"`
+		}
+		if err := json.Unmarshal(result.Body, &errData); err == nil {
+			msg := errData.Message
+			if msg == "" {
+				msg = errData.Error
+			}
+			if msg != "" {
+				fmt.Fprintln(os.Stderr, ui.ErrorStyle.Render("x "+msg))
+				os.Exit(1)
+			}
+		}
+		fmt.Fprintf(os.Stderr, "%s\n%s\n", ui.ErrorStyle.Render(fmt.Sprintf("x API call failed with HTTP %d:", result.StatusCode)), string(result.Body))
+		os.Exit(1)
 	}
 
 	// Print response (clean stdout for piping)

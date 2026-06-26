@@ -124,8 +124,9 @@ func TestParseInjectionsJSON(t *testing.T) {
 }
 
 func TestNewServerCreation(t *testing.T) {
-	s := NewServer()
+	s := NewServer("dev")
 	if s == nil {
 		t.Fatal("NewServer() returned nil")
 	}
 }
+

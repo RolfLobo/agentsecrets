@@ -4,6 +4,9 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/The-17/agentsecrets/pkg/keychainauth"
+	"github.com/The-17/agentsecrets/pkg/keyring"
 )
 
 func TestConfigRoundtrip(t *testing.T) {
@@ -12,6 +15,10 @@ func TestConfigRoundtrip(t *testing.T) {
 	oldHome := HomeDirHook
 	HomeDirHook = func() (string, error) { return tmpDir, nil }
 	defer func() { HomeDirHook = oldHome }()
+
+	// Set up the in-memory test stub for keychain-auth
+	keychainauth.SetupTestStub()
+	defer keychainauth.TeardownTestStub()
 
 	// 1. Init
 	if err := InitGlobalConfig(); err != nil {
@@ -30,18 +37,25 @@ func TestConfigRoundtrip(t *testing.T) {
 		t.Error("token.json was not created")
 	}
 
-	// 2. Save and Load Global Config
+	// 2. Save and Load Global Config (Workspace Cache Keychain delegation)
 	cfg := &GlobalConfig{
 		Email:               "test@example.com",
 		SelectedWorkspaceID: "ws-123",
-		Workspaces: map[string]WorkspaceCacheEntry{
-			"ws-123": {Name: "Test WS", Key: "base64key", Type: "shared"},
-		},
 	}
 	if err := SaveGlobalConfig(cfg); err != nil {
 		t.Fatalf("SaveGlobalConfig failed: %v", err)
 	}
 
+	testWorkspaceKey := "bXktc2VjcmV0LWtleS0zMi1jaGFycy1sb25nLWhlcmUt" // valid base64 key
+	workspaces := map[string]WorkspaceCacheEntry{
+		"ws-123": {Name: "Test WS", Key: testWorkspaceKey, Type: "shared"},
+	}
+
+	if err := StoreWorkspaceCache(workspaces); err != nil {
+		t.Fatalf("StoreWorkspaceCache failed: %v", err)
+	}
+
+	// Verify that config.json on disk does NOT contain the key
 	loaded, err := LoadGlobalConfig()
 	if err != nil {
 		t.Fatalf("LoadGlobalConfig failed: %v", err)
@@ -52,8 +66,20 @@ func TestConfigRoundtrip(t *testing.T) {
 	if loaded.Workspaces["ws-123"].Name != "Test WS" {
 		t.Error("Nested workspace cache entry missing or incorrect")
 	}
+	if loaded.Workspaces["ws-123"].Key != "" {
+		t.Error("Workspace key was saved to config.json! It should have been stripped and saved to keyring.")
+	}
 
-	// 3. Tokens
+	// Verify we can retrieve it via GetWorkspaceKey
+	retrievedKey, err := GetWorkspaceKey("ws-123")
+	if err != nil {
+		t.Fatalf("GetWorkspaceKey failed: %v", err)
+	}
+	if string(retrievedKey) != "my-secret-key-32-chars-long-here-" {
+		t.Errorf("GetWorkspaceKey returned incorrect value: %q", string(retrievedKey))
+	}
+
+	// 3. Tokens Secure storage
 	tokens := &TokenConfig{
 		AccessToken:  "access-123",
 		RefreshToken: "refresh-456",
@@ -71,6 +97,15 @@ func TestConfigRoundtrip(t *testing.T) {
 		t.Error("Loaded tokens do not match saved tokens")
 	}
 
+	// Verify that token.json file on disk is empty of secrets
+	diskTokens := &TokenConfig{}
+	if err := readJSON(paths.TokenFile, diskTokens); err != nil {
+		t.Fatalf("readJSON token.json failed: %v", err)
+	}
+	if diskTokens.AccessToken != "" || diskTokens.RefreshToken != "" {
+		t.Error("Tokens were written in plaintext to token.json!")
+	}
+
 	// 4. Convenience getters
 	if GetEmail() != "test@example.com" {
 		t.Errorf("GetEmail returned %q, expected %q", GetEmail(), "test@example.com")
@@ -80,6 +115,37 @@ func TestConfigRoundtrip(t *testing.T) {
 	}
 	if !IsAuthenticated() {
 		t.Error("IsAuthenticated returned false, expected true")
+	}
+
+	// 4.5. Test migration behavior
+	// Manually write tokens to token.json
+	legacyTokens := &TokenConfig{
+		AccessToken:  "legacy-access",
+		RefreshToken: "legacy-refresh",
+	}
+	_ = keyring.DeleteUserTokens() // Clear from keyring first
+	if err := writeJSON(paths.TokenFile, legacyTokens, 0600); err != nil {
+		t.Fatalf("Failed to write legacy token.json: %v", err)
+	}
+
+	// LoadTokens should detect it, migrate it, and clear the file
+	migratedTokens, err := LoadTokens()
+	if err != nil {
+		t.Fatalf("LoadTokens migration failed: %v", err)
+	}
+	if migratedTokens.AccessToken != "legacy-access" {
+		t.Errorf("Failed to read legacy token: %s", migratedTokens.AccessToken)
+	}
+	// Verify it's in keyring now
+	keyringJSON, err := keyring.GetUserTokens()
+	if err != nil || keyringJSON == "" {
+		t.Error("Tokens were not migrated to keyring")
+	}
+	// Verify file is cleared
+	diskTokens2 := &TokenConfig{}
+	_ = readJSON(paths.TokenFile, diskTokens2)
+	if diskTokens2.AccessToken != "" {
+		t.Error("token.json was not cleared after migration")
 	}
 
 	// 5. Clear Session

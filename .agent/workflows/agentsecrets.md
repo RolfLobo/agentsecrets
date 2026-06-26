@@ -175,9 +175,9 @@ You will see: timestamp, method, target URL, key name, status code, duration, an
 To stream the authoritative backend global audit ledger or view statistical summaries over time:
 
 ```bash
-agentsecrets log list --tail
-agentsecrets log export --format json
-agentsecrets log summary
+agentsecrets logs list --tail
+agentsecrets logs export --format json
+agentsecrets logs summary
 ```
 
 If you see (REDACTED) in the logs, the proxy detected an echoed credential and scrubbed it. This is expected security behavior.

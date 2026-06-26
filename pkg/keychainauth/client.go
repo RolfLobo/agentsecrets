@@ -6,18 +6,24 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"runtime"
 	"strings"
 	"sync"
+
+	"github.com/The-17/agentsecrets/pkg/telemetry"
 )
 
 // conn holds the persistent connection to the keychain-auth daemon.
 // The connection itself is the authenticated session — no tokens needed.
 var (
-	conn        net.Conn
-	scanner     *bufio.Scanner
-	encoder     *json.Encoder
-	sessionMu   sync.Mutex
-	initialized bool
+	conn          net.Conn
+	scanner       *bufio.Scanner
+	encoder       *json.Encoder
+	sessionMu     sync.Mutex
+	initialized   bool
+	testStubMode  bool
+	testStubStore map[string]string
+	testStubMu    sync.RWMutex
 )
 
 // Init connects to the keychain-auth daemon.
@@ -35,11 +41,16 @@ func Init() error {
 		return nil
 	}
 
+	// Shred and delete legacy files on startup
+	_ = PurgeLegacyFiles()
+
 	sockPath := SocketPath()
 
-	// Step 1: Check socket exists before attempting connection
-	if _, err := os.Stat(sockPath); os.IsNotExist(err) {
-		return &DaemonNotRunningError{SocketPath: sockPath, Cause: err}
+	// Step 1: Check socket exists before attempting connection (Unix only)
+	if runtime.GOOS != "windows" {
+		if _, err := os.Stat(sockPath); os.IsNotExist(err) {
+			return &DaemonNotRunningError{SocketPath: sockPath, Cause: err}
+		}
 	}
 
 	// Step 2: Connect to the Unix socket with SOCK_CLOEXEC to prevent
@@ -64,6 +75,7 @@ func Init() error {
 		if err := json.Unmarshal(sc.Bytes(), &env); err == nil {
 			if env.Status == "denied" || env.Status == "error" {
 				c.Close()
+				telemetry.RecordProcessVerificationsFailed()
 				return &DaemonDeniedError{Reason: env.Reason}
 			}
 		}
@@ -97,6 +109,7 @@ func Init() error {
 	scanner = sc
 	encoder = json.NewEncoder(c)
 	initialized = true
+	telemetry.RecordProcessVerificationsPassed()
 
 	// Step 4: Perform a protocol sanity check (ping) to ensure the running
 	// daemon understands the v2.0+ REQUEST/RESPONSE protocol.
@@ -146,6 +159,15 @@ func Init() error {
 		return fmt.Errorf("keychainauth: protocol mismatch (outdated daemon version)")
 	}
 
+	if resp.Status == "denied" || resp.Status == "error" {
+		c.Close()
+		conn = nil
+		scanner = nil
+		encoder = nil
+		initialized = false
+		return &DaemonDeniedError{Reason: resp.Reason}
+	}
+
 	return nil
 }
 
@@ -165,7 +187,16 @@ func Close() {
 }
 
 // IsAvailable checks whether the keychain-auth socket file exists on disk.
+// On Windows, it attempts to dial the named pipe to check availability.
 func IsAvailable() bool {
+	if runtime.GOOS == "windows" {
+		c, err := dialCLOEXEC(SocketPath())
+		if err == nil {
+			c.Close()
+			return true
+		}
+		return false
+	}
 	_, err := os.Stat(SocketPath())
 	return err == nil
 }
@@ -240,9 +271,14 @@ func GetAllProjectSecrets(projectID, environment string) (map[string]string, err
 	result := make(map[string]string, len(resp.Results))
 	for _, item := range resp.Results {
 		bare := stripPrefix(item.Target, prefix)
-		if bare != "" {
-			result[bare] = item.Value
+		if bare == "" {
+			continue
 		}
+		// Skip metadata entries (e.g. "KEY:policy") — only return actual secrets.
+		if strings.HasSuffix(bare, ":policy") {
+			continue
+		}
+		result[bare] = item.Value
 	}
 	return result, nil
 }
@@ -264,12 +300,18 @@ func ListProjectKeyNames(projectID, environment string) ([]string, error) {
 	keys := make([]string, 0, len(resp.Results))
 	for _, item := range resp.Results {
 		bare := stripPrefix(item.Target, prefix)
-		if bare != "" {
-			keys = append(keys, bare)
+		if bare == "" {
+			continue
 		}
+		// Skip metadata entries (e.g. "KEY:policy") — only return actual secret keys.
+		if strings.HasSuffix(bare, ":policy") {
+			continue
+		}
+		keys = append(keys, bare)
 	}
 	return keys, nil
 }
+
 
 // SetWorkspaceAllowlist stores the domain allowlist for a workspace.
 func SetWorkspaceAllowlist(workspaceID string, domains []string) error {
@@ -311,33 +353,101 @@ func GetWorkspaceAllowlist(workspaceID string) ([]string, error) {
 	return domains, nil
 }
 
+// SetSecretPolicy stores policy in the OS keychain via keychain-auth.
+func SetSecretPolicy(projectID, environment, key string, policy []byte) error {
+	target := formatTarget(projectID, environment, key) + ":policy"
+	_, err := sendRequest(request{
+		Type:    typeRequest,
+		Action:  actionWrite,
+		Service: serviceName,
+		Targets: []string{target},
+		Values:  []string{string(policy)},
+	})
+	return err
+}
+
+// GetSecretPolicy retrieves policy from the OS keychain via keychain-auth.
+func GetSecretPolicy(projectID, environment, key string) ([]byte, error) {
+	target := formatTarget(projectID, environment, key) + ":policy"
+	resp, err := sendRequest(request{
+		Type:    typeRequest,
+		Action:  actionRead,
+		Service: serviceName,
+		Targets: []string{target},
+	})
+	if err != nil {
+		return nil, err
+	}
+	if len(resp.Results) == 0 {
+		return nil, nil
+	}
+	return []byte(resp.Results[0].Value), nil
+}
+
 // --- Internal helpers ---
 
 // sendRequest sends a request to the daemon and reads the response.
 // The caller must NOT hold sessionMu.
 func sendRequest(req request) (*response, error) {
 	sessionMu.Lock()
+	testMode := testStubMode
+	if testMode {
+		sessionMu.Unlock()
+		return handleStubRequest(req)
+	}
 	defer sessionMu.Unlock()
 
-	if !initialized {
-		return nil, fmt.Errorf("keychainauth: not initialized — call Init() first")
+	// Helper to ensure initialized
+	ensureConn := func() error {
+		if !initialized {
+			sessionMu.Unlock()
+			initErr := Init()
+			sessionMu.Lock()
+			if initErr != nil {
+				return fmt.Errorf("keychainauth: not initialized (failed to auto-reconnect: %w)", initErr)
+			}
+		}
+		return nil
+	}
+
+	if err := ensureConn(); err != nil {
+		return nil, err
 	}
 
 	req.Type = typeRequest
 
-	// Send request as a single newline-delimited JSON line
+	// Try sending request. If it fails, try to reconnect once and retry.
 	if err := encoder.Encode(req); err != nil {
 		initialized = false
-		return nil, fmt.Errorf("keychainauth: failed to send request: %w", err)
+		if reconnectErr := ensureConn(); reconnectErr != nil {
+			return nil, fmt.Errorf("keychainauth: failed to send request: %w (reconnect failed: %v)", err, reconnectErr)
+		}
+		if err = encoder.Encode(req); err != nil {
+			initialized = false
+			return nil, fmt.Errorf("keychainauth: failed to send request on retry: %w", err)
+		}
 	}
 
-	// Read response
+	// Read response. If it fails, try to reconnect once and retry the whole request.
 	if !scanner.Scan() {
 		initialized = false
-		if err := scanner.Err(); err != nil {
-			return nil, fmt.Errorf("keychainauth: connection lost: %w", err)
+		if reconnectErr := ensureConn(); reconnectErr != nil {
+			if scanErr := scanner.Err(); scanErr != nil {
+				return nil, fmt.Errorf("keychainauth: connection lost: %w (reconnect failed: %v)", scanErr, reconnectErr)
+			}
+			return nil, fmt.Errorf("keychainauth: connection closed by daemon (reconnect failed: %v)", reconnectErr)
 		}
-		return nil, fmt.Errorf("keychainauth: connection closed by daemon")
+		if err := encoder.Encode(req); err != nil {
+			initialized = false
+			return nil, fmt.Errorf("keychainauth: failed to resend request on retry: %w", err)
+		}
+		if !scanner.Scan() {
+			initialized = false
+			if scanErr := scanner.Err(); scanErr != nil {
+				return nil, fmt.Errorf("keychainauth: connection lost on retry: %w", scanErr)
+			}
+			return nil, fmt.Errorf("keychainauth: connection closed by daemon on retry")
+		}
 	}
 
 	var resp response
@@ -381,4 +491,130 @@ func stripPrefix(target, prefix string) string {
 		return target[len(prefix):]
 	}
 	return ""
+}
+
+// Write writes a value to a service/target namespace in the OS keychain via the daemon.
+func Write(service, target, value string) error {
+	_, err := sendRequest(request{
+		Type:    typeRequest,
+		Action:  actionWrite,
+		Service: service,
+		Targets: []string{target},
+		Values:  []string{value},
+	})
+	return err
+}
+
+// Read retrieves a single value for a service/target from the OS keychain via the daemon.
+func Read(service, target string) (string, error) {
+	resp, err := sendRequest(request{
+		Type:    typeRequest,
+		Action:  actionRead,
+		Service: service,
+		Targets: []string{target},
+	})
+	if err != nil {
+		return "", err
+	}
+	if len(resp.Results) == 0 {
+		return "", fmt.Errorf("keychainauth: target %q not found", target)
+	}
+	return resp.Results[0].Value, nil
+}
+
+// Delete removes a service/target entry from the OS keychain via the daemon.
+func Delete(service, target string) error {
+	_, err := sendRequest(request{
+		Type:    typeRequest,
+		Action:  actionDelete,
+		Service: service,
+		Targets: []string{target},
+	})
+	return err
+}
+
+// Search returns a list of target keys registered under a service namespace that start with a prefix.
+func Search(service, prefix string) ([]string, error) {
+	resp, err := sendRequest(request{
+		Type:    typeRequest,
+		Action:  actionSearch,
+		Service: service,
+		Targets: []string{prefix},
+	})
+	if err != nil {
+		return nil, err
+	}
+	results := make([]string, 0, len(resp.Results))
+	for _, r := range resp.Results {
+		results = append(results, r.Target)
+	}
+	return results, nil
+}
+
+// SetupTestStub enables an in-memory client stub for running unit tests without a running daemon.
+func SetupTestStub() {
+	sessionMu.Lock()
+	defer sessionMu.Unlock()
+	testStubMode = true
+	testStubStore = make(map[string]string)
+	initialized = true
+}
+
+// TeardownTestStub disables the in-memory client stub and clears test store data.
+func TeardownTestStub() {
+	sessionMu.Lock()
+	defer sessionMu.Unlock()
+	testStubMode = false
+	testStubStore = nil
+	initialized = false
+}
+
+func handleStubRequest(req request) (*response, error) {
+	testStubMu.Lock()
+	defer testStubMu.Unlock()
+
+	resp := &response{
+		Type:   typeResponse,
+		Status: "success",
+	}
+
+	switch req.Action {
+	case actionRead:
+		for _, target := range req.Targets {
+			key := req.Service + ":" + target
+			if val, ok := testStubStore[key]; ok {
+				resp.Results = append(resp.Results, resultItem{
+					Target: target,
+					Value:  val,
+				})
+			}
+		}
+	case actionWrite:
+		for i, target := range req.Targets {
+			key := req.Service + ":" + target
+			testStubStore[key] = req.Values[i]
+		}
+	case actionDelete:
+		for _, target := range req.Targets {
+			key := req.Service + ":" + target
+			delete(testStubStore, key)
+		}
+	case actionSearch:
+		if len(req.Targets) > 0 {
+			prefix := req.Targets[0]
+			for k, val := range testStubStore {
+				if strings.HasPrefix(k, req.Service+":") {
+					target := strings.TrimPrefix(k, req.Service+":")
+					if strings.HasPrefix(target, prefix) {
+						resp.Results = append(resp.Results, resultItem{
+							Target: target,
+							Value:  val,
+						})
+					}
+				}
+			}
+		}
+	}
+
+	return resp, nil
 }

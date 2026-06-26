@@ -12,6 +12,7 @@ import (
 
 	"github.com/The-17/agentsecrets/pkg/config"
 	"github.com/The-17/agentsecrets/pkg/keyring"
+	"github.com/The-17/agentsecrets/pkg/proxy"
 	"github.com/The-17/agentsecrets/pkg/ui"
 	"github.com/The-17/agentsecrets/pkg/workspaces"
 )
@@ -43,12 +44,14 @@ var allowlistListCmd = &cobra.Command{
 }
 
 var allowlistLogCmd = &cobra.Command{
-	Use:   "log",
-	Short: "View allowlist audit log",
+	Use:   "logs",
+	Short: "View allowlist audit logs",
 	RunE:  runAllowlistLog,
 }
 
 func init() {
+	allowlistRemoveCmd.ValidArgsFunction = autocompleteAllowlistDomains
+
 	workspaceAllowlistCmd.AddCommand(
 		allowlistAddCmd,
 		allowlistRemoveCmd,
@@ -133,6 +136,17 @@ func runAllowlistAdd(_ *cobra.Command, args []string) error {
 	cfg, _ := config.LoadGlobalConfig()
 	wsName := cfg.Workspaces[workspaceID].Name
 	ui.Success(fmt.Sprintf("%s added to %s allowlist", strings.Join(domains, ", "), wsName))
+
+	var projectID string
+	if pc, err := config.LoadProjectConfig(); err == nil && pc != nil {
+		projectID = pc.ProjectID
+	} else {
+		projectID = cfg.SelectedProjectID
+	}
+	for _, d := range domains {
+		_ = proxy.LogManagementEvent("ADD", "allowlist", fmt.Sprintf("Added domain %s", d), cfg.Email, workspaceID, projectID, config.ResolveEnvironment())
+	}
+
 	return nil
 }
 
@@ -142,6 +156,21 @@ func runAllowlistRemove(_ *cobra.Command, args []string) error {
 	workspaceID, err := requireWorkspaceID()
 	if err != nil {
 		return err
+	}
+
+	// Validate that the domain actually exists in the allowlist first
+	allowlist, alErr := keyring.GetWorkspaceAllowlist(workspaceID)
+	if alErr == nil && len(allowlist) > 0 {
+		found := false
+		for _, d := range allowlist {
+			if strings.EqualFold(d, domain) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return fmt.Errorf("%s is not in the allowlist.", domain)
+		}
 	}
 
 	if err := verifyPasswordLocally(); err != nil {
@@ -171,6 +200,15 @@ func runAllowlistRemove(_ *cobra.Command, args []string) error {
 	cfg, _ := config.LoadGlobalConfig()
 	wsName := cfg.Workspaces[workspaceID].Name
 	ui.Success(fmt.Sprintf("%s removed from %s allowlist", domain, wsName))
+
+	var projectID string
+	if pc, err := config.LoadProjectConfig(); err == nil && pc != nil {
+		projectID = pc.ProjectID
+	} else {
+		projectID = cfg.SelectedProjectID
+	}
+	_ = proxy.LogManagementEvent("REMOVE", "allowlist", fmt.Sprintf("Removed domain %s", domain), cfg.Email, workspaceID, projectID, config.ResolveEnvironment())
+
 	return nil
 }
 
@@ -260,4 +298,22 @@ func runAllowlistLog(_ *cobra.Command, _ []string) error {
 	renderedTable := ui.RenderTable(headers, rows)
 	fmt.Printf("\n%s\n%s\n\n", ui.BannerStr("Allowlist Logs"), renderedTable)
 	return nil
+}
+
+func autocompleteAllowlistDomains(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
+	workspaceID := config.GetSelectedWorkspaceID()
+	if workspaceID == "" {
+		return nil, cobra.ShellCompDirectiveNoFileComp
+	}
+	domains, err := keyring.GetWorkspaceAllowlist(workspaceID)
+	if err != nil {
+		return nil, cobra.ShellCompDirectiveNoFileComp
+	}
+	var completions []string
+	for _, d := range domains {
+		if strings.HasPrefix(strings.ToLower(d), strings.ToLower(toComplete)) {
+			completions = append(completions, d)
+		}
+	}
+	return completions, cobra.ShellCompDirectiveNoFileComp
 }

@@ -61,6 +61,10 @@ var envCleanCmd = &cobra.Command{
 }
 
 func init() {
+	envSwitchCmd.ValidArgsFunction = autocompleteEnvironments
+	envCopyCmd.ValidArgsFunction = autocompleteEnvironmentsMulti
+	envMergeCmd.ValidArgsFunction = autocompleteEnvironmentsMulti
+
 	environmentCmd.AddCommand(envSwitchCmd)
 	environmentCmd.AddCommand(envListCmd)
 	environmentCmd.AddCommand(envCopyCmd)
@@ -462,6 +466,12 @@ func runEnvClean(cmd *cobra.Command, args []string) error {
 		return nil
 	}
 
+	if activeEnv == "production" {
+		if err := verifyPasswordLocally(); err != nil {
+			return err
+		}
+	}
+
 	for _, s := range list {
 		if err := ui.Spinner(fmt.Sprintf("Deleting %s...", s.Key), func() error {
 			return secretsService.Delete(s.Key)
@@ -472,4 +482,30 @@ func runEnvClean(cmd *cobra.Command, args []string) error {
 
 	ui.Success(fmt.Sprintf("Cleaned %s environment.", activeEnv))
 	return nil
+}
+
+func autocompleteEnvironments(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
+	var completions []string
+	for _, env := range config.ValidEnvironments {
+		if strings.HasPrefix(strings.ToLower(env), strings.ToLower(toComplete)) {
+			completions = append(completions, env)
+		}
+	}
+	return completions, cobra.ShellCompDirectiveNoFileComp
+}
+
+func autocompleteEnvironmentsMulti(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
+	if len(args) >= 2 {
+		return nil, cobra.ShellCompDirectiveNoFileComp
+	}
+	var completions []string
+	for _, env := range config.ValidEnvironments {
+		if len(args) == 1 && env == args[0] {
+			continue
+		}
+		if strings.HasPrefix(strings.ToLower(env), strings.ToLower(toComplete)) {
+			completions = append(completions, env)
+		}
+	}
+	return completions, cobra.ShellCompDirectiveNoFileComp
 }

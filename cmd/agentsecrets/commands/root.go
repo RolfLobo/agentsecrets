@@ -6,6 +6,7 @@ import (
 
 	"errors"
 	"fmt"
+	"github.com/The-17/agentsecrets/pkg/agents"
 	"github.com/The-17/agentsecrets/pkg/api"
 	"github.com/The-17/agentsecrets/pkg/auth"
 	"github.com/The-17/agentsecrets/pkg/config"
@@ -14,6 +15,8 @@ import (
 	"github.com/The-17/agentsecrets/pkg/ui"
 	"github.com/The-17/agentsecrets/pkg/workspaces"
 	"os"
+	"os/exec"
+	"runtime"
 	"strings"
 )
 
@@ -54,6 +57,30 @@ func Execute() error {
 	// Ensure keychain-auth socket is closed on exit
 	defer keychainauth.Close()
 
+	// Register telemetry callbacks to avoid import cycles
+	telemetry.KeychainInitializedFunc = keychainauth.IsInitialized
+	telemetry.LoadProjectIDFunc = func() string {
+		if project, err := config.LoadProjectConfig(); err == nil && project != nil {
+			return project.ProjectID
+		}
+		return ""
+	}
+	telemetry.LoadGlobalConfigFunc = func() (string, string, string) {
+		if gc, err := config.LoadGlobalConfig(); err == nil && gc != nil {
+			wsType := "personal"
+			if gc.SelectedWorkspaceID != "" {
+				if ws, ok := gc.Workspaces[gc.SelectedWorkspaceID]; ok {
+					if ws.Type != "" {
+						wsType = ws.Type
+					}
+				}
+			}
+			return gc.SelectedWorkspaceID, gc.Email, wsType
+		}
+		return "", "", "personal"
+	}
+	telemetry.ResolveEnvironmentFunc = config.ResolveEnvironment
+
 	// Run update check. It's efficient (24h interval) and has a short timeout.
 	if res, _ := config.CheckForUpdates(Version); res != nil && res.NewVersionAvailable {
 		ui.Banner(fmt.Sprintf("Update Available: %s → %s", res.CurrentVersion, res.LatestVersion))
@@ -81,28 +108,13 @@ func Execute() error {
 }
 
 func init() {
-	// Create the API client with a token provider function.
-	apiClient = api.NewClient(func() string {
-		return config.GetAccessToken()
-	})
+	apiClient = auth.NewAuthenticatedClient()
 
 	// Create the shared services
 	authService = auth.NewService(apiClient)
 	workspaceService = workspaces.NewService(apiClient)
 	InitProjectService(apiClient)
 	InitSecretsService(apiClient)
-
-	// Set dynamic token refresh callback to prevent code duplication
-	apiClient.SetRefreshTokenCallback(func() (string, error) {
-		tokens, err := config.LoadTokens()
-		if err != nil || tokens.RefreshToken == "" {
-			return "", fmt.Errorf("no refresh token available")
-		}
-		if err := authService.RefreshSession(tokens.RefreshToken); err != nil {
-			return "", err
-		}
-		return config.GetAccessToken(), nil
-	})
 
 	// Register all subcommands
 	rootCmd.AddCommand(initCmd)
@@ -111,22 +123,34 @@ func init() {
 	rootCmd.AddCommand(statusCmd)
 
 	// Add auth middleware to commands that require it
-	workspaceCmd.PersistentPreRunE = authService.EnsureAuth
-	projectCmd.PersistentPreRunE = authService.EnsureAuth
-	environmentCmd.PersistentPreRunE = authService.EnsureAuth
-	proxyCmd.PersistentPreRunE = authService.EnsureAuth
+	workspaceCmd.PersistentPreRunE = keychainAuthMiddleware
+	projectCmd.PersistentPreRunE = keychainAuthMiddleware
+	environmentCmd.PersistentPreRunE = keychainAuthMiddleware
+	agentCmd.PersistentPreRunE = func(cmd *cobra.Command, args []string) error {
+		if err := keychainAuthMiddleware(cmd, args); err != nil {
+			return err
+		}
+		// Init agent service (originally in agent.go's PersistentPreRunE)
+		if agentService == nil {
+			agentService = agents.NewService(apiClient)
+		}
+		return nil
+	}
 
 	// Commands that read secrets or display sensitive info need auth verification.
-	// The keychainAuthMiddleware (currently auth-only) handles this.
+	// The keychainAuthMiddleware handles this.
 	secretsCmd.PersistentPreRunE = keychainAuthMiddleware
 	callCmd.PersistentPreRunE = keychainAuthMiddleware
-	statusCmd.PersistentPreRunE = keychainAuthMiddleware
+
+	statusCmd.PersistentPreRunE = daemonOnlyMiddleware
+	loginCmd.PersistentPreRunE = daemonOnlyMiddleware
+	initCmd.PersistentPreRunE = daemonOnlyMiddleware
 
 	rootCmd.AddCommand(workspaceCmd)
 	rootCmd.AddCommand(projectCmd)
 	rootCmd.AddCommand(secretsCmd)
 	rootCmd.AddCommand(agentCmd)
-	rootCmd.AddCommand(logCmd)
+	rootCmd.AddCommand(logsCmd)
 	rootCmd.AddCommand(proxyCmd)
 	rootCmd.AddCommand(mcpCmd)
 	rootCmd.AddCommand(callCmd)
@@ -136,25 +160,30 @@ func init() {
 	rootCmd.AddCommand(docsCmd)
 }
 
-// keychainAuthMiddleware is a PersistentPreRunE that ensures both:
-// 1. The user is authenticated (EnsureAuth)
-// 2. A keychain-auth connection is established (keychainauth.Init)
-//
-// If keychain-auth is not installed or not running, it performs automatic
-// setup with a spinner so the user never has to think about it.
-func keychainAuthMiddleware(cmd *cobra.Command, args []string) error {
-	// Step 1: Ensure the user is logged in
-	if err := authService.EnsureAuth(cmd, args); err != nil {
-		return err
-	}
-
-	// Step 2: Skip if connection already established (e.g. parent command already ran this)
+// ensureDaemonInitialized ensures that:
+// 1. The keychain-auth daemon is set up and running (AutoSetup if missing/outdated)
+// 2. The client is successfully initialized and connected to the daemon socket/named pipe
+func ensureDaemonInitialized() error {
+	// Step 1: Skip if connection already established
 	if keychainauth.IsInitialized() {
 		return nil
 	}
 
-	// Step 3: If keychain-auth isn't available or we're not fully configured, run auto-setup with a spinner
-	if !keychainauth.IsAvailable() || !keychainauth.IsFullyConfigured() {
+	// Step 2: If keychain-auth isn't available, run auto-setup
+	if !keychainauth.IsAvailable() {
+		if runtime.GOOS == "linux" {
+			// Check if sudo is cached. If not, prompt the user before starting the spinner.
+			sudoCheck := exec.Command("sudo", "-n", "true")
+			if err := sudoCheck.Run(); err != nil {
+				fmt.Println("keychain-auth sandbox system setup is required. Please authorize when prompted.")
+				sudoVal := exec.Command("sudo", "-v")
+				sudoVal.Stdin = os.Stdin
+				sudoVal.Stdout = os.Stdout
+				sudoVal.Stderr = os.Stderr
+				_ = sudoVal.Run() // Wait for password entry to cache it
+			}
+		}
+
 		if err := ui.Spinner("Setting up keychain-auth...", func() error {
 			return keychainauth.AutoSetup()
 		}); err != nil {
@@ -164,7 +193,7 @@ func keychainAuthMiddleware(cmd *cobra.Command, args []string) error {
 			ui.Info("  brew install The-17/tap/keychain-auth")
 			ui.Info("  keychain-auth start")
 			fmt.Println()
-			return fmt.Errorf("keychain-auth is required for secret operations")
+			return fmt.Errorf("keychain-auth is required for secure credentials storage")
 		}
 	}
 
@@ -180,7 +209,19 @@ func keychainAuthMiddleware(cmd *cobra.Command, args []string) error {
 				_ = os.Remove(keychainauth.SocketPath())
 			}
 
-			if errSetup := ui.Spinner("Setting up keychain-auth...", func() error {
+			if runtime.GOOS == "linux" {
+				sudoCheck := exec.Command("sudo", "-n", "true")
+				if err := sudoCheck.Run(); err != nil {
+					fmt.Println("keychain-auth daemon restart is required. Please authorize when prompted.")
+					sudoVal := exec.Command("sudo", "-v")
+					sudoVal.Stdin = os.Stdin
+					sudoVal.Stdout = os.Stdout
+					sudoVal.Stderr = os.Stderr
+					_ = sudoVal.Run()
+				}
+			}
+
+			if errSetup := ui.Spinner("Starting keychain-auth daemon...", func() error {
 				if isMismatch {
 					return keychainauth.RestartDaemon()
 				}
@@ -192,7 +233,7 @@ func keychainAuthMiddleware(cmd *cobra.Command, args []string) error {
 				ui.Info("  brew install The-17/tap/keychain-auth")
 				ui.Info("  keychain-auth start")
 				fmt.Println()
-				return fmt.Errorf("keychain-auth is required for secret operations")
+				return fmt.Errorf("keychain-auth is required for secure credentials storage")
 			}
 
 			err = keychainauth.Init()
@@ -202,10 +243,32 @@ func keychainAuthMiddleware(cmd *cobra.Command, args []string) error {
 		// If the binary is unregistered or hash changed (e.g. after rebuild or upgrade),
 		// re-register and restart the daemon transparently.
 		var denied *keychainauth.DaemonDeniedError
-		if errors.As(err, &denied) && (denied.IsUnregistered() || denied.IsHashMismatch()) {
+		errStr := err.Error()
+		isClosedOrDenied := strings.Contains(errStr, "daemon closed connection immediately") ||
+			strings.Contains(errStr, "connection closed by daemon") ||
+			strings.Contains(errStr, "broken pipe") ||
+			strings.Contains(errStr, "connection reset by peer") ||
+			(errors.As(err, &denied) && (denied.IsUnregistered() || denied.IsHashMismatch()))
+
+		if isClosedOrDenied {
 			keychainauth.Close()
-			_ = keychainauth.AutoSetup()
-			_ = keychainauth.RestartDaemon()
+
+			if runtime.GOOS == "linux" {
+				sudoCheck := exec.Command("sudo", "-n", "true")
+				if err := sudoCheck.Run(); err != nil {
+					fmt.Println("keychain-auth binary registration is required. Please authorize when prompted.")
+					sudoVal := exec.Command("sudo", "-v")
+					sudoVal.Stdin = os.Stdin
+					sudoVal.Stdout = os.Stdout
+					sudoVal.Stderr = os.Stderr
+					_ = sudoVal.Run()
+				}
+			}
+
+			_ = ui.Spinner("Registering agentsecrets binary with daemon...", func() error {
+				_ = keychainauth.AutoSetup()
+				return keychainauth.RestartDaemon()
+			})
 			err = keychainauth.Init()
 		}
 	}
@@ -214,4 +277,21 @@ func keychainAuthMiddleware(cmd *cobra.Command, args []string) error {
 	}
 
 	return nil
+}
+
+// keychainAuthMiddleware is a PersistentPreRunE that ensures both:
+// 1. The keychain-auth connection is established
+// 2. The user is authenticated (EnsureAuth)
+func keychainAuthMiddleware(cmd *cobra.Command, args []string) error {
+	if err := ensureDaemonInitialized(); err != nil {
+		return err
+	}
+	return authService.EnsureAuth(cmd, args)
+}
+
+// daemonOnlyMiddleware is a PersistentPreRunE that ensures the keychain-auth daemon
+// connection is established (without requiring user authentication first).
+// Used by bootstrap/login/logout flow.
+func daemonOnlyMiddleware(cmd *cobra.Command, args []string) error {
+	return ensureDaemonInitialized()
 }

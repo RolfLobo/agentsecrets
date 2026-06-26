@@ -2,6 +2,7 @@ package commands
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/charmbracelet/huh"
 	"github.com/charmbracelet/lipgloss"
@@ -10,6 +11,7 @@ import (
 	"github.com/The-17/agentsecrets/pkg/api"
 	"github.com/The-17/agentsecrets/pkg/config"
 	"github.com/The-17/agentsecrets/pkg/projects"
+	"github.com/The-17/agentsecrets/pkg/proxy"
 	"github.com/The-17/agentsecrets/pkg/ui"
 )
 
@@ -69,6 +71,10 @@ var projectInviteCmd = &cobra.Command{
 }
 
 func init() {
+	projectUseCmd.ValidArgsFunction = autocompleteProjects
+	projectUpdateCmd.ValidArgsFunction = autocompleteProjects
+	projectDeleteCmd.ValidArgsFunction = autocompleteProjects
+
 	projectCmd.AddCommand(projectListCmd)
 	projectCmd.AddCommand(projectCreateCmd)
 	projectCmd.AddCommand(projectUseCmd)
@@ -96,6 +102,7 @@ func runProjectList(cmd *cobra.Command, args []string) error {
 
 	// Fetch global config to map workspace IDs to names
 	cfg, _ := config.LoadGlobalConfig()
+	currentProj, _ := config.LoadProjectConfig()
 
 	headers := []string{"Project", "Workspace", "Description"}
 	rows := make([][]string, len(projs))
@@ -113,7 +120,12 @@ func runProjectList(cmd *cobra.Command, args []string) error {
 			desc = "—"
 		}
 
-		rows[i] = []string{p.Name, wsName, desc}
+		pName := "  " + p.Name
+		if currentProj != nil && currentProj.ProjectID == p.ID {
+			pName = ui.BrandStyle.Render("→ " + p.Name)
+		}
+
+		rows[i] = []string{pName, wsName, desc}
 	}
 
 	renderedTable := ui.RenderTable(headers, rows)
@@ -171,6 +183,10 @@ func runProjectCreate(cmd *cobra.Command, args []string) error {
 		ui.Error("Failed to create project: " + err.Error())
 		return nil
 	}
+
+	cfg, _ := config.LoadGlobalConfig()
+	workspaceID := config.GetSelectedWorkspaceID()
+	_ = proxy.LogManagementEvent("CREATE", "project", fmt.Sprintf("Created project %s", created.Name), cfg.Email, workspaceID, created.ID, config.ResolveEnvironment())
 
 	fmt.Println()
 	ui.Success(fmt.Sprintf("Project '%s' created and selected!", created.Name))
@@ -230,6 +246,10 @@ func runProjectUse(cmd *cobra.Command, args []string) error {
 		return nil
 	}
 
+	cfg, _ := config.LoadGlobalConfig()
+	workspaceID := config.GetSelectedWorkspaceID()
+	_ = proxy.LogManagementEvent("LINK", "project", fmt.Sprintf("Linked directory to project %s", used.Name), cfg.Email, workspaceID, used.ID, config.ResolveEnvironment())
+
 	fmt.Println()
 	ui.Success(fmt.Sprintf("Now using project '%s'!", used.Name))
 	return nil
@@ -279,6 +299,23 @@ func runProjectUpdate(cmd *cobra.Command, args []string) error {
 		return nil
 	}
 
+	var projectID string
+	if list, err := projectService.List(); err == nil {
+		for _, p := range list {
+			if p.Name == oldName || p.ID == oldName {
+				projectID = p.ID
+				break
+			}
+		}
+	}
+	cfg, _ := config.LoadGlobalConfig()
+	workspaceID := config.GetSelectedWorkspaceID()
+	targetName := oldName
+	if newName != "" {
+		targetName = newName
+	}
+	_ = proxy.LogManagementEvent("UPDATE", "project", fmt.Sprintf("Updated project %s", targetName), cfg.Email, workspaceID, projectID, config.ResolveEnvironment())
+
 	ui.Success(fmt.Sprintf("Project '%s' updated!", oldName))
 	return nil
 }
@@ -299,6 +336,20 @@ func runProjectDelete(cmd *cobra.Command, args []string) error {
 		}
 	}
 
+	var projectID string
+	if list, err := projectService.List(); err == nil {
+		for _, p := range list {
+			if p.Name == name || p.ID == name {
+				projectID = p.ID
+				break
+			}
+		}
+	}
+
+	if projectID == "" {
+		return fmt.Errorf("project %q not found", name)
+	}
+
 	var confirmed bool
 	if err := huh.NewConfirm().
 		Title(fmt.Sprintf("Are you sure you want to delete project '%s'? This cannot be undone.", name)).
@@ -307,12 +358,20 @@ func runProjectDelete(cmd *cobra.Command, args []string) error {
 		return nil
 	}
 
+	if err := verifyPasswordLocally(); err != nil {
+		return err
+	}
+
 	if err := ui.Spinner(fmt.Sprintf("Deleting project '%s'...", name), func() error {
 		return projectService.Delete(name)
 	}); err != nil {
 		ui.Error("Failed to delete project: " + err.Error())
 		return nil
 	}
+
+	cfg, _ := config.LoadGlobalConfig()
+	workspaceID := config.GetSelectedWorkspaceID()
+	_ = proxy.LogManagementEvent("DELETE", "project", fmt.Sprintf("Deleted project %s", name), cfg.Email, workspaceID, projectID, config.ResolveEnvironment())
 
 	ui.Success(fmt.Sprintf("Project '%s' deleted!", name))
 	return nil
@@ -364,4 +423,21 @@ func runProjectInvite(cmd *cobra.Command, args []string) error {
 
 	ui.Success(fmt.Sprintf("Invited %s to project!", email))
 	return nil
+}
+
+func autocompleteProjects(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
+	if projectService == nil {
+		return nil, cobra.ShellCompDirectiveNoFileComp
+	}
+	projs, err := projectService.List()
+	if err != nil {
+		return nil, cobra.ShellCompDirectiveNoFileComp
+	}
+	var completions []string
+	for _, p := range projs {
+		if strings.HasPrefix(strings.ToLower(p.Name), strings.ToLower(toComplete)) {
+			completions = append(completions, p.Name)
+		}
+	}
+	return completions, cobra.ShellCompDirectiveNoFileComp
 }
