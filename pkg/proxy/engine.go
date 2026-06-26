@@ -515,6 +515,7 @@ func (e *Engine) Execute(req CallRequest) (*CallResult, error) {
 
 	if len(allowlist) == 0 {
 		msg := "Your workspace allowlist is empty. No credential injections are allowed until you add at least one domain.\nRun: agentsecrets workspace allowlist add <domain>"
+		telemetry.RecordAllowlistViolation()
 		return logBlocked("empty_allowlist", string(bytes.ReplaceAll([]byte(msg), []byte("\n"), []byte(" "))))
 	}
 
