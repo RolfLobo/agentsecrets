@@ -18,7 +18,7 @@ npm install -g @the-17/agentsecrets
 
 **PyPI (Python projects):**
 ```bash
-pip install agentsecrets
+pip install agentsecrets-cli
 ```
 
 **From source (Go 1.21+):**
