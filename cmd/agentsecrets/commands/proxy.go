@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
+	"golang.org/x/term"
 
 	"github.com/The-17/agentsecrets/pkg/config"
 	"github.com/The-17/agentsecrets/pkg/log"
@@ -183,6 +184,11 @@ func runProxyStart(cmd *cobra.Command, args []string) error {
 	ui.Success(fmt.Sprintf("\nProxy listening on http://localhost:%d/proxy", proxyPort))
 	ui.Info("Press Ctrl+C to stop")
 	fmt.Println()
+
+	// Wire up interactive approval prompts in this terminal.
+	// When a request is blocked waiting for approval, this goroutine fires
+	// immediately and shows a y/N prompt — no timeout, no polling.
+	startInteractiveApprovalLoop(engine)
 
 	return server.Start()
 }
@@ -469,6 +475,76 @@ func runProxyApprove(cmd *cobra.Command, args []string) error {
 
 	ui.Success(fmt.Sprintf("Approved: %s can be used for %s requests to %s (this session only)", secretKey, method, domain))
 	return nil
+}
+
+// startInteractiveApprovalLoop runs in the background while the proxy is active.
+// It reads from engine.Approvals.Notifications(), which fires immediately the
+// moment a request goroutine calls WaitForApproval. The goroutine prints a
+// formatted prompt right away so the developer can approve without leaving the
+// proxy terminal — and without any polling or timeout expiry first.
+//
+// This is a no-op when not attached to an interactive terminal (CI/headless).
+func startInteractiveApprovalLoop(engine *proxy.Engine) {
+	if engine.Approvals == nil {
+		return
+	}
+	if !term.IsTerminal(int(os.Stdin.Fd())) || !term.IsTerminal(int(os.Stdout.Fd())) {
+		// Headless / piped — /approve endpoint is the only path.
+		return
+	}
+
+	go func() {
+		// Track keys we're already prompting for to avoid duplicate prompts
+		// when multiple requests for the same key arrive simultaneously.
+		handling := make(map[proxy.ApprovalKey]bool)
+
+		for key := range engine.Approvals.Notifications() {
+			// Already granted this session — the waiter will unblock on its own.
+			if engine.Approvals.IsApproved(key) {
+				continue
+			}
+			// Already printing a prompt for this key.
+			if handling[key] {
+				continue
+			}
+			handling[key] = true
+
+			// Print immediately — no wait.
+			fmt.Println()
+			ui.Banner("Approval Required")
+			ui.Divider()
+			ui.StatusRow("Secret:", ui.BrandStyle.Render(key.SecretKey))
+			agent := key.AgentID
+			if agent == "" {
+				agent = "(anonymous)"
+			}
+			ui.StatusRow("Agent:", agent)
+			ui.StatusRow("Request:", fmt.Sprintf("%s → %s", key.Method, key.Domain))
+			fmt.Println()
+			fmt.Print(ui.WarningStyle.Render("Allow? [y/N/always]: "))
+
+			var response string
+			fmt.Fscanln(os.Stdin, &response)
+			response = strings.TrimSpace(strings.ToLower(response))
+
+			switch response {
+			case "y", "yes", "always":
+				engine.Approvals.Approve(key)
+				ui.Success(fmt.Sprintf("Approved: %s for %s → %s (this session)", key.SecretKey, key.Method, key.Domain))
+				if response == "always" {
+					ui.Info("'always' grants approval for this proxy session only — restart proxy to reset.")
+				}
+				// Keep in handling — already granted, future requests unblock instantly.
+			default:
+				engine.Approvals.Deny(key)
+				ui.Warning(fmt.Sprintf("Denied: %s for %s → %s", key.SecretKey, key.Method, key.Domain))
+				// Remove from handling so a future request for the same key re-prompts.
+				delete(handling, key)
+			}
+
+			fmt.Println()
+		}
+	}()
 }
 
 var proxyRotateSessionCmd = &cobra.Command{

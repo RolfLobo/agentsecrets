@@ -19,7 +19,7 @@ type Agent struct {
 	ProjectID   *string    `json:"project_id,omitempty"`
 	CreatedAt   time.Time  `json:"created_at"`
 	TokenCount  int        `json:"token_count"`
-	LastUsed    *time.Time `json:"last_used"`
+	LastUsed    *time.Time `json:"last_used_at"`
 }
 
 // Token represents a token issued to an agent.
@@ -29,7 +29,7 @@ type Token struct {
 	Label     string     `json:"label"`
 	CreatedAt time.Time  `json:"created_at"`
 	ExpiresAt *time.Time `json:"expires_at,omitempty"`
-	LastUsed  *time.Time `json:"last_used,omitempty"`
+	LastUsed  *time.Time `json:"last_used_at,omitempty"`
 	Status    string     `json:"status"` // e.g., "active", "revoked", "expired"
 }
 

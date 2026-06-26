@@ -153,9 +153,9 @@ func today() string {
 }
 
 func currentDay() *Day {
-	if data == nil {
-		_ = load()
-	}
+	// Always reload from disk to pick up changes made by other processes
+	// (e.g. CLI commands vs long-running proxy daemon sharing telemetry.json).
+	_ = load()
 	if data.Daily == nil {
 		data.Daily = make(map[string]*Day)
 	}
@@ -527,9 +527,8 @@ func SyncIfDue(client *api.Client, cliVersion string) {
 		return
 	}
 
-	if data == nil {
-		_ = load()
-	}
+	// Always reload from disk to get the latest state (another process may have synced already).
+	_ = load()
 
 	if time.Since(data.LastSync) >= 24*time.Hour {
 		if len(data.Daily) == 0 {

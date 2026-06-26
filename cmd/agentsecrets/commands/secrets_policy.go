@@ -106,7 +106,7 @@ func runSecretsPolicySet(cmd *cobra.Command, args []string) error {
 	}
 
 	if !exists {
-		return errors.New(errors.ErrSecretNotFound, fmt.Sprintf("secret %q does not exist in project", key), fmt.Errorf("Please create the secret first with: agentsecrets secrets set %s=value", key, key))
+		return errors.New(errors.ErrSecretNotFound, fmt.Sprintf("secret %q does not exist in project", key), fmt.Errorf("Please create the secret first with: agentsecrets secrets set %s=value", key))
 	}
 
 	// Policy changes are security-sensitive — always require password verification.

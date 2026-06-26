@@ -11,7 +11,11 @@
 
 ---
 
-AgentSecrets is the zero-knowledge credential infrastructure for the AI era. It decouples credentials from the application runtime entirely, ensuring that agents execute tasks using credentials by reference without ever holding the raw values in memory. 
+Credentials are the backbone of the modern world. Every database, API, infrastructure, and system we interact with is protected by one thing: access. Yet as software becomes more autonomous, the layer that controls access has remained largely unchanged. We've spent years building more powerful applications, more capable AI systems, and more connected infrastructure — but we rarely ask: *what governs the keys that unlock them?*
+
+AI agents make this problem impossible to ignore. An agent's capability is bounded by the credentials it holds, and without proper control, those credentials become the weakest link. We built AgentSecrets as the credential infrastructure for this new world — not just storing secrets, but governing how they're accessed, used, and enforced at runtime.
+
+AgentSecrets is zero-knowledge credential infrastructure. It decouples credentials from the application runtime entirely, ensuring that agents execute tasks using credentials by reference without ever holding the raw values in memory.
 
 To achieve this, AgentSecrets acts as an extensible infrastructure host. Specific security guarantees are enforced by **subsystems** that plug into AgentSecrets:
 
@@ -35,6 +39,7 @@ AgentSecrets compiles these subsystems into a cohesive, provably secure framewor
 - [Environments](#environments)
 - [Team Workspaces](#team-workspaces)
 - [Agent Identity](#agent-identity)
+- [Secret-Level Policies & Approvals](#secret-level-policies--approvals)
 - [6 Auth Injection Styles](#6-auth-injection-styles)
 - [Zero-Trust Proxy Security](#zero-trust-proxy-security)
 - [Encryption Model](#encryption-model)
@@ -117,13 +122,13 @@ AgentSecrets hosts modular subsystems to provide layered defense-in-depth:
 
 **Environments & Teams:** Switches contexts (`development`, `staging`, `production`) instantly. Syncs secrets client-side via NaCl SealedBox key exchange across team workspaces. No plaintext keys touch the wire or disk.
 
-**Identity & Audit Logs:** Maps executions to cryptographically issued Agent Tokens (when configured). The log stores metadata, status, environment, and target scopes. No value field exists in the schema.
+**Identity & Audit Logs:** Maps executions to cryptographically issued Agent Tokens (when configured). The forensic log is SHA-256 chain-linked — tampering, deletion, or reordering is mathematically detectable. No value field exists in the schema.
 
 **Developer SDK & MCP:** Build MCP servers, plugins, and agents where credential values are resolved below the runtime loop. The SDK has no `get()` method to prevent accidental or malicious retrieval.
 
 **MCP integration:** first-class MCP server for Claude Desktop and Cursor. No credential values in any config file.
 
-**Environment variable injection:** `agentsecrets env -- <command>` wraps any process and injects secrets from the OS keychain at spawn time. Nothing written to disk.
+**Environment variable injection:** `agentsecrets env -- <command>` wraps any process and injects secrets from the OS keychain at spawn time. Stdout/stderr streams are scanned — any credential echo is redacted before hitting the console. Nothing written to disk.
 
 ---
 
@@ -140,7 +145,7 @@ npm install -g @the-17/agentsecrets
 pip install agentsecrets-cli
 
 # Go (recommend using a pinned version for supply chain security)
-go install github.com/The-17/agentsecrets/cmd/agentsecrets@v2.0.0
+go install github.com/The-17/agentsecrets/cmd/agentsecrets@v3.0.0
 ```
 
 ---
@@ -188,12 +193,12 @@ AgentSecrets Status
 
 agentsecrets secrets diff
 # Comparing secrets & allowlist...
-# 
+#
 # SECRETS:
-# 
+#
 #   In Cloud but missing in Local:
 #     STRIPE_KEY
-# 
+#
 # Run agentsecrets secrets pull to sync from cloud.
 
 agentsecrets secrets pull
@@ -268,10 +273,51 @@ agentsecrets agent token issue "billing-processor"
 # → agt_ws01hxyz_4kR9mNpQ...
 client = AgentSecrets(agent_token="agt_ws01hxyz_...")
 
+# Restrict what secrets an agent can use
+agentsecrets agent policy set billing-processor \
+  --allow STRIPE_KEY \
+  --deny OPENAI_KEY
+
 # Audit by agent
 agentsecrets logs list --agent billing-processor
 agentsecrets logs list --identity anonymous   # find coverage gaps
 ```
+
+Agent capabilities are enforced at the proxy boundary — before credential resolution. An agent with `--deny OPENAI_KEY` cannot use that credential regardless of what it requests.
+
+---
+
+## Secret-Level Policies & Approvals
+
+Define per-secret rules that govern which domains and HTTP methods can use each credential.
+
+```bash
+# Allow GET, require approval for POST
+agentsecrets secrets policy set STRIPE_KEY \
+  --rule "api.stripe.com:GET=allow" \
+  --rule "api.stripe.com:POST=request_permission"
+```
+
+When a `request_permission` policy is triggered, the proxy holds the HTTP connection open and prompts for developer approval — in real time, without re-running the command:
+
+**Proxy terminal** — immediate interactive prompt:
+```
+Approval Required
+──────────────────────────────
+Secret:   STRIPE_KEY  |  Agent: billing-processor
+Request:  POST → api.stripe.com
+
+Allow? [y/N/always]:
+```
+
+**Caller terminal** — hint appears after 2 seconds:
+```
+⏳ Waiting for approval...
+   → Check the proxy terminal, or run:
+     agentsecrets proxy approve STRIPE_KEY POST api.stripe.com
+```
+
+Type `y` in either terminal. The blocked request proceeds immediately — no re-run required. Approvals are session-scoped (reset on proxy restart).
 
 ---
 
@@ -307,13 +353,23 @@ agentsecrets call --url https://oauth.example.com/token \
 
 ## Zero-Trust Proxy Security
 
-Every proxied request passes through four security layers before injection:
+Every proxied request passes through a fail-fast security pipeline before credential injection:
 
-**Domain allowlist:** deny-by-default. Every target domain must be explicitly authorized. Unauthorized domains are blocked before credential resolution, regardless of whether the request came from prompt injection, SSRF, or misconfiguration.
+**Secret presence check:** is the referenced key name in the local index? Blocks typos and non-existent keys before any network activity.
 
-**Response body redaction:** if an external API echoes the injected credential in its response, the proxy replaces it with `[REDACTED_BY_AGENTSECRETS]` before the response reaches the agent.
+**HTTPS enforcement:** plaintext `http://` targets are blocked — no credential is ever sent over unencrypted transport.
+
+**Agent token validation:** token checked against the cloud, capabilities extracted. Workspace, project, and environment scope restrictions enforced.
+
+**Agent capability check:** per-token allow/deny lists evaluated before any credential is resolved. A denied key cannot be accessed regardless of other policy.
+
+**Domain allowlist:** deny-by-default. Every target domain must be explicitly authorized. Unauthorized domains are blocked before credential resolution.
+
+**Secret-level policy:** per-secret domain + method rules evaluated. Actions: `allow`, `deny`, or `request_permission` (holds the request open for interactive developer approval).
 
 **SSRF protection:** private IP ranges, localhost, and non-HTTPS targets are blocked at the proxy level.
+
+**Response body redaction:** if an external API echoes the injected credential in its response body, the proxy replaces it with `[REDACTED_BY_AGENTSECRETS]` before the response reaches the agent. Catches exact matches, API-truncated variants (e.g. `RESTRICT*DDUH`), URL-encoded forms, JSON-escaped forms, and long-prefix leaks.
 
 **Session token:** generated at proxy startup, required on every request. Blocks rogue processes on the same machine from using the proxy.
 
@@ -335,6 +391,7 @@ agentsecrets workspace allowlist log   # view blocked attempts
 | Key storage | OS keychain (macOS Keychain, Windows Credential Manager, Linux Secret Service) |
 | Transport | HTTPS / TLS |
 | Server | Stores ciphertext only, structurally cannot decrypt |
+| Audit chain | SHA-256 hash chaining (tamper-evident) |
 
 ---
 
@@ -466,16 +523,21 @@ agentsecrets secrets pull
 agentsecrets secrets delete KEY
 agentsecrets secrets diff
 agentsecrets secrets diff --from X --to Y
+agentsecrets secrets policy set KEY --rule "domain:METHOD=action"
+agentsecrets secrets policy get KEY
+agentsecrets secrets policy delete KEY
 ```
 
 ### Proxy and Calls
 ```bash
 agentsecrets call --url URL --bearer KEY
-agentsecrets proxy start [--port 8765] [--allow-local-http]
+agentsecrets proxy start [--port 8765]
 agentsecrets proxy status
 agentsecrets proxy stop
+agentsecrets proxy approve <SECRET_KEY> <METHOD> <DOMAIN>
 agentsecrets proxy rotate-session
 agentsecrets proxy logs [--last N] [--watch] [--env ENV]
+agentsecrets proxy sync
 agentsecrets mcp serve
 agentsecrets mcp install
 agentsecrets exec
@@ -496,8 +558,11 @@ agentsecrets logs watch               # Live stream audit entries
 ### Agent Identity
 ```bash
 agentsecrets agent list
+agentsecrets agent register <name>
 agentsecrets agent delete <n>
-agentsecrets agent token issue <n>
+agentsecrets agent policy set <name> --allow KEY --deny KEY
+agentsecrets agent policy get <name>
+agentsecrets agent token issue <n> [--env ENV] [--expires-in 30d]
 agentsecrets agent token list <n>
 agentsecrets agent token revoke <id> --agent="<n>"
 ```
@@ -510,14 +575,20 @@ agentsecrets agent token revoke <id> --agent="<n>"
 - [x] Zero-knowledge cloud sync
 - [x] Credential proxy with 6 auth styles
 - [x] Workspaces, projects, team invites
-- [x] MCP server (Claude Desktop, Cursor)
+- [x] MCP server (Claude Desktop, Cursor) — 19 tools
 - [x] HTTP proxy server
 - [x] OpenClaw skill + exec provider
-- [x] Governance audit log
+- [x] Forensic governance audit log (SHA-256 chain, verify, replay)
 - [x] Agent identity + token management
+- [x] Agent capabilities (allow/deny per token)
+- [x] Secret-level policies (domain + method rules, request_permission)
+- [x] Interactive approval flow (immediate prompt, no re-run required)
 - [x] Environment support (development / staging / production)
-- [x] Domain allowlist + response body redaction
-- [x] `agentsecrets env` for environment variable injection
+- [x] Domain allowlist + enhanced response body redaction
+- [x] SSRF & DNS rebinding protection
+- [x] `agentsecrets env` for environment variable injection + stdout/stderr redaction
+- [x] Zero-disk configuration (all keys in OS keychain)
+- [x] Transient proxy (always-on security)
 - [x] Python SDK
 - [x] Zero-Knowledge MCP Template
 - [x] Multi-platform binaries (macOS, Linux, Windows)
@@ -538,10 +609,10 @@ agentsecrets agent token revoke <id> --agent="<n>"
 AgentSecrets delegates authentication and cryptography to the user's local OS keychain (macOS Keychain, Windows Credential Manager, Linux Secret Service). Be mindful of which workspace and environment you configure for your agents, as they will have access to any credentials provisioned in that specific scope. However, unwanted actions and API calls are heavily mitigated by the domain allowlist, which bounds where agents can send those credentials.
 
 ### Audit Logging Privacy
-Every proxy call is recorded in a persistent audit log (locally at `~/.agentsecrets/proxy.log` and globally in the cloud). The log records endpoints, timestamps, and key names (e.g., `STRIPE_KEY`), but never the actual values. **Do not put sensitive data in the key names themselves.**
+Every proxy call is recorded in a persistent audit log (locally at `~/.agentsecrets/audit.db` and globally in the cloud). The log records endpoints, timestamps, and key names (e.g., `STRIPE_KEY`), but never the actual values. **Do not put sensitive data in the key names themselves.**
 
 ### Supply Chain Security
-Your security depends on the integrity of the installed `agentsecrets` package. We strongly recommend installing from official sources (like Homebrew) which verify package hashes, or using pinned versions for `go install` (e.g., `@v2.0.0` instead of `@latest`) to mitigate upstream supply chain poisoning.
+Your security depends on the integrity of the installed `agentsecrets` package. We strongly recommend installing from official sources (like Homebrew) which verify package hashes, or using pinned versions for `go install` (e.g., `@v3.0.0` instead of `@latest`) to mitigate upstream supply chain poisoning.
 
 Vulnerabilities: do NOT open public issues.
 Email: engineering@theseventeen.co, response within 24 hours.
@@ -568,11 +639,11 @@ Want to contribute? [CONTRIBUTING.md](docs/CONTRIBUTING.md)
 
 - **Website**: [agentsecrets.theseventeen.co](https://agentsecrets.theseventeen.co)
 - **Docs**: [agentsecrets.theseventeen.co/docs](https://agentsecrets.theseventeen.co/docs)
-- **Engineering Blog**: [engineering.theseventeen.co/series/building-agentsecrets](engineering.theseventeen.co/series/building-agentsecrets)
-- **SDK**: [github.com/The-17/agentsecrets-sdk](github.com/The-17/agentsecrets-sdk)
-- **ClawHub**: [clawhub.ai/SteppaCodes/agentsecrets](clawhub.ai/SteppaCodes/agentsecrets)
+- **Engineering Blog**: [engineering.theseventeen.co/series/building-agentsecrets](https://engineering.theseventeen.co/series/building-agentsecrets)
+- **SDK**: [github.com/The-17/agentsecrets-sdk](https://github.com/The-17/agentsecrets-sdk)
+- **ClawHub**: [clawhub.ai/SteppaCodes/agentsecrets](https://clawhub.ai/SteppaCodes/agentsecrets)
 
-- ---
+ ---
 ## License
 MIT. See [LICENSE](LICENSE)
 

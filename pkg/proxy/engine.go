@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -30,11 +31,64 @@ func resolveEnvForAudit() string {
 	return config.ResolveEnvironment()
 }
 
+const redactionPlaceholder = "[REDACTED_BY_AGENTSECRETS]"
+
+// redactSecretFromResponse removes all detectable forms of secretValue from body.
+//
+// APIs frequently echo credentials back in error messages — sometimes verbatim,
+// sometimes truncated/masked (e.g. Stripe: "RESTRICT*DDUH", OpenAI: "sk-...xxxx").
+// A pure exact-match misses every non-verbatim form, so we build a set of candidate
+// patterns and replace all of them.
 func redactSecretFromResponse(body []byte, secretValue string) []byte {
-	if secretValue == "" {
+	if secretValue == "" || len(body) == 0 {
 		return body
 	}
-	return bytes.ReplaceAll(body, []byte(secretValue), []byte("[REDACTED_BY_AGENTSECRETS]"))
+
+	// 1. Exact match — always first, cheapest.
+	body = bytes.ReplaceAll(body, []byte(secretValue), []byte(redactionPlaceholder))
+
+	// 2. URL-encoded variant (e.g. Bearer token in a redirect echo).
+	urlEncoded := url.QueryEscape(secretValue)
+	if urlEncoded != secretValue {
+		body = bytes.ReplaceAll(body, []byte(urlEncoded), []byte(redactionPlaceholder))
+	}
+
+	// 3. JSON-string-escaped variant (e.g. backslash before quotes inside JSON).
+	jsonEscaped := strings.ReplaceAll(secretValue, `"`, `\"`)
+	if jsonEscaped != secretValue {
+		body = bytes.ReplaceAll(body, []byte(jsonEscaped), []byte(redactionPlaceholder))
+	}
+
+	// 4. Truncated/masked patterns that APIs echo in error messages.
+	// Strategy: if we find a prefix of the secret (>=6 chars) followed by any
+	// masking character(s) (* . - _ #) and optionally a suffix, redact the whole match.
+	// This catches: "RESTRICT*DDUH", "sk_live_51H***xyz", "ABCDEF...wxyz" etc.
+	if len(secretValue) >= 8 {
+		// Use the first 6 chars as an anchor (short enough to survive truncation,
+		// long enough to avoid false positives on common prefixes).
+		prefixLen := 6
+		if len(secretValue) >= 16 {
+			prefixLen = 8
+		}
+		escapedPrefix := regexp.QuoteMeta(secretValue[:prefixLen])
+		// Pattern: <prefix>[mask chars][any non-whitespace/quote chars up to ~30 chars]
+		// We stop at whitespace, quote, or common JSON terminators to avoid over-redaction.
+		pattern := escapedPrefix + `[\*\.\-_#]{1,4}[^\s"'\\,}\]]{0,30}`
+		if re, err := regexp.Compile(pattern); err == nil {
+			body = re.ReplaceAll(body, []byte(redactionPlaceholder))
+		}
+	}
+
+	// 5. Prefix-only leak: sometimes APIs echo just the beginning of a key
+	// (e.g. "Invalid key: sk_live_51H"). Redact if >=12 char prefix appears.
+	if len(secretValue) >= 12 {
+		prefixCut := len(secretValue) * 2 / 3 // first two-thirds of the value
+		if prefixCut >= 12 {
+			body = bytes.ReplaceAll(body, []byte(secretValue[:prefixCut]), []byte(redactionPlaceholder))
+		}
+	}
+
+	return body
 }
 
 // CallRequest is the input to the engine — used by both MCP and HTTP paths.
@@ -118,6 +172,10 @@ func NewEngine(projectID string) (*Engine, error) {
 	}
 
 	apiClient := auth.NewAuthenticatedClient()
+
+	if audit != nil {
+		audit.APIClient = apiClient
+	}
 
 	eng := &Engine{
 		ProjectID:   projectID,
@@ -496,7 +554,7 @@ func (e *Engine) Execute(req CallRequest) (*CallResult, error) {
 					Method:    method,
 				}
 				if e.Approvals == nil || !e.Approvals.IsApproved(approvalKey) {
-					// Check if transient and interactive TTY
+					// Transient proxy + interactive TTY: prompt inline.
 					if e.Transient && term.IsTerminal(int(os.Stdin.Fd())) && term.IsTerminal(int(os.Stdout.Fd())) {
 						telemetry.RecordInteractivePromptShown()
 						fmt.Fprintf(os.Stdout, "\n[AgentSecrets] Secret '%s' requires approval for %s to %s.\n", inj.SecretKey, method, targetDomain)
@@ -518,20 +576,23 @@ func (e *Engine) Execute(req CallRequest) (*CallResult, error) {
 						}
 					}
 
-					// Otherwise, block and poll IsApproved for up to 30 seconds
+					// Daemon proxy: hold the HTTP connection open on a channel.
+					// The proxy terminal's approval goroutine (or /approve endpoint)
+					// will signal the channel as soon as the developer responds.
+					// No busy-waiting — the goroutine sleeps until unblocked.
 					telemetry.RecordInteractivePromptSkipped()
-					fmt.Fprintf(os.Stderr, "Secret '%s' requires approval for %s to %s — waiting up to 30s for 'agentsecrets proxy approve'...\n",
-						inj.SecretKey, method, targetDomain)
-					approved := false
-					for i := 0; i < 30; i++ {
-						time.Sleep(1 * time.Second)
-						if e.Approvals != nil && e.Approvals.IsApproved(approvalKey) {
-							approved = true
-							break
+					if e.Approvals != nil {
+						// WaitForApproval blocks until approval/denial/timeout (5 min).
+						if approved := e.Approvals.WaitForApproval(approvalKey, 5*time.Minute); !approved {
+							msg := fmt.Sprintf(
+								"Secret '%s' requires approval for %s to %s — "+
+									"approve in the proxy terminal or run: agentsecrets proxy approve %s %s %s",
+								inj.SecretKey, method, targetDomain,
+								inj.SecretKey, method, targetDomain,
+							)
+							return logBlocked("policy_approval_required", msg)
 						}
-					}
-
-					if !approved {
+					} else {
 						msg := fmt.Sprintf("Secret '%s' requires approval for %s to %s — run: agentsecrets proxy approve %s %s %s",
 							inj.SecretKey, method, targetDomain, inj.SecretKey, method, targetDomain)
 						return logBlocked("policy_approval_required", msg)
@@ -716,8 +777,8 @@ func (e *Engine) Execute(req CallRequest) (*CallResult, error) {
 			ResponseStatus:     result.StatusCode,
 		}
 		if redacted {
-			resolution.RedactionPattern = "[REDACTED_BY_AGENTSECRETS]"
-			resolution.Replacement = "[REDACTED_BY_AGENTSECRETS]"
+			resolution.RedactionPattern = redactionPlaceholder
+			resolution.Replacement = redactionPlaceholder
 		}
 		e.logForensic(req, targetDomain, method, u.Path, result.StatusCode, outcome, result.Duration.Milliseconds(), secretKeys, authStyles, enforcement, resolution)
 	}
