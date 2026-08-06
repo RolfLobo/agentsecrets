@@ -37,6 +37,26 @@ func NewTokenCache(ttl time.Duration) *TokenCache {
 	}
 }
 
+// PurgeRevoked removes any cached token whose ID or agent ID appears in the
+// given revocation list, forcing a fresh (and failing) revalidation next time.
+func (c *TokenCache) PurgeRevoked(revokedIDs []string) {
+	if len(revokedIDs) == 0 {
+		return
+	}
+	revoked := make(map[string]bool, len(revokedIDs))
+	for _, id := range revokedIDs {
+		revoked[id] = true
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for token, cached := range c.tokens {
+		if revoked[cached.TokenID] || revoked[cached.AgentID] {
+			delete(c.tokens, token)
+		}
+	}
+}
+
 type verifyResponse struct {
 	Valid        bool                           `json:"valid"`
 	Reason       string                         `json:"reason,omitempty"`

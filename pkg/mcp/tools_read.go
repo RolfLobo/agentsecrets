@@ -239,12 +239,12 @@ func getAllowlistTool() mcp.Tool {
 
 // --- Handlers ---
 
-func handleListKeys(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+func (s *Server) handleListKeys(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	args := req.GetArguments()
 	remoteFlag, _ := args["remote"].(bool)
 
 	activeEnv := config.ResolveEnvironment()
-	envs := []string{"development", "staging", "production"}
+	envs := config.ValidEnvironments
 
 	project, err := config.LoadProjectConfig()
 	if err != nil || project == nil || project.ProjectID == "" {
@@ -257,7 +257,7 @@ func handleListKeys(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallTool
 
 	var svc *secrets.Service
 	if remoteFlag {
-		svc = getSecretsService()
+		svc = s.getSecretsService()
 	}
 
 	for i, env := range envs {
@@ -305,7 +305,7 @@ func handleListKeys(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallTool
 	return jsonResult(result)
 }
 
-func handleCheckKey(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+func (s *Server) handleCheckKey(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	args := req.GetArguments()
 	keyName, _ := args["key_name"].(string)
 	if keyName == "" {
@@ -313,7 +313,7 @@ func handleCheckKey(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallTool
 	}
 
 	envParam, _ := args["environment"].(string)
-	svc := getSecretsService()
+	svc := s.getSecretsService()
 
 	type envStatus struct {
 		Exists    bool   `json:"exists"`
@@ -323,7 +323,7 @@ func handleCheckKey(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallTool
 	resEnvs := make(map[string]envStatus)
 	existsAnywhere := false
 
-	envsToCheck := []string{"development", "staging", "production"}
+	envsToCheck := config.ValidEnvironments
 	if envParam != "" {
 		if !config.IsValidEnvironment(envParam) {
 			return mcp.NewToolResultError(fmt.Sprintf("invalid environment %q", envParam)), nil
@@ -357,9 +357,9 @@ func handleCheckKey(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallTool
 	})
 }
 
-func handleGetCoverage(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	svc := getSecretsService()
-	envs := []string{"development", "staging", "production"}
+func (s *Server) handleGetCoverage(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	svc := s.getSecretsService()
+	envs := config.ValidEnvironments
 	lists := make(map[string][]secrets.SecretMetadata)
 	allUniqueKeys := make(map[string]bool)
 
@@ -456,7 +456,7 @@ func handleGetCoverage(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallT
 	})
 }
 
-func handleGetStatus(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+func (s *Server) handleGetStatus(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	pc, _ := config.LoadProjectConfig()
 
 	// --- Authentication & Session ---
@@ -539,7 +539,7 @@ func handleGetStatus(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToo
 	// --- Secrets Sync (matches CLI DiffCached) ---
 	secretsData := map[string]interface{}{}
 	if pc != nil && pc.ProjectID != "" {
-		svc := getSecretsService()
+		svc := s.getSecretsService()
 		diff, diffErr := svc.DiffCached("", "")
 		if diffErr == nil {
 			syncedCount := len(diff.Unchanged)
@@ -592,7 +592,7 @@ func handleGetStatus(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToo
 	})
 }
 
-func handleGetEnvironment(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+func (s *Server) handleGetEnvironment(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	env, source := config.ResolveEnvironmentWithSource()
 	pc, _ := config.LoadProjectConfig()
 
@@ -612,7 +612,7 @@ func handleGetEnvironment(ctx context.Context, req mcp.CallToolRequest) (*mcp.Ca
 	})
 }
 
-func handleDiffSecrets(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+func (s *Server) handleDiffSecrets(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	args := req.GetArguments()
 	envParam, _ := args["environment"].(string)
 
@@ -625,7 +625,7 @@ func handleDiffSecrets(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallT
 		return mcp.NewToolResultError(fmt.Sprintf("invalid environment %q", env)), nil
 	}
 
-	svc := getSecretsService()
+	svc := s.getSecretsService()
 	diff, err := svc.Diff("", env)
 	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("diff failed: %v", err)), nil
@@ -654,7 +654,7 @@ func handleDiffSecrets(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallT
 	})
 }
 
-func handleDiffEnvironments(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+func (s *Server) handleDiffEnvironments(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	args := req.GetArguments()
 	source, _ := args["source"].(string)
 	target, _ := args["target"].(string)
@@ -667,7 +667,7 @@ func handleDiffEnvironments(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 		return mcp.NewToolResultError("invalid source or target environment"), nil
 	}
 
-	svc := getSecretsService()
+	svc := s.getSecretsService()
 	srcList, err := svc.ListForEnv(source)
 	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("failed to list keys for source: %v", err)), nil
@@ -721,7 +721,7 @@ func handleDiffEnvironments(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 	})
 }
 
-func handleGetProxyLogs(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+func (s *Server) handleGetProxyLogs(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	args := req.GetArguments()
 	keyName, _ := args["key_name"].(string)
 	domain, _ := args["domain"].(string)
@@ -742,7 +742,7 @@ func handleGetProxyLogs(ctx context.Context, req mcp.CallToolRequest) (*mcp.Call
 		}
 	}
 
-	logSvc, err := log.NewService(getAPIClient(), nil)
+	logSvc, err := log.NewService(s.getAPIClient(), nil)
 	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("failed to init log service: %v", err)), nil
 	}
@@ -768,7 +768,7 @@ func handleGetProxyLogs(ctx context.Context, req mcp.CallToolRequest) (*mcp.Call
 	return jsonResult(toSafeProxyLogs(events))
 }
 
-func handleGetBlockedRequests(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+func (s *Server) handleGetBlockedRequests(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	args := req.GetArguments()
 	limitStr, _ := args["limit"].(string)
 
@@ -779,7 +779,7 @@ func handleGetBlockedRequests(ctx context.Context, req mcp.CallToolRequest) (*mc
 		}
 	}
 
-	logSvc, err := log.NewService(getAPIClient(), nil)
+	logSvc, err := log.NewService(s.getAPIClient(), nil)
 	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("failed to init log service: %v", err)), nil
 	}
@@ -803,7 +803,7 @@ func handleGetBlockedRequests(ctx context.Context, req mcp.CallToolRequest) (*mc
 	return jsonResult(toSafeProxyLogs(events))
 }
 
-func handleGetRedactionEvents(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+func (s *Server) handleGetRedactionEvents(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	args := req.GetArguments()
 	limitStr, _ := args["limit"].(string)
 
@@ -814,7 +814,7 @@ func handleGetRedactionEvents(ctx context.Context, req mcp.CallToolRequest) (*mc
 		}
 	}
 
-	logSvc, err := log.NewService(getAPIClient(), nil)
+	logSvc, err := log.NewService(s.getAPIClient(), nil)
 	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("failed to init log service: %v", err)), nil
 	}
@@ -838,8 +838,8 @@ func handleGetRedactionEvents(ctx context.Context, req mcp.CallToolRequest) (*mc
 	return jsonResult(toSafeProxyLogs(events))
 }
 
-func handleGetAuditSummary(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	logSvc, err := log.NewService(getAPIClient(), nil)
+func (s *Server) handleGetAuditSummary(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	logSvc, err := log.NewService(s.getAPIClient(), nil)
 	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("failed to init log service: %v", err)), nil
 	}
@@ -917,7 +917,7 @@ func handleGetAuditSummary(ctx context.Context, req mcp.CallToolRequest) (*mcp.C
 	})
 }
 
-func handleGetAgentIdentity(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+func (s *Server) handleGetAgentIdentity(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	agentTokenSet := os.Getenv("AS_AGENT_TOKEN") != ""
 	keychainConfigured := keychainauth.IsFullyConfigured()
 	authenticated := config.IsAuthenticated()
@@ -931,13 +931,13 @@ func handleGetAgentIdentity(ctx context.Context, req mcp.CallToolRequest) (*mcp.
 	})
 }
 
-func handleGetAllowlist(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+func (s *Server) handleGetAllowlist(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	pc, err := config.LoadProjectConfig()
 	if err != nil || pc.WorkspaceID == "" {
 		return mcp.NewToolResultError("no workspace configured — run 'agentsecrets init' first"), nil
 	}
 
-	wsSvc := getWorkspaceService()
+	wsSvc := s.getWorkspaceService()
 	domainsResp, err := wsSvc.ListAllowlist(pc.WorkspaceID)
 	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("failed to fetch allowlist: %v", err)), nil
@@ -955,7 +955,7 @@ func handleGetAllowlist(ctx context.Context, req mcp.CallToolRequest) (*mcp.Call
 	})
 }
 
-func handleCheckDomain(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+func (s *Server) handleCheckDomain(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	args := req.GetArguments()
 	domain, _ := args["domain"].(string)
 	if domain == "" {
@@ -967,7 +967,7 @@ func handleCheckDomain(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallT
 		return mcp.NewToolResultError("no workspace configured — run 'agentsecrets init' first"), nil
 	}
 
-	wsSvc := getWorkspaceService()
+	wsSvc := s.getWorkspaceService()
 	domainsResp, err := wsSvc.ListAllowlist(pc.WorkspaceID)
 	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("failed to fetch allowlist: %v", err)), nil
@@ -996,13 +996,13 @@ func handleCheckDomain(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallT
 	return jsonResult(res)
 }
 
-func handleListAgentTokens(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+func (s *Server) handleListAgentTokens(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	pc, err := config.LoadProjectConfig()
 	if err != nil || pc.WorkspaceID == "" {
 		return mcp.NewToolResultError("no workspace configured — run 'agentsecrets init' first"), nil
 	}
 
-	svc := agents.NewService(getAPIClient())
+	svc := agents.NewService(s.getAPIClient())
 	agentList, err := svc.List(pc.WorkspaceID, "")
 	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("failed to list agents: %v", err)), nil

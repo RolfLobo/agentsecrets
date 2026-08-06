@@ -2,7 +2,6 @@
 package agents
 
 import (
-	"encoding/json"
 	"fmt"
 	"time"
 
@@ -89,23 +88,11 @@ func (s *Service) Register(req RegisterRequest) (*RegisterResponse, error) {
 		urlParams["project_id"] = req.ProjectID
 	}
 
-	resp, err := s.client.Call(endpointKey, "POST", req, urlParams, nil)
+	resp, err := api.CallJSON[RegisterResponse](s.client, endpointKey, "POST", req, urlParams, nil)
 	if err != nil {
-		return nil, fmt.Errorf("failed to register agent request: %w", err)
+		return nil, err
 	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode >= 400 {
-		return nil, s.client.DecodeError(resp)
-	}
-
-	var wrapper struct {
-		Data RegisterResponse `json:"data"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&wrapper); err != nil {
-		return nil, fmt.Errorf("failed to decode response: %w", err)
-	}
-	return &wrapper.Data, nil
+	return &resp, nil
 }
 
 // List returns agents scoped to the given workspace (or project if projectID is non-empty).
@@ -121,23 +108,7 @@ func (s *Service) List(workspaceID, projectID string) ([]Agent, error) {
 		urlParams["project_id"] = projectID
 	}
 
-	resp, err := s.client.Call(endpointKey, "GET", nil, urlParams, nil)
-	if err != nil {
-		return nil, fmt.Errorf("failed to list agents: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode >= 400 {
-		return nil, s.client.DecodeError(resp)
-	}
-
-	var wrapper struct {
-		Data []Agent `json:"data"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&wrapper); err != nil {
-		return nil, fmt.Errorf("failed to decode response: %w", err)
-	}
-	return wrapper.Data, nil
+	return api.CallJSON[[]Agent](s.client, endpointKey, "GET", nil, urlParams, nil)
 }
 
 // ListAll returns all agents in the workspace, including project-scoped ones.
@@ -150,23 +121,7 @@ func (s *Service) ListAll(workspaceID string) ([]Agent, error) {
 	urlParams := map[string]string{"workspace_id": workspaceID}
 	queryParams := map[string]string{"include_projects": "true"}
 
-	resp, err := s.client.Call(endpointKey, "GET", nil, urlParams, queryParams)
-	if err != nil {
-		return nil, fmt.Errorf("failed to list all agents: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode >= 400 {
-		return nil, s.client.DecodeError(resp)
-	}
-
-	var wrapper struct {
-		Data []Agent `json:"data"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&wrapper); err != nil {
-		return nil, fmt.Errorf("failed to decode response: %w", err)
-	}
-	return wrapper.Data, nil
+	return api.CallJSON[[]Agent](s.client, endpointKey, "GET", nil, urlParams, queryParams)
 }
 
 // GetByName returns an agent by its exact name within the given workspace.
@@ -216,68 +171,31 @@ func (s *Service) GetByName(workspaceID, name string) (*Agent, error) {
 
 // TokenIssue issues a new token for an existing agent.
 func (s *Service) TokenIssue(workspaceID, registrationID string, req IssueTokenRequest) (*IssueTokenResponse, error) {
-	resp, err := s.client.Call("agents.token_issue", "POST", req, map[string]string{
+	resp, err := api.CallJSON[IssueTokenResponse](s.client, "agents.token_issue", "POST", req, map[string]string{
 		"workspace_id":    workspaceID,
 		"registration_id": registrationID,
 	}, nil)
 	if err != nil {
-		return nil, fmt.Errorf("failed to issue token request: %w", err)
+		return nil, err
 	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode >= 400 {
-		return nil, s.client.DecodeError(resp)
-	}
-
-	var wrapper struct {
-		Data IssueTokenResponse `json:"data"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&wrapper); err != nil {
-		return nil, fmt.Errorf("failed to decode response: %w", err)
-	}
-	return &wrapper.Data, nil
+	return &resp, nil
 }
 
 // TokenList lists all tokens for an agent.
 func (s *Service) TokenList(workspaceID, registrationID string) ([]Token, error) {
-	resp, err := s.client.Call("agents.token_list", "GET", nil, map[string]string{
+	return api.CallJSON[[]Token](s.client, "agents.token_list", "GET", nil, map[string]string{
 		"workspace_id":    workspaceID,
 		"registration_id": registrationID,
 	}, nil)
-	if err != nil {
-		return nil, fmt.Errorf("failed to list tokens: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode >= 400 {
-		return nil, s.client.DecodeError(resp)
-	}
-
-	var wrapper struct {
-		Data []Token `json:"data"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&wrapper); err != nil {
-		return nil, fmt.Errorf("failed to decode response: %w", err)
-	}
-	return wrapper.Data, nil
 }
 
 // TokenRevoke revokes a single token.
 func (s *Service) TokenRevoke(workspaceID, registrationID string, tokenID string) error {
-	resp, err := s.client.Call("agents.token_revoke", "DELETE", nil, map[string]string{
+	return s.client.CallNoContent("agents.token_revoke", "DELETE", nil, map[string]string{
 		"workspace_id":    workspaceID,
 		"registration_id": registrationID,
 		"token_id":        tokenID,
 	}, nil)
-	if err != nil {
-		return fmt.Errorf("failed to revoke token: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode >= 400 {
-		return s.client.DecodeError(resp)
-	}
-	return nil
 }
 
 // TokenRevokeAll revokes all active tokens for an agent by listing then deleting each.
@@ -307,65 +225,32 @@ func (s *Service) Delete(workspaceID, registrationID string) error {
 		return fmt.Errorf("failed to revoke tokens before delete: %w", err)
 	}
 
-	resp, err := s.client.Call("agents.delete", "DELETE", nil, map[string]string{
+	return s.client.CallNoContent("agents.delete", "DELETE", nil, map[string]string{
 		"workspace_id":    workspaceID,
 		"registration_id": registrationID,
 	}, nil)
-	if err != nil {
-		return fmt.Errorf("failed to delete agent registration: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode >= 400 {
-		return s.client.DecodeError(resp)
-	}
-	return nil
 }
 
 // GetCapabilities retrieves the agent's capabilities restrictions.
 func (s *Service) GetCapabilities(workspaceID, registrationID string) (*capabilities.AgentCapabilities, error) {
-	resp, err := s.client.Call("agents.get_capabilities", "GET", nil, map[string]string{
+	resp, err := api.CallJSON[capabilities.AgentCapabilities](s.client, "agents.get_capabilities", "GET", nil, map[string]string{
 		"workspace_id":    workspaceID,
 		"registration_id": registrationID,
 	}, nil)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get agent capabilities: %w", err)
+		return nil, err
 	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode >= 400 {
-		return nil, s.client.DecodeError(resp)
-	}
-
-	var wrapper struct {
-		Data capabilities.AgentCapabilities `json:"data"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&wrapper); err != nil {
-		return nil, fmt.Errorf("failed to decode capabilities response: %w", err)
-	}
-	return &wrapper.Data, nil
+	return &resp, nil
 }
 
 // SetCapabilities updates the agent's capabilities restrictions.
 func (s *Service) SetCapabilities(workspaceID, registrationID string, caps capabilities.AgentCapabilities) (*capabilities.AgentCapabilities, error) {
-	resp, err := s.client.Call("agents.set_capabilities", "PUT", caps, map[string]string{
+	resp, err := api.CallJSON[capabilities.AgentCapabilities](s.client, "agents.set_capabilities", "PUT", caps, map[string]string{
 		"workspace_id":    workspaceID,
 		"registration_id": registrationID,
 	}, nil)
 	if err != nil {
-		return nil, fmt.Errorf("failed to set agent capabilities: %w", err)
+		return nil, err
 	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode >= 400 {
-		return nil, s.client.DecodeError(resp)
-	}
-
-	var wrapper struct {
-		Data capabilities.AgentCapabilities `json:"data"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&wrapper); err != nil {
-		return nil, fmt.Errorf("failed to decode capabilities response: %w", err)
-	}
-	return &wrapper.Data, nil
+	return &resp, nil
 }

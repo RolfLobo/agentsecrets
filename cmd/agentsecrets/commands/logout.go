@@ -46,7 +46,7 @@ var logoutCmd = &cobra.Command{
 			}
 		}
 
-		if err := authService.Logout(); err != nil {
+		if err := app.Auth().Logout(); err != nil {
 			ui.Error("Logout failed: " + err.Error())
 			return nil
 		}

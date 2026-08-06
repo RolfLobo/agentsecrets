@@ -130,8 +130,8 @@ var statusCmd = &cobra.Command{
 			secretsDisplay := "Unable to calculate"
 			if !isAuthenticated {
 				secretsDisplay = "Login to view"
-			} else if secretsService != nil {
-				diff, diffErr := secretsService.DiffCached("", "")
+			} else {
+				diff, diffErr := app.Secrets().DiffCached("", "")
 				if diffErr != nil {
 					secretsDisplay = fmt.Sprintf("Could not check (%s)", diffErr.Error())
 				} else {

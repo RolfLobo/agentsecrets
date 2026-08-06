@@ -54,13 +54,6 @@ const (
 	reasonInternalError      reasonCode = "internal_error"
 )
 
-// envelope is used for initial JSON unmarshalling to determine message type.
-type envelope struct {
-	Type   string     `json:"type"`
-	Status string     `json:"status,omitempty"`
-	Reason reasonCode `json:"reason,omitempty"`
-}
-
 // request is the single generalized structure sent to the daemon.
 type request struct {
 	Type       string            `json:"type"`

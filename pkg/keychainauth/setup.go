@@ -51,7 +51,80 @@ func AutoSetup() error {
 	return nil
 }
 
-const RequiredDaemonVersion = "2.2.0"
+// RequiredDaemonVersion is the minimum keychain-auth daemon this build accepts,
+// pinned to the daemon version co-released with it. Any older daemon fails the
+// compareVersions check in EnsureInstalled and is upgraded to the latest release,
+// so a daemon binary change always reaches users rather than leaving a stale
+// daemon in place.
+const RequiredDaemonVersion = "3.2.0"
+
+// findBestDaemon returns the path to the highest-priority installed keychain-auth
+// binary (mirroring EnsureInstalled's search order), or "" if none is found.
+func findBestDaemon() string {
+	homeDir, _ := os.UserHomeDir()
+	binaryName := "keychain-auth"
+	if runtime.GOOS == "windows" {
+		binaryName = "keychain-auth.exe"
+	}
+	candidates := []string{}
+	if runtime.GOOS == "linux" {
+		candidates = append(candidates, "/usr/local/bin/keychain-auth")
+	}
+	candidates = append(candidates,
+		filepath.Join(homeDir, "go", "bin", binaryName),
+		filepath.Join(homeDir, ".local", "bin", binaryName),
+	)
+	if p, err := exec.LookPath(binaryName); err == nil {
+		candidates = append(candidates, p)
+	}
+	for _, p := range candidates {
+		if _, err := os.Stat(p); err == nil {
+			return p
+		}
+	}
+	return ""
+}
+
+// DaemonUpdateNeeded reports whether the installed keychain-auth binary is
+// missing or older than RequiredDaemonVersion. It is a cheap, read-only check
+// (a stat plus one `--version` exec) used to gate the heavier EnsureDaemonUpToDate
+// path — and its sudo prompt — so it only runs when an update is actually due.
+func DaemonUpdateNeeded() bool {
+	path := findBestDaemon()
+	if path == "" {
+		return true
+	}
+	v, err := queryInstalledVersion(path)
+	if err != nil {
+		return true
+	}
+	return compareVersions(v, RequiredDaemonVersion) < 0
+}
+
+// EnsureDaemonUpToDate installs or upgrades the keychain-auth daemon to at least
+// RequiredDaemonVersion and, when an upgrade replaced the on-disk binary, restarts
+// the running daemon so the new binary actually takes effect. brew upgrade only
+// swaps the file; the previously-started daemon process keeps serving the old
+// code until it is restarted. It is a no-op when the daemon is already current.
+func EnsureDaemonUpToDate() error {
+	if !DaemonUpdateNeeded() {
+		return nil
+	}
+	// Install/upgrade the on-disk binary to RequiredDaemonVersion.
+	if _, err := EnsureInstalled(); err != nil {
+		return err
+	}
+	// The upgrade only swapped the file; a daemon started from the old binary is
+	// still serving. Restart it so requests hit the new code. RestartDaemon kills
+	// the old process, removes the stale socket, and starts the fresh binary.
+	if err := RestartDaemon(); err != nil {
+		return fmt.Errorf("keychain-auth upgraded but daemon restart failed: %w", err)
+	}
+	// Drop our now-dead connection to the old daemon so the next request re-dials
+	// the freshly started one instead of erroring on a severed socket.
+	Close()
+	return nil
+}
 
 // EnsureInstalled checks if keychain-auth is in PATH and matches the required version.
 // If not found or outdated, attempts to install it via the platform's package manager.
@@ -105,14 +178,18 @@ func EnsureInstalled() (string, error) {
 		}
 	}
 
-	// Not installed or outdated — attempt platform-specific installation
+	// Not installed or outdated — attempt platform-specific installation.
+	// alreadyPresent distinguishes "outdated, on disk" (needs `brew upgrade`)
+	// from "missing" (needs `brew install`); `brew install` is a no-op on an
+	// already-installed formula and would leave a stale daemon in place.
+	alreadyPresent := keychainAuthOnDisk()
 	switch runtime.GOOS {
 	case "darwin":
-		return installViaBrew()
+		return installViaBrew(alreadyPresent)
 	case "linux":
 		// Try Homebrew first (Linuxbrew), then fall back to instructions
 		if _, err := exec.LookPath("brew"); err == nil {
-			return installViaBrew()
+			return installViaBrew(alreadyPresent)
 		}
 		return "", fmt.Errorf(
 			"keychain-auth is not installed.\n\n" +
@@ -134,9 +211,39 @@ func EnsureInstalled() (string, error) {
 	}
 }
 
-// installViaBrew installs keychain-auth via Homebrew and returns the binary path.
-func installViaBrew() (string, error) {
-	cmd := exec.Command("brew", "install", "The-17/tap/keychain-auth")
+// keychainAuthOnDisk reports whether keychain-auth is installed anywhere (any
+// version), used to distinguish "outdated" from "missing" so installViaBrew
+// knows whether to `brew upgrade` (for an outdated formula) or `brew install`.
+func keychainAuthOnDisk() bool {
+	if _, err := exec.LookPath("keychain-auth"); err == nil {
+		return true
+	}
+	// Check common paths even if not in PATH
+	homeDir, _ := os.UserHomeDir()
+	candidates := []string{
+		filepath.Join(homeDir, "go", "bin", "keychain-auth"),
+		filepath.Join(homeDir, ".local", "bin", "keychain-auth"),
+		"/usr/local/bin/keychain-auth",
+	}
+	for _, p := range candidates {
+		if _, err := os.Stat(p); err == nil {
+			return true
+		}
+	}
+	return false
+}
+
+// installViaBrew installs or upgrades keychain-auth via Homebrew. alreadyPresent
+// distinguishes an outdated install (needs `brew upgrade`) from a missing one
+// (needs `brew install`); `brew install` is a no-op on an already-installed
+// formula and would leave a stale daemon in place.
+func installViaBrew(alreadyPresent bool) (string, error) {
+	var cmd *exec.Cmd
+	if alreadyPresent {
+		cmd = exec.Command("brew", "upgrade", "The-17/tap/keychain-auth")
+	} else {
+		cmd = exec.Command("brew", "install", "The-17/tap/keychain-auth")
+	}
 	cmd.Env = append(os.Environ(), "HOMEBREW_NO_SANDBOX=1")
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
@@ -151,22 +258,36 @@ func installViaBrew() (string, error) {
 		)
 	}
 
+	// Verify the installed version now meets the requirement
 	path, err := exec.LookPath("keychain-auth")
 	if err != nil {
 		return "", fmt.Errorf("keychain-auth installed but not found in PATH: %w", err)
 	}
+	installedVer, verErr := queryInstalledVersion(path)
+	if verErr != nil || compareVersions(installedVer, RequiredDaemonVersion) < 0 {
+		return "", fmt.Errorf(
+			"keychain-auth was installed but is still version %s, below required %s.\n"+
+				"Try updating Homebrew and re-running:\n"+
+				"  brew update\n"+
+				"  brew upgrade The-17/tap/keychain-auth",
+			installedVer, RequiredDaemonVersion,
+		)
+	}
 	return path, nil
 }
 
-// IsFullyConfigured returns true if the current binary is registered and has proper namespaces allowed.
+// IsFullyConfigured reports whether this binary is not merely connected but
+// actually accepted by the daemon — i.e. registered with a hash that matches.
+// A connect-only check is insufficient: the daemon accepts the socket connection
+// even for an unregistered binary and only denies at request time, so we issue
+// one verification request. This is what lets EnsureRegistered detect a freshly
+// upgraded (and therefore unregistered) binary and re-authorize it, rather than
+// short-circuiting on a successful-but-unverified connection.
 func IsFullyConfigured() bool {
-	if IsInitialized() {
-		return true
+	if err := Init(); err != nil {
+		return false
 	}
-	if err := Init(); err == nil {
-		return true
-	}
-	return false
+	return Verify() == nil
 }
 
 // EnsureRegistered registers the current AgentSecrets binary with keychain-auth.

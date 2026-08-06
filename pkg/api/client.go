@@ -7,6 +7,7 @@ package api
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -74,6 +75,7 @@ var endpointMap = map[string]map[string]string{
 		"get_capabilities": "workspaces/{workspace_id}/agents/{registration_id}/capabilities/",
 		"set_capabilities": "workspaces/{workspace_id}/agents/{registration_id}/capabilities/",
 		"token_validate":   "internal/agents/verify/",
+		"token_revoked":    "workspaces/{workspace_id}/agents/revoked-tokens/",
 	},
 	"log": {
 		"list":    "audit/logs/",
@@ -129,6 +131,21 @@ func (c *Client) SetRefreshTokenCallback(f func() (string, error)) {
 	c.refreshFn = f
 }
 
+// Clone returns a copy of the client with a fresh HTTP client (and thus a
+// fresh internal mutex, avoiding copylocks). The shared token callbacks are
+// intentionally carried over — they are read-only here. The clone starts with
+// a zero-value refresh mutex, which is correct since it guards only its own
+// (non-shared) refresh state.
+func (c *Client) Clone() *Client {
+	httpClone := *c.HTTPClient
+	return &Client{
+		BaseURL:    c.BaseURL,
+		HTTPClient: &httpClone,
+		getToken:   c.getToken,
+		refreshFn:  c.refreshFn,
+	}
+}
+
 // Call makes an API request to the specified endpoint.
 //
 // endpointKey uses dot notation like "auth.login" or "secrets.get".
@@ -137,6 +154,14 @@ func (c *Client) SetRefreshTokenCallback(f func() (string, error)) {
 // urlParams are substituted into the endpoint path template.
 // queryParams are added as ?key=value to the URL.
 func (c *Client) Call(endpointKey, method string, data interface{}, urlParams map[string]string, queryParams map[string]string) (*http.Response, error) {
+	return c.CallCtx(context.Background(), endpointKey, method, data, urlParams, queryParams)
+}
+
+// CallCtx is Call with an explicit context. The context is attached to the
+// outbound request (and to the refresh-retry request), so a cancelled or
+// timed-out caller — e.g. an MCP handler whose ctx is cancelled — aborts the
+// in-flight HTTP call instead of blocking until the client's own timeout.
+func (c *Client) CallCtx(ctx context.Context, endpointKey, method string, data interface{}, urlParams map[string]string, queryParams map[string]string) (*http.Response, error) {
 	// Resolve the endpoint path
 	path, err := c.resolveEndpoint(endpointKey, urlParams)
 	if err != nil {
@@ -178,7 +203,7 @@ func (c *Client) Call(endpointKey, method string, data interface{}, urlParams ma
 	httpMethod := strings.ToUpper(method)
 
 	// Build and send the request
-	resp, err := c.doRequest(httpMethod, url, jsonData)
+	resp, err := c.doRequest(ctx, httpMethod, url, jsonData, "")
 	if err != nil {
 		return nil, err
 	}
@@ -187,6 +212,9 @@ func (c *Client) Call(endpointKey, method string, data interface{}, urlParams ma
 	// Public endpoints (auth.login, auth.refresh, telemetry.sync) are excluded
 	// to prevent infinite refresh loops since auth.refresh is itself public.
 	if resp.StatusCode == 401 && !publicEndpoints[endpointKey] && c.refreshFn != nil {
+		// Buffer the first 401 body so we can return it if refresh fails,
+		// instead of replaying a potentially non-idempotent request.
+		bodyBytes, readErr := io.ReadAll(resp.Body)
 		resp.Body.Close()
 
 		// Thread-safe token refresh execution
@@ -195,58 +223,118 @@ func (c *Client) Call(endpointKey, method string, data interface{}, urlParams ma
 		c.refreshMu.Unlock()
 
 		if refreshErr != nil {
-			// Refresh failed — re-issue the original request so the caller
-			// gets a proper 401 response body to inspect.
-			return c.doRequest(httpMethod, url, jsonData)
+			if readErr != nil {
+				return nil, fmt.Errorf("token refresh failed: %w (and failed to read 401 body: %v)", refreshErr, readErr)
+			}
+			// Return the buffered 401 response so the caller gets the real error body.
+			resp.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+			resp.ContentLength = int64(len(bodyBytes))
+			return resp, nil
 		}
 
 		// Retry with the freshly minted token
-		return c.doRequestWithToken(httpMethod, url, jsonData, newToken)
+		return c.doRequest(ctx, httpMethod, url, jsonData, newToken)
 	}
 
 	return resp, nil
 }
 
-// doRequest builds and sends an HTTP request, attaching the current token.
-func (c *Client) doRequest(method, url string, jsonData []byte) (*http.Response, error) {
-	var body io.Reader
-	if jsonData != nil {
-		body = bytes.NewBuffer(jsonData)
+// okStatus reports whether code is an acceptable success status. When okCodes is
+// empty, any 2xx is accepted; otherwise code must be one of okCodes.
+func okStatus(code int, okCodes []int) bool {
+	if len(okCodes) == 0 {
+		return code >= 200 && code < 300
 	}
-
-	req, err := http.NewRequest(method, url, body)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create request: %w", err)
-	}
-
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "application/json")
-
-	if c.getToken != nil {
-		token := c.getToken()
-		if token != "" {
-			req.Header.Set("Authorization", "Bearer "+token)
+	for _, c := range okCodes {
+		if code == c {
+			return true
 		}
 	}
-
-	return c.HTTPClient.Do(req)
+	return false
 }
 
-// doRequestWithToken builds and sends an HTTP request with a specific token.
-func (c *Client) doRequestWithToken(method, url string, jsonData []byte, token string) (*http.Response, error) {
+// CallJSON performs an API request and decodes the JSON response body into T.
+//
+// It collapses the request → error-check → defer Close → status-check → decode
+// boilerplate that was duplicated across ~40 call sites. The API wraps payloads
+// in {"data": ...}; CallJSON unwraps that envelope and returns the inner value.
+//
+// okCodes optionally restricts the accepted status codes; when omitted, any 2xx
+// is treated as success. On a non-OK status the decoded API error is returned
+// (via DecodeError) so callers keep the same error surface as before.
+func CallJSON[T any](c *Client, endpointKey, method string, data interface{}, urlParams, queryParams map[string]string, okCodes ...int) (T, error) {
+	return CallJSONCtx[T](context.Background(), c, endpointKey, method, data, urlParams, queryParams, okCodes...)
+}
+
+// CallJSONCtx is CallJSON with an explicit context threaded to the HTTP request.
+func CallJSONCtx[T any](ctx context.Context, c *Client, endpointKey, method string, data interface{}, urlParams, queryParams map[string]string, okCodes ...int) (T, error) {
+	var zero T
+	resp, err := c.CallCtx(ctx, endpointKey, method, data, urlParams, queryParams)
+	if err != nil {
+		return zero, err
+	}
+	defer resp.Body.Close()
+
+	if !okStatus(resp.StatusCode, okCodes) {
+		return zero, c.DecodeError(resp)
+	}
+
+	var wrapper struct {
+		Data T `json:"data"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&wrapper); err != nil {
+		return zero, fmt.Errorf("%s: failed to decode response: %w", endpointKey, err)
+	}
+	return wrapper.Data, nil
+}
+
+// CallNoContent performs an API request that returns no meaningful body (e.g.
+// DELETE / revoke). It handles the error-check → defer Close → status-check
+// boilerplate and discards the body. okCodes defaults to any 2xx.
+func (c *Client) CallNoContent(endpointKey, method string, data interface{}, urlParams, queryParams map[string]string, okCodes ...int) error {
+	return c.CallNoContentCtx(context.Background(), endpointKey, method, data, urlParams, queryParams, okCodes...)
+}
+
+// CallNoContentCtx is CallNoContent with an explicit context.
+func (c *Client) CallNoContentCtx(ctx context.Context, endpointKey, method string, data interface{}, urlParams, queryParams map[string]string, okCodes ...int) error {
+	resp, err := c.CallCtx(ctx, endpointKey, method, data, urlParams, queryParams)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	// Drain so the connection can be reused by keep-alive.
+	if !okStatus(resp.StatusCode, okCodes) {
+		return c.DecodeError(resp)
+	}
+	_, _ = io.Copy(io.Discard, resp.Body)
+	return nil
+}
+
+// doRequest builds and sends an HTTP request. If tokenOverride is non-empty it
+// is used as the bearer token (the refresh-retry path); otherwise the current
+// token from getToken is attached when available.
+func (c *Client) doRequest(ctx context.Context, method, url string, jsonData []byte, tokenOverride string) (*http.Response, error) {
 	var body io.Reader
 	if jsonData != nil {
 		body = bytes.NewBuffer(jsonData)
 	}
 
-	req, err := http.NewRequest(method, url, body)
+	req, err := http.NewRequestWithContext(ctx, method, url, body)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create request: %w", err)
 	}
 
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
-	req.Header.Set("Authorization", "Bearer "+token)
+
+	token := tokenOverride
+	if token == "" && c.getToken != nil {
+		token = c.getToken()
+	}
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
 
 	return c.HTTPClient.Do(req)
 }

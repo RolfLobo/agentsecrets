@@ -194,11 +194,13 @@ func runCall(cmd *cobra.Command, args []string) error {
 			}
 			if msg != "" {
 				fmt.Fprintln(os.Stderr, ui.ErrorStyle.Render("x "+msg))
-				os.Exit(1)
+				// Message already rendered above; return a silent coded exit so
+				// deferred cleanup/telemetry in Execute still run.
+				return &ExitError{Code: 1, Silent: true}
 			}
 		}
 		fmt.Fprintf(os.Stderr, "%s\n%s\n", ui.ErrorStyle.Render(fmt.Sprintf("x API call failed with HTTP %d:", result.StatusCode)), string(result.Body))
-		os.Exit(1)
+		return &ExitError{Code: 1, Silent: true}
 	}
 
 	// Print response (clean stdout for piping)

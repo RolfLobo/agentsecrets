@@ -62,6 +62,12 @@ func SetSecret(projectID, environment, key, value string) error {
 	return keychainauth.SetSecret(projectID, environment, key, value)
 }
 
+// SetSecretsBatch stores multiple secrets and their policies in a single
+// keychain-auth round-trip. See keychainauth.SetSecretsBatch.
+func SetSecretsBatch(projectID, environment string, secrets map[string]string, policies map[string][]byte) (int, error) {
+	return keychainauth.SetSecretsBatch(projectID, environment, secrets, policies)
+}
+
 // GetSecret retrieves a secret value directly from the OS keychain via keychain-auth.
 func GetSecret(projectID, environment, key string) (string, error) {
 	return keychainauth.GetSecret(projectID, environment, key)

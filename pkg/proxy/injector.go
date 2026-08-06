@@ -32,6 +32,133 @@ func Inject(req *http.Request, cred string, inj Injection) error {
 	}
 }
 
+// InjectAll applies every injection to the outbound request in one pass.
+//
+// Header/query/bearer/basic styles are cheap per-injection. Body and form
+// styles are the expensive ones: each call re-reads and re-marshals the whole
+// body. When multiple body/form injections target the same request, doing them
+// one-by-one via Inject() means N parses + N marshals and the intermediate
+// bodies are thrown away. InjectAll groups them: it parses the raw body once,
+// applies all body and form injections in memory, then serializes once.
+//
+// The caller's Content-Type is preserved when it is already set; only a
+// missing one is defaulted based on the injection styles actually applied.
+func InjectAll(req *http.Request, creds []string, injs []Injection) error {
+	// Fast path: nothing body/form-related — behave exactly like per-injection.
+	hasBodyStyle := false
+	for _, inj := range injs {
+		if inj.Style == "body" || inj.Style == "form" {
+			hasBodyStyle = true
+			break
+		}
+	}
+	if !hasBodyStyle {
+		for i, inj := range injs {
+			if err := Inject(req, creds[i], inj); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+
+	// Snapshot the original body once. Subsequent per-injection reads must see
+	// the same bytes, not whatever the previous injection wrote.
+	var raw []byte
+	if req.Body != nil {
+		raw, _ = io.ReadAll(req.Body)
+	}
+
+	// Handle all body and form injections against an in-memory representation.
+	var bodyMap map[string]interface{}
+	var form url.Values
+	contentType := strings.ToLower(req.Header.Get("Content-Type"))
+	bodyDirty := false
+	formDirty := false
+
+	for i, inj := range injs {
+		switch inj.Style {
+		case "body":
+			if bodyMap == nil {
+				bodyMap = make(map[string]interface{})
+				if len(raw) > 0 {
+					if err := json.Unmarshal(raw, &bodyMap); err != nil {
+						return fmt.Errorf("body is not valid JSON: %w", err)
+					}
+				}
+			}
+			if err := setNested(bodyMap, inj.Target, creds[i]); err != nil {
+				return err
+			}
+			bodyDirty = true
+		case "form":
+			if form == nil {
+				form = make(url.Values)
+				if len(raw) > 0 {
+					parsed, err := url.ParseQuery(string(raw))
+					if err != nil {
+						return fmt.Errorf("body is not valid form data: %w", err)
+					}
+					form = parsed
+				}
+			}
+			form.Set(inj.Target, creds[i])
+			formDirty = true
+		default:
+			// Non-body styles apply directly to the request.
+			if err := Inject(req, creds[i], inj); err != nil {
+				return err
+			}
+		}
+	}
+
+	// Serialize each dirty representation exactly once.
+	if bodyDirty {
+		newBody, err := json.Marshal(bodyMap)
+		if err != nil {
+			return fmt.Errorf("failed to marshal body: %w", err)
+		}
+		req.Body = io.NopCloser(bytes.NewReader(newBody))
+		req.ContentLength = int64(len(newBody))
+		if contentType == "" {
+			req.Header.Set("Content-Type", "application/json")
+		}
+	}
+	if formDirty {
+		encoded := form.Encode()
+		req.Body = io.NopCloser(strings.NewReader(encoded))
+		req.ContentLength = int64(len(encoded))
+		if contentType == "" {
+			req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		}
+	}
+
+	return nil
+}
+
+// setNested sets value at a dot-separated path inside m, creating nested maps
+// as needed (shared by InjectAll and injectBody).
+func setNested(m map[string]interface{}, path, value string) error {
+	parts := strings.Split(path, ".")
+	current := m
+	for i, part := range parts {
+		if i == len(parts)-1 {
+			current[part] = value
+			return nil
+		}
+		next, ok := current[part]
+		if !ok {
+			next = make(map[string]interface{})
+			current[part] = next
+		}
+		nested, ok := next.(map[string]interface{})
+		if !ok {
+			return fmt.Errorf("body path conflict: %q is not an object", part)
+		}
+		current = nested
+	}
+	return nil
+}
+
 // injectBearer sets Authorization: Bearer <token>.
 func injectBearer(req *http.Request, token string) error {
 	if token == "" {
@@ -99,25 +226,8 @@ func injectBody(req *http.Request, value string, path string) error {
 	}
 
 	// Set value at nested path (e.g. "auth.key" → bodyMap["auth"]["key"])
-	parts := strings.Split(path, ".")
-	current := bodyMap
-	for i, part := range parts {
-		if i == len(parts)-1 {
-			// Last segment — set the value
-			current[part] = value
-		} else {
-			// Intermediate segment — create nested map if needed
-			next, ok := current[part]
-			if !ok {
-				next = make(map[string]interface{})
-				current[part] = next
-			}
-			nested, ok := next.(map[string]interface{})
-			if !ok {
-				return fmt.Errorf("body path conflict: %q is not an object", part)
-			}
-			current = nested
-		}
+	if err := setNested(bodyMap, path, value); err != nil {
+		return err
 	}
 
 	// Marshal back and replace body
@@ -127,7 +237,10 @@ func injectBody(req *http.Request, value string, path string) error {
 	}
 	req.Body = io.NopCloser(bytes.NewReader(newBody))
 	req.ContentLength = int64(len(newBody))
-	req.Header.Set("Content-Type", "application/json")
+	// Don't clobber a caller-set Content-Type; only default it when absent.
+	if req.Header.Get("Content-Type") == "" {
+		req.Header.Set("Content-Type", "application/json")
+	}
 	return nil
 }
 
@@ -161,6 +274,9 @@ func injectForm(req *http.Request, value string, key string) error {
 	encoded := form.Encode()
 	req.Body = io.NopCloser(strings.NewReader(encoded))
 	req.ContentLength = int64(len(encoded))
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	// Don't clobber a caller-set Content-Type; only default it when absent.
+	if req.Header.Get("Content-Type") == "" {
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	}
 	return nil
 }

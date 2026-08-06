@@ -191,12 +191,7 @@ func runWorkspaceSwitch(_ *cobra.Command, args []string) error {
 		return fmt.Errorf("failed to update active workspace: %w", err)
 	}
 
-	var projectID string
-	if pc, err := config.LoadProjectConfig(); err == nil && pc != nil {
-		projectID = pc.ProjectID
-	} else {
-		projectID = cfg.SelectedProjectID
-	}
+	projectID := currentProjectID()
 	_ = proxy.LogManagementEvent("SWITCH", "workspace", fmt.Sprintf("Switched active workspace to %s", cfg.Workspaces[selectedID].Name), cfg.Email, selectedID, projectID, config.ResolveEnvironment())
 
 	ui.Success(fmt.Sprintf("Switched to workspace: %s", cfg.Workspaces[selectedID].Name))
@@ -217,19 +212,14 @@ func runWorkspaceCreate(_ *cobra.Command, args []string) error {
 	}
 
 	if err := ui.Spinner(fmt.Sprintf("Creating workspace (%s)...", name), func() error {
-		return workspaceService.Create(name)
+		return app.Workspaces().Create(name)
 	}); err != nil {
 		return err
 	}
 
 	cfg, _ := config.LoadGlobalConfig()
 	newWorkspaceID := cfg.SelectedWorkspaceID
-	var projectID string
-	if pc, err := config.LoadProjectConfig(); err == nil && pc != nil {
-		projectID = pc.ProjectID
-	} else {
-		projectID = cfg.SelectedProjectID
-	}
+	projectID := currentProjectID()
 	_ = proxy.LogManagementEvent("CREATE", "workspace", fmt.Sprintf("Created workspace %s", name), cfg.Email, newWorkspaceID, projectID, config.ResolveEnvironment())
 
 	ui.Success(fmt.Sprintf("Workspace %s created and selected!", name))
@@ -296,7 +286,7 @@ func runWorkspaceInvite(_ *cobra.Command, args []string) error {
 
 	if err := ui.Spinner(spinnerMsg, func() error {
 		var e error
-		results, e = workspaceService.InviteBatch(workspaceID, emails, role)
+		results, e = app.Workspaces().InviteBatch(workspaceID, emails, role)
 		return e
 	}); err != nil {
 		return err
@@ -311,12 +301,7 @@ func runWorkspaceInvite(_ *cobra.Command, args []string) error {
 			ui.Success(fmt.Sprintf("  ✓ %s invited", r.Email))
 			hasSuccess = true
 
-			var projectID string
-			if pc, err := config.LoadProjectConfig(); err == nil && pc != nil {
-				projectID = pc.ProjectID
-			} else {
-				projectID = cfg.SelectedProjectID
-			}
+			projectID := currentProjectID()
 			_ = proxy.LogManagementEvent("INVITE", "workspace", fmt.Sprintf("Invited member %s", r.Email), cfg.Email, workspaceID, projectID, config.ResolveEnvironment())
 		}
 	}
@@ -339,7 +324,7 @@ func runWorkspaceMembers(_ *cobra.Command, _ []string) error {
 	var members []workspaces.WorkspaceMember
 	if err := ui.Spinner("Fetching members...", func() error {
 		var e error
-		members, e = workspaceService.Members(workspaceID)
+		members, e = app.Workspaces().Members(workspaceID)
 		return e
 	}); err != nil {
 		return err
@@ -382,18 +367,13 @@ func runWorkspaceRemove(_ *cobra.Command, args []string) error {
 		if err != nil {
 			return err
 		}
-		return workspaceService.RemoveMember(workspaceID, userID)
+		return app.Workspaces().RemoveMember(workspaceID, userID)
 	}); err != nil {
 		return err
 	}
 
 	cfg, _ := config.LoadGlobalConfig()
-	var projectID string
-	if pc, err := config.LoadProjectConfig(); err == nil && pc != nil {
-		projectID = pc.ProjectID
-	} else {
-		projectID = cfg.SelectedProjectID
-	}
+	projectID := currentProjectID()
 	_ = proxy.LogManagementEvent("REMOVE", "workspace", fmt.Sprintf("Removed member %s", email), cfg.Email, workspaceID, projectID, config.ResolveEnvironment())
 
 	ui.Success(fmt.Sprintf("Removed %s from workspace.", email))
@@ -401,7 +381,7 @@ func runWorkspaceRemove(_ *cobra.Command, args []string) error {
 }
 
 func getMemberUserID(workspaceID, email string) (string, error) {
-	members, err := workspaceService.Members(workspaceID)
+	members, err := app.Workspaces().Members(workspaceID)
 	if err != nil {
 		return "", fmt.Errorf("failed to fetch members: %w", err)
 	}
@@ -437,7 +417,7 @@ func runWorkspacePromote(_ *cobra.Command, args []string) error {
 		if err != nil {
 			return err
 		}
-		if err := workspaceService.UpdateRole(workspaceID, userID, "promote"); err != nil {
+		if err := app.Workspaces().UpdateRole(workspaceID, userID, "promote"); err != nil {
 			if strings.Contains(err.Error(), "403") {
 				return fmt.Errorf("only admins can change member roles")
 			}
@@ -448,12 +428,7 @@ func runWorkspacePromote(_ *cobra.Command, args []string) error {
 		return err
 	}
 
-	var projectID string
-	if pc, err := config.LoadProjectConfig(); err == nil && pc != nil {
-		projectID = pc.ProjectID
-	} else {
-		projectID = cfg.SelectedProjectID
-	}
+	projectID := currentProjectID()
 	_ = proxy.LogManagementEvent("PROMOTE", "workspace", fmt.Sprintf("Promoted member %s", email), cfg.Email, workspaceID, projectID, config.ResolveEnvironment())
 
 	ui.Success(fmt.Sprintf("%s is now an admin of %s", email, cfg.Workspaces[workspaceID].Name))
@@ -478,7 +453,7 @@ func runWorkspaceDemote(_ *cobra.Command, args []string) error {
 		if err != nil {
 			return err
 		}
-		if err := workspaceService.UpdateRole(workspaceID, userID, "demote"); err != nil {
+		if err := app.Workspaces().UpdateRole(workspaceID, userID, "demote"); err != nil {
 			if strings.Contains(err.Error(), "403") {
 				return fmt.Errorf("only admins can change member roles")
 			}
@@ -489,13 +464,8 @@ func runWorkspaceDemote(_ *cobra.Command, args []string) error {
 		return err
 	}
 
-	var projectID2 string
-	if pc, err := config.LoadProjectConfig(); err == nil && pc != nil {
-		projectID2 = pc.ProjectID
-	} else {
-		projectID2 = cfg.SelectedProjectID
-	}
-	_ = proxy.LogManagementEvent("DEMOTE", "workspace", fmt.Sprintf("Demoted member %s", email), cfg.Email, workspaceID, projectID2, config.ResolveEnvironment())
+	projectID := currentProjectID()
+	_ = proxy.LogManagementEvent("DEMOTE", "workspace", fmt.Sprintf("Demoted member %s", email), cfg.Email, workspaceID, projectID, config.ResolveEnvironment())
 
 	ui.Success(fmt.Sprintf("%s is now a member of %s", email, cfg.Workspaces[workspaceID].Name))
 	return nil
@@ -581,7 +551,7 @@ func runWorkspaceDelete(cmd *cobra.Command, args []string) error {
 	}
 
 	if err := ui.Spinner(fmt.Sprintf("Deleting workspace '%s'...", wsName), func() error {
-		return workspaceService.Delete(targetID)
+		return app.Workspaces().Delete(targetID)
 	}); err != nil {
 		ui.Error("Failed to delete workspace: " + err.Error())
 		return nil

@@ -4,7 +4,6 @@ package secrets
 import (
 	"encoding/json"
 	"fmt"
-	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -65,8 +64,13 @@ func (s *Service) BatchSet(kv map[string]string, environment string) error {
 		}
 		apiSecrets[k] = encryptedValue
 
-		// 2. Store in OS Keychain (for Proxy support)
-		_ = keyring.SetSecret(project.ProjectID, env, k, v)
+		// 2. Store in OS Keychain (for Proxy support). This is best-effort: the
+		// cloud + .env writes below are the source of truth, so a keychain miss
+		// (e.g. daemon not running) must not fail the whole set — but silently
+		// dropping it hides why the proxy later can't resolve the value, so warn.
+		if err := keyring.SetSecret(project.ProjectID, env, k, v); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: could not store %s in the OS keychain (proxy may not resolve it until next pull): %v\n", k, err)
+		}
 	}
 
 	// 3. Sync to cloud (Single bulk call with dictionary)
@@ -76,14 +80,8 @@ func (s *Service) BatchSet(kv map[string]string, environment string) error {
 		"secrets":     apiSecrets,
 	}
 
-	resp, err := s.API.Call("secrets.create", "POST", data, nil, nil)
-	if err != nil {
+	if err := s.API.CallNoContent("secrets.create", "POST", data, nil, nil); err != nil {
 		return fmt.Errorf("batch set: API call failed: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusOK {
-		return s.API.DecodeError(resp)
 	}
 
 	// 4. Write to .env
@@ -97,27 +95,6 @@ func (s *Service) BatchSet(kv map[string]string, environment string) error {
 	// Update .env.example
 	_ = s.UpdateEnvExampleFromLocal()
 
-	return nil
-}
-
-// BatchSetLocal updates local storage (keychain and .env) without calling the API.
-// Used during merge/copy flows if needed, or by Pull.
-func (s *Service) BatchSetLocal(kv map[string]string, env string) error {
-	project, err := config.LoadProjectConfig()
-	if err != nil || project.ProjectID == "" {
-		return fmt.Errorf("batch set local: no project configured")
-	}
-
-	for k, v := range kv {
-		_ = keyring.SetSecret(project.ProjectID, env, k, v)
-	}
-
-	// We only write to .env if the environment matches the current active one
-	if env == config.ResolveEnvironment() {
-		_ = s.Env.Write(kv)
-	}
-
-	_ = s.UpdateEnvExampleFromLocal()
 	return nil
 }
 
@@ -136,27 +113,15 @@ func (s *Service) Get(key string) (string, error) {
 	}
 
 	// Fallback to API
-	resp, err := s.API.Call("secrets.get", "GET", nil, map[string]string{
+	valWrapper, err := api.CallJSON[struct {
+		Value string `json:"value"`
+	}](s.API, "secrets.get", "GET", nil, map[string]string{
 		"project_id":  project.ProjectID,
 		"environment": env,
 		"key":         key,
 	}, nil)
 	if err != nil {
-		return "", fmt.Errorf("get secret: API call failed: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return "", s.API.DecodeError(resp)
-	}
-
-	var res struct {
-		Data struct {
-			Value string `json:"value"`
-		} `json:"data"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&res); err != nil {
-		return "", fmt.Errorf("get secret: decode response: %w", err)
+		return "", fmt.Errorf("get secret: %w", err)
 	}
 
 	wsKey, err := config.GetProjectWorkspaceKey()
@@ -164,13 +129,16 @@ func (s *Service) Get(key string) (string, error) {
 		return "", err
 	}
 
-	plaintext, err := crypto.DecryptSecret(res.Data.Value, wsKey)
+	plaintext, err := crypto.DecryptSecret(valWrapper.Value, wsKey)
 	if err != nil {
 		return "", fmt.Errorf("get secret: decrypt: %w", err)
 	}
 
-	// Cache in keychain
-	_ = keyring.SetSecret(project.ProjectID, env, key, plaintext)
+	// Cache in keychain (best-effort; a failure here only means the value is
+	// re-fetched next time, so surface it as a warning rather than failing).
+	if err := keyring.SetSecret(project.ProjectID, env, key, plaintext); err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: could not cache %s in the OS keychain: %v\n", key, err)
+	}
 
 	return plaintext, nil
 }
@@ -195,33 +163,21 @@ func (s *Service) ListForEnv(env string) ([]SecretMetadata, error) {
 		return nil, fmt.Errorf("list secrets: no project configured in current directory")
 	}
 
-	resp, err := s.API.Call("secrets.list", "GET", nil, map[string]string{
+	list, err := api.CallJSON[struct {
+		Secrets []SecretMetadata `json:"secrets"`
+	}](s.API, "secrets.list", "GET", nil, map[string]string{
 		"project_id": project.ProjectID,
 	}, map[string]string{
 		"environment": env,
 	})
 	if err != nil {
-		return nil, fmt.Errorf("list secrets: API call failed: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, s.API.DecodeError(resp)
-	}
-
-	var res struct {
-		Data struct {
-			Secrets []SecretMetadata `json:"secrets"`
-		} `json:"data"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&res); err != nil {
-		return nil, fmt.Errorf("list secrets: failed to parse response: %w", err)
+		return nil, fmt.Errorf("list secrets: %w", err)
 	}
 
 	// Cache the cloud secrets
-	_ = s.writeCache(project.ProjectID, env, res.Data.Secrets)
+	_ = s.writeCache(project.ProjectID, env, list.Secrets)
 
-	return res.Data.Secrets, nil
+	return list.Secrets, nil
 }
 
 // Pull downloads secrets from the cloud and updates .env + Keychain.
@@ -250,6 +206,8 @@ func (s *Service) Pull(targetKeys []string) error {
 	project, _ := config.LoadProjectConfig()
 	env := config.ResolveEnvironment()
 	secretsMap := make(map[string]string)
+	policies := make(map[string][]byte)
+
 	for _, s := range secrets {
 		if isSelective && !filter[s.Key] {
 			continue
@@ -259,17 +217,31 @@ func (s *Service) Pull(targetKeys []string) error {
 			continue
 		}
 		secretsMap[s.Key] = plaintext
-		_ = keyring.SetSecret(project.ProjectID, env, s.Key, plaintext)
 
-		// Cache secret policy locally for proxy enforcement
+		// Prepare policy for batch write
 		if s.Policy != nil && (len(s.Policy.Domains) > 0 || len(s.Policy.Methods) > 0) {
 			policyBytes, err := json.Marshal(s.Policy)
 			if err == nil {
-				_ = keyring.SetSecretPolicy(project.ProjectID, env, s.Key, policyBytes)
+				policies[s.Key] = policyBytes
 			}
 		} else {
-			_ = keyring.SetSecretPolicy(project.ProjectID, env, s.Key, nil)
+			policies[s.Key] = nil
 		}
+	}
+
+	// Batch write secrets + policies in a single round-trip
+	keychainFailures := 0
+	if len(secretsMap) > 0 {
+		if _, err := keyring.SetSecretsBatch(project.ProjectID, env, secretsMap, policies); err != nil {
+			keychainFailures = len(secretsMap) // Conservative: assume all failed
+		}
+	}
+
+	// A keychain miss during pull is why the proxy later "can't find" secrets —
+	// so don't swallow it. The .env write below still succeeds, so this stays a
+	// warning rather than a hard failure.
+	if keychainFailures > 0 {
+		fmt.Fprintf(os.Stderr, "Warning: %d secret/policy value(s) could not be written to the OS keychain; the proxy may not resolve them until keychain-auth is available.\n", keychainFailures)
 	}
 
 	telemetry.RecordSecretCount(len(secretsMap))
@@ -284,20 +256,39 @@ func (s *Service) Pull(targetKeys []string) error {
 
 	// Update project last_pull timestamp
 	project.LastPull = time.Now().Format(time.RFC3339)
-	_ = config.SaveProjectConfig(project)
+	if err := config.SaveProjectConfig(project); err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: pull succeeded but failed to update last_pull timestamp: %v\n", err)
+	}
 
 	// Pull agent policies/capabilities and cache them locally in keyring
 	if project.WorkspaceID != "" {
 		agentSvc := agents.NewService(s.API)
 		agentsList, err := agentSvc.ListAll(project.WorkspaceID)
-		if err == nil {
+		if err == nil && len(agentsList) > 0 {
+			// Fetch capabilities concurrently
+			type capResult struct {
+				name string
+				caps []byte
+			}
+			ch := make(chan capResult, len(agentsList))
 			for _, a := range agentsList {
-				caps, err := agentSvc.GetCapabilities(project.WorkspaceID, a.ID)
-				if err == nil && caps != nil {
-					capsBytes, err := json.Marshal(caps)
-					if err == nil {
-						_ = keyring.SetAgentCapabilities(a.Name, capsBytes)
+				go func(agent agents.Agent) {
+					caps, err := agentSvc.GetCapabilities(project.WorkspaceID, agent.ID)
+					if err == nil && caps != nil {
+						capsBytes, err := json.Marshal(caps)
+						if err == nil {
+							ch <- capResult{name: agent.Name, caps: capsBytes}
+							return
+						}
 					}
+					ch <- capResult{name: agent.Name, caps: nil}
+				}(a)
+			}
+			// Collect results and write to keyring
+			for range agentsList {
+				r := <-ch
+				if r.caps != nil {
+					_ = keyring.SetAgentCapabilities(r.name, r.caps)
 				}
 			}
 		}
@@ -339,6 +330,7 @@ func (s *Service) Push() error {
 	}
 
 	apiSet := make(map[string]string)
+	keychainFailures := 0
 	for k, v := range localSecrets {
 		encrypted, err := crypto.EncryptSecret(v, workspaceKey)
 		if err != nil {
@@ -346,8 +338,13 @@ func (s *Service) Push() error {
 		}
 		apiSet[k] = encrypted
 
-		// 1. Sync to keychain
-		_ = keyring.SetSecret(project.ProjectID, env, k, v)
+		// 1. Sync to keychain (best-effort; cloud + .env remain the source of truth)
+		if err := keyring.SetSecret(project.ProjectID, env, k, v); err != nil {
+			keychainFailures++
+		}
+	}
+	if keychainFailures > 0 {
+		fmt.Fprintf(os.Stderr, "Warning: %d secret(s) could not be written to the OS keychain.\n", keychainFailures)
 	}
 
 	// 2. Sync to cloud (Bulk dictionary format)
@@ -357,19 +354,15 @@ func (s *Service) Push() error {
 		"secrets":     apiSet,
 	}
 
-	resp, err := s.API.Call("secrets.create", "POST", data, nil, nil)
-	if err != nil {
+	if err := s.API.CallNoContent("secrets.create", "POST", data, nil, nil); err != nil {
 		return fmt.Errorf("push secrets: API call failed: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusOK {
-		return s.API.DecodeError(resp)
 	}
 
 	// Update project last_push timestamp
 	project.LastPush = time.Now().Format(time.RFC3339)
-	_ = config.SaveProjectConfig(project)
+	if err := config.SaveProjectConfig(project); err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: push succeeded but failed to update last_push timestamp: %v\n", err)
+	}
 
 	_ = s.UpdateEnvExampleFromLocal()
 
@@ -388,18 +381,12 @@ func (s *Service) Delete(key string) error {
 
 	// 1. Delete from API
 	env := config.ResolveEnvironment()
-	resp, err := s.API.Call("secrets.delete", "DELETE", nil, map[string]string{
+	if err := s.API.CallNoContent("secrets.delete", "DELETE", nil, map[string]string{
 		"project_id":  project.ProjectID,
 		"environment": env,
 		"key":         key,
-	}, nil)
-	if err != nil {
+	}, nil); err != nil {
 		return fmt.Errorf("delete secret: API call failed: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return s.API.DecodeError(resp)
 	}
 
 	// 2. Delete from .env
@@ -637,7 +624,7 @@ func (s *Service) UpdateEnvExampleFromLocal() error {
 		return nil
 	}
 
-	environments := []string{"development", "staging", "production"}
+	environments := config.ValidEnvironments
 	allKeys := make(map[string]bool)
 	keyEnvs := make(map[string][]string)
 
@@ -680,89 +667,6 @@ func (s *Service) UpdateEnvExampleFromLocal() error {
 
 		var annotation string
 		if allThree {
-			annotation = "[all]"
-		} else {
-			var segments []string
-			if hasDev {
-				segments = append(segments, "[development]")
-			}
-			if hasStg {
-				segments = append(segments, "[staging]")
-			}
-			if hasPrd {
-				segments = append(segments, "[production]")
-			}
-			annotation = strings.Join(segments, " ")
-		}
-
-		lines = append(lines, fmt.Sprintf("%-24s # %s", key+"=", annotation))
-	}
-
-	return s.Env.WriteEnvExample(strings.Join(lines, "\n") + "\n")
-}
-
-// UpdateEnvExample fetches secrets across development, staging, and production
-// and regenerates .env.example with correct environment scopes.
-func (s *Service) UpdateEnvExample() error {
-	project, err := config.LoadProjectConfig()
-	if err != nil || project.ProjectID == "" {
-		return nil
-	}
-
-	wsKey, err := config.GetProjectWorkspaceKey()
-	if err != nil {
-		return err
-	}
-
-	environments := []string{"development", "staging", "production"}
-	keyEnvValues := make(map[string]map[string]string)
-	allKeys := make(map[string]bool)
-
-	for _, env := range environments {
-		resp, err := s.API.Call("secrets.list", "GET", nil, map[string]string{
-			"project_id": project.ProjectID,
-		}, map[string]string{
-			"environment": env,
-		})
-
-		if err == nil && resp.StatusCode == http.StatusOK {
-			var res struct {
-				Data struct {
-					Secrets []SecretMetadata `json:"secrets"`
-				} `json:"data"`
-			}
-			if err := json.NewDecoder(resp.Body).Decode(&res); err == nil {
-				for _, secret := range res.Data.Secrets {
-					if plaintext, err := crypto.DecryptSecret(secret.Value, wsKey); err == nil {
-						if keyEnvValues[secret.Key] == nil {
-							keyEnvValues[secret.Key] = make(map[string]string)
-						}
-						keyEnvValues[secret.Key][env] = plaintext
-						allKeys[secret.Key] = true
-					}
-				}
-			}
-			resp.Body.Close()
-		}
-	}
-
-	var lines []string
-	lines = append(lines, "# AgentSecrets — generated by agentsecrets secrets pull")
-	lines = append(lines, "# Keys marked [all] exist in all three environments")
-	lines = append(lines, "# Environment-specific keys show which environments they belong to\n")
-
-	for key := range allKeys {
-		envsMap := keyEnvValues[key]
-
-		valDev, hasDev := envsMap["development"]
-		valStg, hasStg := envsMap["staging"]
-		valPrd, hasPrd := envsMap["production"]
-
-		allThree := hasDev && hasStg && hasPrd
-		sameValue := allThree && (valDev == valStg) && (valStg == valPrd)
-
-		var annotation string
-		if sameValue {
 			annotation = "[all]"
 		} else {
 			var segments []string

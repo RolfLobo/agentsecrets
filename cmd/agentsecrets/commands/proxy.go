@@ -2,11 +2,13 @@ package commands
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
+	"os/signal"
 	"strings"
 	"syscall"
 	"time"
@@ -147,9 +149,9 @@ func runProxyStart(cmd *cobra.Command, args []string) error {
 		return nil
 	}
 
-	// Inject apiClient for cloud log syncing
+	// Inject the shared API client for cloud log syncing
 	if engine.Audit != nil {
-		engine.Audit.APIClient = apiClient
+		engine.Audit.APIClient = app.API()
 	}
 
 	agentToken := os.Getenv("AS_AGENT_TOKEN")
@@ -172,8 +174,7 @@ func runProxyStart(cmd *cobra.Command, args []string) error {
 	ui.StatusRow("Session Token:", "Active (secured in OS Keychain)")
 
 	server := proxy.NewServer(proxyPort, engine)
-	server.APIClient = apiClient
-	server.SessionToken = sessionToken
+	server.SetSessionToken(sessionToken)
 
 	// Write PID file for proxy status
 	if err := proxy.WritePIDFile(proxyPort); err != nil {
@@ -190,7 +191,13 @@ func runProxyStart(cmd *cobra.Command, args []string) error {
 	// immediately and shows a y/N prompt — no timeout, no polling.
 	startInteractiveApprovalLoop(engine)
 
-	return server.Start()
+	// Cancel on SIGINT/SIGTERM so Start performs a graceful shutdown and the
+	// deferred cleanup (PID file removal, audit flush) actually runs — a hard
+	// Ctrl+C kill would skip the defers and leave a stale PID file behind.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	return server.Start(ctx)
 }
 
 func runProxyStatus(cmd *cobra.Command, args []string) error {
@@ -565,12 +572,6 @@ func runProxyRotateSession(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("failed to read current session token: %w", err)
 	}
 
-	// Generate new session token
-	newToken, err := proxy.GenerateSessionToken()
-	if err != nil {
-		return fmt.Errorf("failed to generate new session token: %w", err)
-	}
-
 	// Determine port from PID file or default
 	port := 8765
 	_, _, pidPort, err := proxy.ReadPIDFile()
@@ -578,14 +579,11 @@ func runProxyRotateSession(cmd *cobra.Command, args []string) error {
 		port = pidPort
 	}
 
-	// Notify running proxy server
+	// Notify running proxy server. The new token is generated server-side and
+	// returned; the client never chooses it (trusting a client-supplied token
+	// would let anyone who can reach the endpoint pick the session key).
 	url := fmt.Sprintf("http://localhost:%d/rotate-session", port)
-	payload := map[string]string{
-		"new_token": newToken,
-	}
-	body, _ := json.Marshal(payload)
-
-	req, err := http.NewRequest("POST", url, bytes.NewReader(body))
+	req, err := http.NewRequest("POST", url, nil)
 	if err != nil {
 		return fmt.Errorf("failed to build rotation request: %w", err)
 	}
@@ -595,21 +593,34 @@ func runProxyRotateSession(cmd *cobra.Command, args []string) error {
 	client := &http.Client{Timeout: 5 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
-		ui.Warning("Proxy daemon is not currently running. Updating local token only.")
-	} else {
-		defer resp.Body.Close()
-		if resp.StatusCode != 200 {
-			respBody, _ := io.ReadAll(resp.Body)
-			return fmt.Errorf("proxy rejected session rotation: %s", string(respBody))
-		}
-		ui.Success("Running proxy daemon updated with new session token.")
+		ui.Warning("Proxy daemon is not currently running. Cannot rotate without a running daemon.")
+		return nil
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		respBody, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("proxy rejected session rotation: %s", string(respBody))
 	}
 
-	// Update local keyring storage
-	if err := proxy.WriteSessionToken(newToken); err != nil {
+	var rotResp struct {
+		Status  string `json:"status"`
+		Message string `json:"message"`
+		NewToken string `json:"new_token"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&rotResp); err != nil {
+		return fmt.Errorf("failed to decode rotation response: %w", err)
+	}
+	if rotResp.NewToken == "" {
+		return fmt.Errorf("proxy returned no new session token")
+	}
+
+	// Persist the server-generated token to the keyring.
+	if err := proxy.WriteSessionToken(rotResp.NewToken); err != nil {
 		return fmt.Errorf("failed to store new session token: %w", err)
 	}
 
+	ui.Success("Running proxy daemon updated with new session token (server-generated).")
 	ui.Success("Session token rotated successfully in secure OS Keychain.")
 	fmt.Println()
 	return nil

@@ -88,21 +88,9 @@ func runSecretsPolicySet(cmd *cobra.Command, args []string) error {
 	env := config.ResolveEnvironment()
 
 	// Validate that the secret key actually exists locally or remotely before prompting for password
-	exists, err := keyring.SecretExists(project.ProjectID, env, key)
+	exists, err := secretExists(project.ProjectID, env, key)
 	if err != nil {
-		return fmt.Errorf("failed to check if secret exists: %w", err)
-	}
-
-	if !exists {
-		// Fallback to checking remotely
-		if remoteKeys, err := secretsService.ListForEnv(env); err == nil {
-			for _, k := range remoteKeys {
-				if strings.EqualFold(k.Key, key) {
-					exists = true
-					break
-				}
-			}
-		}
+		return err
 	}
 
 	if !exists {
@@ -242,19 +230,17 @@ func runSecretsPolicySet(cmd *cobra.Command, args []string) error {
 	}
 
 	// 1. Save secret policy to cloud
-	if apiClient != nil {
-		resp, err := apiClient.Call("secrets.set_policy", "PUT", policy, map[string]string{
-			"project_id":  project.ProjectID,
-			"environment": env,
-			"key":         key,
-		}, nil)
-		if err != nil {
-			return fmt.Errorf("failed to save policy to cloud: %w", err)
-		}
-		defer resp.Body.Close()
-		if resp.StatusCode != http.StatusOK {
-			return apiClient.DecodeError(resp)
-		}
+	resp, err := app.API().Call("secrets.set_policy", "PUT", policy, map[string]string{
+		"project_id":  project.ProjectID,
+		"environment": env,
+		"key":         key,
+	}, nil)
+	if err != nil {
+		return fmt.Errorf("failed to save policy to cloud: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return app.API().DecodeError(resp)
 	}
 
 	// 2. Save secret policy to local keyring
@@ -359,21 +345,9 @@ func runSecretsPolicyDelete(cmd *cobra.Command, args []string) error {
 	env := config.ResolveEnvironment()
 
 	// Check if secret exists locally or remotely first
-	exists, err := keyring.SecretExists(project.ProjectID, env, key)
+	exists, err := secretExists(project.ProjectID, env, key)
 	if err != nil {
-		return fmt.Errorf("failed to check if secret exists: %w", err)
-	}
-
-	if !exists {
-		// Fallback to checking remotely
-		if remoteKeys, err := secretsService.ListForEnv(env); err == nil {
-			for _, k := range remoteKeys {
-				if strings.EqualFold(k.Key, key) {
-					exists = true
-					break
-				}
-			}
-		}
+		return err
 	}
 
 	if !exists {
@@ -386,20 +360,18 @@ func runSecretsPolicyDelete(cmd *cobra.Command, args []string) error {
 	}
 
 	// 1. Delete on cloud API (by setting to empty policy)
-	if apiClient != nil {
-		emptyPolicy := capabilities.SecretPolicy{}
-		resp, err := apiClient.Call("secrets.set_policy", "PUT", emptyPolicy, map[string]string{
-			"project_id":  project.ProjectID,
-			"environment": env,
-			"key":         key,
-		}, nil)
-		if err != nil {
-			return fmt.Errorf("failed to delete policy on cloud: %w", err)
-		}
-		defer resp.Body.Close()
-		if resp.StatusCode != http.StatusOK {
-			return apiClient.DecodeError(resp)
-		}
+	emptyPolicy := capabilities.SecretPolicy{}
+	resp, err := app.API().Call("secrets.set_policy", "PUT", emptyPolicy, map[string]string{
+		"project_id":  project.ProjectID,
+		"environment": env,
+		"key":         key,
+	}, nil)
+	if err != nil {
+		return fmt.Errorf("failed to delete policy on cloud: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return app.API().DecodeError(resp)
 	}
 
 	// 2. Deleting the policy locally is setting it to nil

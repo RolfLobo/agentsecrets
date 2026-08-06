@@ -26,17 +26,30 @@ var (
 	testStubMu    sync.RWMutex
 )
 
+// maxResponseBuffer bounds a single daemon response line. Prefix reads over a
+// large project can return many secrets in one framed message, so the default
+// bufio.Scanner cap (64KB) is too small and would surface as a bogus
+// "connection lost". 10MB comfortably covers realistic keychain payloads.
+const maxResponseBuffer = 10 * 1024 * 1024
+
 // Init connects to the keychain-auth daemon.
 //
 // The daemon verifies the caller process at connection time using kernel-level
 // peer credentials (PID, binary path, binary hash). If the binary is not
-// registered, the daemon immediately sends a denied response and closes.
+// registered, the daemon sends a denied response; that denial surfaces on the
+// first real request (see sendRequest), so Init itself performs no probe or
+// ping round-trip — it just establishes the connection.
 //
 // This must be called once per process lifetime before any secret operations.
 func Init() error {
 	sessionMu.Lock()
 	defer sessionMu.Unlock()
+	return initLocked()
+}
 
+// initLocked performs connection setup while the caller already holds sessionMu.
+// This lets sendRequest reconnect without an unlock/relock window.
+func initLocked() error {
 	if initialized {
 		return nil
 	}
@@ -60,50 +73,13 @@ func Init() error {
 		return &DaemonNotRunningError{SocketPath: sockPath, Cause: err}
 	}
 
-	// Step 3: The daemon verifies us at connection time. If our binary is
-	// unregistered, it sends a RESPONSE with status="denied" immediately.
-	// We probe for this by setting a short read deadline.
+	// The daemon verifies us at connection time. If our binary is unregistered
+	// it will send a status="denied" RESPONSE; rather than blocking on a read
+	// deadline to detect that here, we let the denial surface on the first real
+	// request (sendRequest maps "denied"/"error" to DaemonDeniedError). This
+	// removes a fixed ~200ms probe from every process startup.
 	sc := bufio.NewScanner(c)
-	sc.Buffer(make([]byte, 0, 64*1024), 64*1024)
-
-	// Try to read an immediate denial. Use a brief deadline so we don't
-	// block forever if the daemon accepted us silently (the happy path).
-	_ = c.SetReadDeadline(timeNow().Add(connectionProbeTimeout))
-	if sc.Scan() {
-		// The daemon sent something — this means we were denied.
-		var env envelope
-		if err := json.Unmarshal(sc.Bytes(), &env); err == nil {
-			if env.Status == "denied" || env.Status == "error" {
-				c.Close()
-				telemetry.RecordProcessVerificationsFailed()
-				return &DaemonDeniedError{Reason: env.Reason}
-			}
-		}
-		// Unexpected message — close and report
-		c.Close()
-		return fmt.Errorf("keychainauth: unexpected message from daemon on connect")
-	}
-
-	// sc.Scan() returned false — either timeout (good: daemon accepted us)
-	// or a real error. Check if it's a timeout.
-	if err := sc.Err(); err != nil {
-		// If it's a timeout, that's expected — the daemon accepted us silently.
-		if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-			// Good — daemon accepted the connection. Clear the deadline.
-			_ = c.SetReadDeadline(timeZero)
-		} else {
-			c.Close()
-			return fmt.Errorf("keychainauth: connection error: %w", err)
-		}
-	} else {
-		// EOF without error — daemon closed connection
-		c.Close()
-		return fmt.Errorf("keychainauth: daemon closed connection immediately")
-	}
-
-	// Re-create scanner after the probe (the old one may have buffered state)
-	sc = bufio.NewScanner(c)
-	sc.Buffer(make([]byte, 0, 64*1024), 64*1024)
+	sc.Buffer(make([]byte, 0, 64*1024), maxResponseBuffer)
 
 	conn = c
 	scanner = sc
@@ -111,64 +87,24 @@ func Init() error {
 	initialized = true
 	telemetry.RecordProcessVerificationsPassed()
 
-	// Step 4: Perform a protocol sanity check (ping) to ensure the running
-	// daemon understands the v2.0+ REQUEST/RESPONSE protocol.
-	// We send a search request for our service namespace.
-	pingReq := request{
-		Type:    typeRequest,
-		Action:  actionSearch,
-		Service: serviceName,
-	}
-	if err := encoder.Encode(pingReq); err != nil {
-		c.Close()
-		conn = nil
-		scanner = nil
-		encoder = nil
-		initialized = false
-		return fmt.Errorf("keychainauth: protocol check failed: %w", err)
-	}
-
-	if !sc.Scan() {
-		c.Close()
-		conn = nil
-		scanner = nil
-		encoder = nil
-		initialized = false
-		if err := sc.Err(); err != nil {
-			return fmt.Errorf("keychainauth: connection lost during protocol check: %w", err)
-		}
-		return fmt.Errorf("keychainauth: connection closed by daemon during protocol check")
-	}
-
-	var resp response
-	if err := json.Unmarshal(sc.Bytes(), &resp); err != nil {
-		c.Close()
-		conn = nil
-		scanner = nil
-		encoder = nil
-		initialized = false
-		return fmt.Errorf("keychainauth: invalid response during protocol check: %w", err)
-	}
-
-	if resp.Status == "" {
-		c.Close()
-		conn = nil
-		scanner = nil
-		encoder = nil
-		initialized = false
-		return fmt.Errorf("keychainauth: protocol mismatch (outdated daemon version)")
-	}
-
-	if resp.Status == "denied" || resp.Status == "error" {
-		c.Close()
-		conn = nil
-		scanner = nil
-		encoder = nil
-		initialized = false
-		return &DaemonDeniedError{Reason: resp.Reason}
-	}
-
 	return nil
+}
+
+// resetConn tears down the current connection and clears session state.
+// The caller must hold sessionMu. Centralizing this both prevents the
+// file-descriptor leak (the old conn is always closed before a reconnect)
+// and removes the repeated cleanup blocks that Init previously carried.
+func resetConn() {
+	if conn != nil {
+		conn.Close()
+	}
+	conn = nil
+	scanner = nil
+	encoder = nil
+	initialized = false
+	// Drop cached metadata: a reconnect may span an external mutation, so
+	// don't let a pre-reset listing/policy survive across it.
+	valueCache.invalidateAll()
 }
 
 // Close tears down the Unix socket connection to keychain-auth.
@@ -176,14 +112,7 @@ func Init() error {
 func Close() {
 	sessionMu.Lock()
 	defer sessionMu.Unlock()
-
-	if conn != nil {
-		conn.Close()
-		conn = nil
-	}
-	scanner = nil
-	encoder = nil
-	initialized = false
+	resetConn()
 }
 
 // IsAvailable checks whether the keychain-auth socket file exists on disk.
@@ -208,6 +137,27 @@ func IsInitialized() bool {
 	return initialized
 }
 
+// Verify confirms the daemon still accepts this binary by issuing one lightweight
+// request. The daemon checks our peer credentials (binary path + hash) before it
+// evaluates the request itself, so an unregistered or hash-mismatched binary —
+// e.g. one that was just upgraded — is denied here with a *DaemonDeniedError the
+// caller can route into re-registration recovery, instead of letting the raw
+// denial surface on the user's first real command.
+//
+// It performs a search (key names only — never a secret value) under a prefix
+// that is not expected to match anything, so the request is cheap and side-effect
+// free. This is used deliberately by callers that gate it (e.g. only after the
+// binary changed); Init itself stays probe-free so the hot path pays nothing.
+func Verify() error {
+	_, err := sendRequest(request{
+		Type:    typeRequest,
+		Action:  actionSearch,
+		Service: serviceName,
+		Targets: []string{"__agentsecrets_verify__:"},
+	})
+	return err
+}
+
 // --- Secret CRUD operations ---
 
 // SetSecret stores a secret in the OS keychain via keychain-auth.
@@ -220,10 +170,59 @@ func SetSecret(projectID, environment, key, value string) error {
 		Targets: []string{target},
 		Values:  []string{value},
 	})
+	if err == nil {
+		valueCache.invalidateAll()
+	}
 	return err
 }
 
+// SetSecretsBatch stores multiple secrets and their policies in a single round-trip.
+// Each entry in secrets is a key-value pair; each entry in policies is the serialized
+// policy JSON (or nil for no policy). The arrays must have the same length.
+// Returns the number of successful writes and the first error encountered (if any).
+func SetSecretsBatch(projectID, environment string, secrets map[string]string, policies map[string][]byte) (int, error) {
+	if len(secrets) == 0 {
+		return 0, nil
+	}
+
+	var targets []string
+	var values []string
+
+	// First pass: secrets
+	for key, val := range secrets {
+		targets = append(targets, formatTarget(projectID, environment, key))
+		values = append(values, val)
+	}
+
+	// Second pass: policies
+	for key, policyBytes := range policies {
+		policyTarget := formatTarget(projectID, environment, key) + ":policy"
+		if policyBytes == nil || len(policyBytes) == 0 {
+			// Delete policy entry if nil/empty
+			targets = append(targets, policyTarget)
+			values = append(values, "")
+		} else {
+			targets = append(targets, policyTarget)
+			values = append(values, string(policyBytes))
+		}
+	}
+
+	_, err := sendRequest(request{
+		Type:    typeRequest,
+		Action:  actionWrite,
+		Service: serviceName,
+		Targets: targets,
+		Values:  values,
+	})
+	if err == nil {
+		valueCache.invalidateAll()
+	}
+	return len(secrets), err
+}
+
 // GetSecret retrieves a single secret from the OS keychain via keychain-auth.
+// Plaintext secret values are never cached in-process — every read goes to the
+// daemon so a rotation/revocation elsewhere is reflected immediately.
 func GetSecret(projectID, environment, key string) (string, error) {
 	target := formatTarget(projectID, environment, key)
 	resp, err := sendRequest(request{
@@ -250,11 +249,15 @@ func DeleteSecret(projectID, environment, key string) error {
 		Service: serviceName,
 		Targets: []string{target},
 	})
+	if err == nil {
+		valueCache.invalidateAll()
+	}
 	return err
 }
 
 // GetAllProjectSecrets returns all secrets for a project+environment as a
 // key→value map. Uses a prefix read to fetch everything in a single round-trip.
+// Values are never cached in-process (see GetSecret).
 func GetAllProjectSecrets(projectID, environment string) (map[string]string, error) {
 	prefix := formatPrefix(projectID, environment)
 	resp, err := sendRequest(request{
@@ -284,9 +287,14 @@ func GetAllProjectSecrets(projectID, environment string) (map[string]string, err
 }
 
 // ListProjectKeyNames returns just the key names for a project+environment.
-// Uses a search operation — no secret values are read.
+// Uses a search operation — no secret values are read, so the result (key
+// names only, no plaintext) is safe to serve from the short-lived cache.
 func ListProjectKeyNames(projectID, environment string) ([]string, error) {
 	prefix := formatPrefix(projectID, environment)
+	ck := "names:" + serviceName + ":" + prefix
+	if e, ok := valueCache.get(ck); ok {
+		return append([]string(nil), e.listVal...), nil
+	}
 	resp, err := sendRequest(request{
 		Type:    typeRequest,
 		Action:  actionSearch,
@@ -309,6 +317,7 @@ func ListProjectKeyNames(projectID, environment string) ([]string, error) {
 		}
 		keys = append(keys, bare)
 	}
+	valueCache.put(ck, cacheEntry{listVal: append([]string(nil), keys...)})
 	return keys, nil
 }
 
@@ -327,12 +336,22 @@ func SetWorkspaceAllowlist(workspaceID string, domains []string) error {
 		Targets: []string{target},
 		Values:  []string{string(valBytes)},
 	})
+	if err == nil {
+		valueCache.invalidateAll()
+	}
 	return err
 }
 
 // GetWorkspaceAllowlist retrieves the domain allowlist for a workspace.
+// The allowlist is non-secret (a list of permitted domains), so it is served
+// from the short-lived cache to avoid re-resolving it on every proxy call and
+// again in the forensic audit path for the same request.
 func GetWorkspaceAllowlist(workspaceID string) ([]string, error) {
 	target := formatAllowlistTarget(workspaceID)
+	ck := "allow:" + serviceName + ":" + target
+	if e, ok := valueCache.get(ck); ok {
+		return append([]string(nil), e.listVal...), nil
+	}
 	resp, err := sendRequest(request{
 		Type:    typeRequest,
 		Action:  actionRead,
@@ -350,6 +369,7 @@ func GetWorkspaceAllowlist(workspaceID string) ([]string, error) {
 	if err := json.Unmarshal([]byte(resp.Results[0].Value), &domains); err != nil {
 		return nil, fmt.Errorf("parse allowlist: %w", err)
 	}
+	valueCache.put(ck, cacheEntry{listVal: append([]string(nil), domains...)})
 	return domains, nil
 }
 
@@ -363,12 +383,19 @@ func SetSecretPolicy(projectID, environment, key string, policy []byte) error {
 		Targets: []string{target},
 		Values:  []string{string(policy)},
 	})
+	if err == nil {
+		valueCache.invalidateAll()
+	}
 	return err
 }
 
 // GetSecretPolicy retrieves policy from the OS keychain via keychain-auth.
 func GetSecretPolicy(projectID, environment, key string) ([]byte, error) {
 	target := formatTarget(projectID, environment, key) + ":policy"
+	ck := "pol:" + serviceName + ":" + target
+	if e, ok := valueCache.get(ck); ok {
+		return e.bytesVal, nil
+	}
 	resp, err := sendRequest(request{
 		Type:    typeRequest,
 		Action:  actionRead,
@@ -381,7 +408,9 @@ func GetSecretPolicy(projectID, environment, key string) ([]byte, error) {
 	if len(resp.Results) == 0 {
 		return nil, nil
 	}
-	return []byte(resp.Results[0].Value), nil
+	val := []byte(resp.Results[0].Value)
+	valueCache.put(ck, cacheEntry{bytesVal: val})
+	return val, nil
 }
 
 // --- Internal helpers ---
@@ -397,15 +426,11 @@ func sendRequest(req request) (*response, error) {
 	}
 	defer sessionMu.Unlock()
 
-	// Helper to ensure initialized
+	// Helper to ensure the connection is live. initLocked is a no-op when
+	// already initialized, so this is cheap on the happy path.
 	ensureConn := func() error {
-		if !initialized {
-			sessionMu.Unlock()
-			initErr := Init()
-			sessionMu.Lock()
-			if initErr != nil {
-				return fmt.Errorf("keychainauth: not initialized (failed to auto-reconnect: %w)", initErr)
-			}
+		if err := initLocked(); err != nil {
+			return fmt.Errorf("keychainauth: not initialized (failed to auto-reconnect: %w)", err)
 		}
 		return nil
 	}
@@ -416,35 +441,38 @@ func sendRequest(req request) (*response, error) {
 
 	req.Type = typeRequest
 
-	// Try sending request. If it fails, try to reconnect once and retry.
+	// Try sending request. If it fails, reset the (possibly half-open)
+	// connection, reconnect once, and retry.
 	if err := encoder.Encode(req); err != nil {
-		initialized = false
+		resetConn()
 		if reconnectErr := ensureConn(); reconnectErr != nil {
 			return nil, fmt.Errorf("keychainauth: failed to send request: %w (reconnect failed: %v)", err, reconnectErr)
 		}
 		if err = encoder.Encode(req); err != nil {
-			initialized = false
+			resetConn()
 			return nil, fmt.Errorf("keychainauth: failed to send request on retry: %w", err)
 		}
 	}
 
-	// Read response. If it fails, try to reconnect once and retry the whole request.
+	// Read response. If it fails, reset, reconnect once, and retry the whole request.
 	if !scanner.Scan() {
-		initialized = false
+		scanErr := scanner.Err()
+		resetConn()
 		if reconnectErr := ensureConn(); reconnectErr != nil {
-			if scanErr := scanner.Err(); scanErr != nil {
+			if scanErr != nil {
 				return nil, fmt.Errorf("keychainauth: connection lost: %w (reconnect failed: %v)", scanErr, reconnectErr)
 			}
 			return nil, fmt.Errorf("keychainauth: connection closed by daemon (reconnect failed: %v)", reconnectErr)
 		}
 		if err := encoder.Encode(req); err != nil {
-			initialized = false
+			resetConn()
 			return nil, fmt.Errorf("keychainauth: failed to resend request on retry: %w", err)
 		}
 		if !scanner.Scan() {
-			initialized = false
-			if scanErr := scanner.Err(); scanErr != nil {
-				return nil, fmt.Errorf("keychainauth: connection lost on retry: %w", scanErr)
+			retryErr := scanner.Err()
+			resetConn()
+			if retryErr != nil {
+				return nil, fmt.Errorf("keychainauth: connection lost on retry: %w", retryErr)
 			}
 			return nil, fmt.Errorf("keychainauth: connection closed by daemon on retry")
 		}
@@ -502,6 +530,9 @@ func Write(service, target, value string) error {
 		Targets: []string{target},
 		Values:  []string{value},
 	})
+	if err == nil {
+		valueCache.invalidateAll()
+	}
 	return err
 }
 
@@ -530,6 +561,9 @@ func Delete(service, target string) error {
 		Service: service,
 		Targets: []string{target},
 	})
+	if err == nil {
+		valueCache.invalidateAll()
+	}
 	return err
 }
 

@@ -4,7 +4,6 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
-	"time"
 )
 
 var socketPathOverride string
@@ -49,14 +48,3 @@ func SocketPath() string {
 	}
 	return filepath.Join(runtimeDir, "keychain-auth", "agent.sock")
 }
-
-// connectionProbeTimeout is how long we wait to detect an immediate rejection
-// from the daemon during Init(). Short enough to not feel slow, long enough
-// for the daemon to respond if it wants to deny us.
-var connectionProbeTimeout = 200 * time.Millisecond
-
-// timeNow and timeZero are vars to allow test overrides.
-var (
-	timeNow  = time.Now
-	timeZero time.Time
-)

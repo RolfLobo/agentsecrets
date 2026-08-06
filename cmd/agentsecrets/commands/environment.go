@@ -103,7 +103,9 @@ func runEnvSwitch(cmd *cobra.Command, args []string) error {
 	p, err := config.LoadProjectConfig()
 	if err == nil && p != nil {
 		p.Environment = environment
-		_ = config.SaveProjectConfig(p)
+		if err := config.SaveProjectConfig(p); err != nil {
+			return fmt.Errorf("failed to update project environment: %w", err)
+		}
 	}
 
 	// Update global config
@@ -159,7 +161,7 @@ func runEnvList(cmd *cobra.Command, args []string) error {
 	for _, env := range config.ValidEnvironments {
 		go func(e string) {
 			count := 0
-			resp, err := apiClient.Call("secrets.list", "GET", nil, map[string]string{
+			resp, err := app.API().Call("secrets.list", "GET", nil, map[string]string{
 				"project_id": project.ProjectID,
 			}, map[string]string{
 				"environment": e,
@@ -256,7 +258,7 @@ func runEnvCopy(cmd *cobra.Command, args []string) error {
 	}
 
 	if err := ui.Spinner(fmt.Sprintf("Fetching secrets from %s...", from), func() error {
-		resp, err := apiClient.Call("secrets.list", "GET", nil, map[string]string{
+		resp, err := app.API().Call("secrets.list", "GET", nil, map[string]string{
 			"project_id": project.ProjectID,
 		}, map[string]string{
 			"environment": from,
@@ -266,7 +268,7 @@ func runEnvCopy(cmd *cobra.Command, args []string) error {
 		}
 		defer resp.Body.Close()
 		if resp.StatusCode != http.StatusOK {
-			return apiClient.DecodeError(resp)
+			return app.API().DecodeError(resp)
 		}
 		var res struct {
 			Data struct {
@@ -305,7 +307,7 @@ func runEnvCopy(cmd *cobra.Command, args []string) error {
 			kv[s.Key] = plaintext
 		}
 
-		return secretsService.BatchSet(kv, to)
+		return app.Secrets().BatchSet(kv, to)
 	}); err != nil {
 		return fmt.Errorf("copy failed: %w", err)
 	}
@@ -342,7 +344,7 @@ func runEnvMerge(cmd *cobra.Command, args []string) error {
 	var fromSecrets []secretEntry
 
 	if err := ui.Spinner(fmt.Sprintf("Fetching keys from %s...", from), func() error {
-		resp, err := apiClient.Call("secrets.list", "GET", nil, map[string]string{
+		resp, err := app.API().Call("secrets.list", "GET", nil, map[string]string{
 			"project_id": project.ProjectID,
 		}, map[string]string{
 			"environment": from,
@@ -352,7 +354,7 @@ func runEnvMerge(cmd *cobra.Command, args []string) error {
 		}
 		defer resp.Body.Close()
 		if resp.StatusCode != http.StatusOK {
-			return apiClient.DecodeError(resp)
+			return app.API().DecodeError(resp)
 		}
 		var res struct {
 			Data struct {
@@ -424,7 +426,7 @@ func runEnvMerge(cmd *cobra.Command, args []string) error {
 			plaintext, _ := crypto.DecryptSecret(s["value"], wsKey)
 			kv[s["key"]] = plaintext
 		}
-		return secretsService.BatchSet(kv, to)
+		return app.Secrets().BatchSet(kv, to)
 	}); err != nil {
 		return fmt.Errorf("merge failed: %w", err)
 	}
@@ -448,7 +450,7 @@ func runEnvClean(cmd *cobra.Command, args []string) error {
 	var list []secrets.SecretMetadata
 	if err := ui.Spinner("Fetching secrets...", func() error {
 		var e error
-		list, e = secretsService.List() // uses active env
+		list, e = app.Secrets().List() // uses active env
 		return e
 	}); err != nil {
 		return err
@@ -474,7 +476,7 @@ func runEnvClean(cmd *cobra.Command, args []string) error {
 
 	for _, s := range list {
 		if err := ui.Spinner(fmt.Sprintf("Deleting %s...", s.Key), func() error {
-			return secretsService.Delete(s.Key)
+			return app.Secrets().Delete(s.Key)
 		}); err != nil {
 			ui.Error(fmt.Sprintf("Failed to delete %s: %v", s.Key, err))
 		}

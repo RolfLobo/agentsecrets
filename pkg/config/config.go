@@ -604,18 +604,6 @@ func SetStorageMode(mode int) error {
 	return SaveGlobalConfig(c)
 }
 
-// SetProjectStorageMode updates the storage mode in the local project config.
-func SetProjectStorageMode(mode int) error {
-	pc, err := LoadProjectConfig()
-	if err != nil || pc == nil {
-		// If project config doesn't exist, we fallback to global
-		// But usually we set this during init
-		return nil
-	}
-	pc.StorageMode = mode
-	return SaveProjectConfig(pc)
-}
-
 // --- Environment Resolution ---
 
 // ValidEnvironments is the list of valid environment names.
@@ -623,9 +611,10 @@ var ValidEnvironments = []string{"development", "staging", "production"}
 
 // IsValidEnvironment returns true if the given string is a valid environment name.
 func IsValidEnvironment(env string) bool {
-	switch env {
-	case "development", "staging", "production":
-		return true
+	for _, valid := range ValidEnvironments {
+		if env == valid {
+			return true
+		}
 	}
 	return false
 }
@@ -669,15 +658,6 @@ func ResolveEnvironmentWithSource() (string, string) {
 
 	// 4. Default
 	return "development", "default"
-}
-
-// GetSelectedEnvironment returns the globally selected environment.
-func GetSelectedEnvironment() string {
-	config, err := LoadGlobalConfig()
-	if err != nil || config.SelectedEnvironment == "" {
-		return "development"
-	}
-	return config.SelectedEnvironment
 }
 
 // SetSelectedEnvironment sets the globally selected environment.

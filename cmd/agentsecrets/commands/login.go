@@ -64,7 +64,7 @@ func performLogin() error {
 	fmt.Println()
 
 	if err := ui.Spinner("Logging in...", func() error {
-		return authService.PerformLogin(email, password, nil, nil)
+		return app.Auth().PerformLogin(email, password, nil, nil)
 	}); err != nil {
 		ui.ErrorWithSuggestions(
 			fmt.Errorf("Login failed: %w", err),

@@ -255,7 +255,7 @@ func runSignup() error {
 
 	// Create account with spinner
 	if err := ui.Spinner("Creating your account...", func() error {
-		return authService.Signup(auth.SignupRequest{
+		return app.Auth().Signup(auth.SignupRequest{
 			FirstName: firstName,
 			LastName:  lastName,
 			Email:     email,

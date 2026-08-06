@@ -9,7 +9,6 @@ import (
 	"github.com/charmbracelet/huh"
 	"github.com/spf13/cobra"
 
-	"github.com/The-17/agentsecrets/pkg/api"
 	"github.com/The-17/agentsecrets/pkg/config"
 	"github.com/The-17/agentsecrets/pkg/errors"
 	"github.com/The-17/agentsecrets/pkg/keyring"
@@ -19,18 +18,33 @@ import (
 )
 
 var (
-	secretsService *secrets.Service
-	pullForce      bool
-	pushForce      bool
-	allEnvs        bool
-	listRemote     bool
-	diffFrom       string
-	diffTo         string
+	pullForce  bool
+	pushForce  bool
+	allEnvs    bool
+	listRemote bool
+	diffFrom   string
+	diffTo     string
 )
 
-// InitSecretsService sets up the service for the CLI
-func InitSecretsService(client *api.Client) {
-	secretsService = secrets.NewService(client)
+// secretExists reports whether a secret key exists for the given project/env.
+// It checks the local keychain first, then falls back to the remote list so a
+// key present only in the cloud (e.g. before a pull) is still recognised.
+func secretExists(projectID, env, key string) (bool, error) {
+	exists, err := keyring.SecretExists(projectID, env, key)
+	if err != nil {
+		return false, fmt.Errorf("failed to check if secret exists: %w", err)
+	}
+	if exists {
+		return true, nil
+	}
+	if remoteKeys, err := app.Secrets().ListForEnv(env); err == nil {
+		for _, k := range remoteKeys {
+			if strings.EqualFold(k.Key, key) {
+				return true, nil
+			}
+		}
+	}
+	return false, nil
 }
 
 var secretsCmd = &cobra.Command{
@@ -55,7 +69,7 @@ var secretsListCmd = &cobra.Command{
 			return err
 		}
 		if listRemote {
-			return authService.EnsureAuth(cmd, args)
+			return app.Auth().EnsureAuth(cmd, args)
 		}
 		return nil
 	},
@@ -141,9 +155,9 @@ func runSecretsSet(cmd *cobra.Command, args []string) error {
 			return err
 		}
 
-		for _, env := range []string{"development", "staging", "production"} {
+		for _, env := range config.ValidEnvironments {
 			if err := ui.Spinner(fmt.Sprintf("Setting in %s...", env), func() error {
-				return secretsService.BatchSet(kv, env)
+				return app.Secrets().BatchSet(kv, env)
 			}); err != nil {
 				ui.Error(fmt.Sprintf("Failed to set in %s: %v", env, err))
 				continue
@@ -161,7 +175,7 @@ func runSecretsSet(cmd *cobra.Command, args []string) error {
 	}
 
 	if err := ui.Spinner(fmt.Sprintf("Encrypting and syncing %d secrets...", len(kv)), func() error {
-		return secretsService.BatchSet(kv, "")
+		return app.Secrets().BatchSet(kv, "")
 	}); err != nil {
 		return fmt.Errorf("failed to set secrets: %w", err)
 	}
@@ -184,7 +198,7 @@ func runSecretsList(cmd *cobra.Command, args []string) error {
 	}
 
 	activeEnv := config.ResolveEnvironment()
-	envs := []string{"development", "staging", "production"}
+	envs := config.ValidEnvironments
 
 	presence := make(map[string][3]bool)
 	allKeysSet := make(map[string]bool)
@@ -241,7 +255,7 @@ func runSecretsList(cmd *cobra.Command, args []string) error {
 
 func runSecretsListRemote(cmd *cobra.Command, args []string) error {
 	activeEnv := config.ResolveEnvironment()
-	envs := []string{"development", "staging", "production"}
+	envs := config.ValidEnvironments
 
 	type envResult struct {
 		env  string
@@ -255,7 +269,7 @@ func runSecretsListRemote(cmd *cobra.Command, args []string) error {
 			wg.Add(1)
 			go func(envName string) {
 				defer wg.Done()
-				list, err := secretsService.ListForEnv(envName)
+				list, err := app.Secrets().ListForEnv(envName)
 				keys := []string{}
 				if err == nil {
 					for _, s := range list {
@@ -273,22 +287,26 @@ func runSecretsListRemote(cmd *cobra.Command, args []string) error {
 		return nil
 	}
 
-	// Map of key -> [devPresent, stagingPresent, prodPresent]
-	presence := make(map[string][3]bool)
+	// Map of key -> presence flag per environment, indexed by position in
+	// config.ValidEnvironments (keeps the table columns and the constant in sync).
+	presence := make(map[string][]bool)
 	allKeysSet := make(map[string]bool)
 
+	envIndex := make(map[string]int, len(envs))
+	for i, e := range envs {
+		envIndex[e] = i
+	}
+
 	for res := range results {
-		idx := 0
-		switch res.env {
-		case "development":
-			idx = 0
-		case "staging":
-			idx = 1
-		case "production":
-			idx = 2
+		idx, ok := envIndex[res.env]
+		if !ok {
+			continue
 		}
 		for _, k := range res.keys {
 			p := presence[k]
+			if p == nil {
+				p = make([]bool, len(envs))
+			}
 			p[idx] = true
 			presence[k] = p
 			allKeysSet[k] = true
@@ -301,22 +319,35 @@ func runSecretsListRemote(cmd *cobra.Command, args []string) error {
 		return nil
 	}
 
-	// Sort keys
+	fmt.Printf("\nEnvironment: %s\n\n", ui.BrandStyle.Render(activeEnv))
+	fmt.Println(renderEnvPresenceTable(envs, presence, allKeysSet))
+	fmt.Println()
+	return nil
+}
+
+// renderEnvPresenceTable renders a "Key | ENV1 | ENV2 | ..." table where each
+// cell shows whether the key is present in that environment. Columns follow the
+// order of envs; presence[key][i] corresponds to envs[i].
+func renderEnvPresenceTable(envs []string, presence map[string][]bool, allKeysSet map[string]bool) string {
 	var sortedKeys []string
 	for k := range allKeysSet {
 		sortedKeys = append(sortedKeys, k)
 	}
 	sort.Strings(sortedKeys)
 
-	headers := []string{"Key", "DEV", "STAGING", "PROD"}
+	headers := make([]string, 0, len(envs)+1)
+	headers = append(headers, "Key")
+	for _, e := range envs {
+		headers = append(headers, envColumnLabel(e))
+	}
+
 	rows := make([][]string, len(sortedKeys))
-
 	for i, k := range sortedKeys {
+		row := make([]string, 0, len(envs)+1)
+		row = append(row, ui.BrandStyle.Render(k))
 		p := presence[k]
-		row := []string{ui.BrandStyle.Render(k)}
-
-		for j := 0; j < 3; j++ {
-			if p[j] {
+		for j := range envs {
+			if j < len(p) && p[j] {
 				row = append(row, ui.SuccessStyle.Render("*"))
 			} else {
 				row = append(row, ui.DimStyle.Render("-"))
@@ -325,10 +356,20 @@ func runSecretsListRemote(cmd *cobra.Command, args []string) error {
 		rows[i] = row
 	}
 
-	fmt.Printf("\nEnvironment: %s\n\n", ui.BrandStyle.Render(activeEnv))
-	fmt.Println(ui.RenderTable(headers, rows))
-	fmt.Println()
-	return nil
+	return ui.RenderTable(headers, rows)
+}
+
+// envColumnLabel returns the short, upper-cased column header for an environment
+// name (e.g. "development" -> "DEV", "production" -> "PROD").
+func envColumnLabel(env string) string {
+	switch env {
+	case "development":
+		return "DEV"
+	case "production":
+		return "PROD"
+	default:
+		return strings.ToUpper(env)
+	}
 }
 
 func runSecretsPull(cmd *cobra.Command, args []string) error {
@@ -337,7 +378,7 @@ func runSecretsPull(cmd *cobra.Command, args []string) error {
 	// 1. Check for conflicts first
 	if err := ui.Spinner("Checking for conflicts...", func() error {
 		var e error
-		diff, e = secretsService.Diff("", "")
+		diff, e = app.Secrets().Diff("", "")
 		return e
 	}); err != nil {
 		ui.Error("Failed to check for conflicts: " + err.Error())
@@ -405,13 +446,13 @@ func runSecretsPull(cmd *cobra.Command, args []string) error {
 	}
 
 	if err := ui.Spinner(fmt.Sprintf("Pulling %d secrets and allowlist...", pullCount), func() error {
-		if err := secretsService.Pull(targetKeys); err != nil {
+		if err := app.Secrets().Pull(targetKeys); err != nil {
 			return err
 		}
 
 		pc, err := config.LoadProjectConfig()
 		if err == nil && pc.WorkspaceID != "" {
-			domainsResp, err := workspaceService.ListAllowlist(pc.WorkspaceID)
+			domainsResp, err := app.Workspaces().ListAllowlist(pc.WorkspaceID)
 			if err == nil {
 				var domains []string
 				for _, d := range domainsResp {
@@ -439,7 +480,7 @@ func runSecretsPush(cmd *cobra.Command, args []string) error {
 
 	if err := ui.Spinner("Checking for conflicts...", func() error {
 		var e error
-		diff, e = secretsService.Diff("", "")
+		diff, e = app.Secrets().Diff("", "")
 		return e
 	}); err != nil {
 		ui.Error("Failed to check for conflicts: " + err.Error())
@@ -490,7 +531,7 @@ func runSecretsPush(cmd *cobra.Command, args []string) error {
 
 	// 2. Push local secrets
 	if err := ui.Spinner("Pushing secrets...", func() error {
-		return secretsService.Push()
+		return app.Secrets().Push()
 	}); err != nil {
 		ui.ErrorWithSuggestions(
 			fmt.Errorf("Push: %w", err),
@@ -506,7 +547,7 @@ func runSecretsPush(cmd *cobra.Command, args []string) error {
 	if deleteFromCloud && len(diff.Removed) > 0 {
 		if err := ui.Spinner(fmt.Sprintf("Deleting %d missing keys from cloud...", len(diff.Removed)), func() error {
 			for _, key := range diff.Removed {
-				if err := secretsService.Delete(key); err != nil {
+				if err := app.Secrets().Delete(key); err != nil {
 					return fmt.Errorf("failed to delete %s: %w", key, err)
 				}
 			}
@@ -535,21 +576,9 @@ func runSecretsDelete(cmd *cobra.Command, args []string) error {
 	env := config.ResolveEnvironment()
 
 	// Check if secret exists locally or remotely first
-	exists, err := keyring.SecretExists(project.ProjectID, env, key)
+	exists, err := secretExists(project.ProjectID, env, key)
 	if err != nil {
-		return fmt.Errorf("failed to check if secret exists: %w", err)
-	}
-
-	if !exists {
-		// Fallback to checking remotely
-		if remoteKeys, err := secretsService.ListForEnv(env); err == nil {
-			for _, k := range remoteKeys {
-				if strings.EqualFold(k.Key, key) {
-					exists = true
-					break
-				}
-			}
-		}
+		return err
 	}
 
 	if !exists {
@@ -569,7 +598,7 @@ func runSecretsDelete(cmd *cobra.Command, args []string) error {
 	}
 
 	if err := ui.Spinner(fmt.Sprintf("Deleting %s...", key), func() error {
-		return secretsService.Delete(key)
+		return app.Secrets().Delete(key)
 	}); err != nil {
 		ui.Error(fmt.Sprintf("Delete: %v", err))
 		return nil
@@ -584,7 +613,7 @@ func runSecretsDiff(cmd *cobra.Command, args []string) error {
 
 	if err := ui.Spinner("Comparing secrets & allowlist...", func() error {
 		var e error
-		diff, e = secretsService.Diff(diffFrom, diffTo)
+		diff, e = app.Secrets().Diff(diffFrom, diffTo)
 		return e
 	}); err != nil {
 		ui.Error(fmt.Sprintf("Diff: %v", err))
@@ -595,7 +624,7 @@ func runSecretsDiff(cmd *cobra.Command, args []string) error {
 	var allowlistRemote []workspaces.AllowlistDomain
 	var allowlistLocal []string
 	if pc != nil && pc.WorkspaceID != "" {
-		if remote, err := workspaceService.ListAllowlist(pc.WorkspaceID); err == nil {
+		if remote, err := app.Workspaces().ListAllowlist(pc.WorkspaceID); err == nil {
 			allowlistRemote = remote
 		}
 		if local, err := keyring.GetWorkspaceAllowlist(pc.WorkspaceID); err == nil {

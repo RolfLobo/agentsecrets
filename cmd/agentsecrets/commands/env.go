@@ -146,7 +146,10 @@ func runEnv(cmd *cobra.Command, args []string) error {
 
 	if runErr != nil {
 		if exitErr, ok := runErr.(*exec.ExitError); ok {
-			os.Exit(exitErr.ExitCode())
+			// Propagate the child's exit code via ExitError instead of os.Exit so
+			// the deferred signal cleanup here and the telemetry flush in Execute
+			// still run. Silent: the child already produced its own output.
+			return &ExitError{Code: exitErr.ExitCode(), Silent: true}
 		}
 		return runErr
 	}

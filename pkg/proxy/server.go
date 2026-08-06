@@ -1,38 +1,71 @@
 package proxy
 
 import (
+	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
-	"os"
+	"net/url"
 	"strings"
+	"sync"
 	"time"
 
-	"github.com/The-17/agentsecrets/pkg/api"
 	"github.com/The-17/agentsecrets/pkg/capabilities"
-	"github.com/The-17/agentsecrets/pkg/keyring"
 )
 
 // Server is the HTTP proxy server that wraps the Engine.
 // It listens for incoming requests with X-AS-* headers, builds
 // CallRequests, executes them through the engine, and returns responses.
 type Server struct {
-	Port         int
-	Engine       *Engine
-	TokenCache   *TokenCache
-	APIClient    *api.Client
+	Port   int
+	Engine *Engine
+	mux    *http.ServeMux
+
+	// tokenMu guards SessionToken: it is read by every request handler and
+	// written by handleRotateSession, so concurrent access must be synchronized.
+	tokenMu      sync.RWMutex
 	SessionToken string
-	mux          *http.ServeMux
+}
+
+// GetSessionToken returns the current session token ("" when unset).
+func (s *Server) GetSessionToken() string {
+	s.tokenMu.RLock()
+	defer s.tokenMu.RUnlock()
+	return s.SessionToken
+}
+
+// SetSessionToken sets the session token. Used at startup (the CLI generates
+// the initial token) — rotation goes through handleRotateSession, which
+// generates the new token server-side.
+func (s *Server) SetSessionToken(token string) {
+	s.tokenMu.Lock()
+	s.SessionToken = token
+	s.tokenMu.Unlock()
+}
+
+// rotateSessionToken generates a fresh token server-side, stores it, and
+// returns it. The client never supplies the new token — trusting a client
+// would let an attacker who can reach the endpoint pick their own session key.
+func (s *Server) rotateSessionToken() (string, error) {
+	newToken, err := GenerateSessionToken()
+	if err != nil {
+		return "", err
+	}
+	s.tokenMu.Lock()
+	s.SessionToken = newToken
+	s.tokenMu.Unlock()
+	return newToken, nil
 }
 
 // NewServer creates a proxy server bound to the given port and engine.
 func NewServer(port int, engine *Engine) *Server {
 	s := &Server{
-		Port:       port,
-		Engine:     engine,
-		TokenCache: NewTokenCache(5 * time.Minute),
-		mux:        http.NewServeMux(),
+		Port:   port,
+		Engine: engine,
+		mux:    http.NewServeMux(),
 	}
 	s.mux.HandleFunc("/proxy", s.validateSession(s.handleProxy))
 	s.mux.HandleFunc("/health", s.handleHealth)
@@ -44,12 +77,13 @@ func NewServer(port int, engine *Engine) *Server {
 
 func (s *Server) validateSession(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if s.SessionToken == "" {
+		expected := s.GetSessionToken()
+		if expected == "" {
 			next(w, r)
 			return
 		}
 		token := r.Header.Get("X-AS-Session-Token")
-		if token == "" || token != s.SessionToken {
+		if token == "" || subtle.ConstantTimeCompare([]byte(token), []byte(expected)) != 1 {
 			writeError(w, http.StatusUnauthorized, "Invalid or missing session token")
 			return
 		}
@@ -57,21 +91,63 @@ func (s *Server) validateSession(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
-// Start begins listening and serving. This blocks until the server is stopped.
-func (s *Server) Start() error {
+// Start begins listening and serving. It blocks until ctx is cancelled (e.g.
+// on SIGINT/SIGTERM) or the server fails to serve. On cancellation it performs
+// a graceful shutdown: it stops accepting new connections and drains in-flight
+// requests within a bounded window before returning. The background workers
+// (audit sync, revocation refresh) also stop when ctx is done, so nothing keeps
+// running after Start returns.
+func (s *Server) Start(ctx context.Context) error {
 	addr := fmt.Sprintf("localhost:%d", s.Port)
 
-	// Launch background sync worker if audit logger is present
+	// Launch background sync worker if audit logger is present.
 	if s.Engine.Audit != nil {
-		go func() {
-			for {
-				time.Sleep(60 * time.Second)
-				_ = s.Engine.Audit.SyncUnpushedLogs()
-			}
-		}()
+		go runPeriodic(ctx, 60*time.Second, s.Engine.Audit.SyncUnpushedLogs)
 	}
 
-	return http.ListenAndServe(addr, s.mux)
+	// Fetch the revocation list on startup and refresh it periodically so
+	// revoked agent tokens stop working without a daemon restart.
+	_ = s.Engine.Sync()
+	go runPeriodic(ctx, 60*time.Second, s.Engine.Sync)
+
+	// Bind synchronously so a failed bind (port already in use) surfaces as an
+	// error from Start rather than being lost inside the serve goroutine.
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		return err
+	}
+
+	httpServer := &http.Server{Handler: s.mux}
+	errCh := make(chan error, 1)
+	go func() {
+		// Serve returns ErrServerClosed after a graceful Shutdown; that path is
+		// handled below via ctx.Done(), so only unexpected errors reach errCh.
+		errCh <- httpServer.Serve(ln)
+	}()
+
+	select {
+	case err := <-errCh:
+		return err
+	case <-ctx.Done():
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		return httpServer.Shutdown(shutdownCtx)
+	}
+}
+
+// runPeriodic invokes fn every interval until ctx is cancelled. The first call
+// happens after one interval (matching the original sleep-then-run cadence).
+func runPeriodic(ctx context.Context, interval time.Duration, fn func() error) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			_ = fn()
+		}
+	}
 }
 
 // handleHealth is a simple health check endpoint.
@@ -91,13 +167,20 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 
 // handleSync forces an immediate revocation list sync.
 func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
-	s.Engine.Sync()
+	if err := s.Engine.Sync(); err != nil {
+		writeError(w, http.StatusBadGateway, fmt.Sprintf("revocation sync failed: %v", err))
+		return
+	}
 
+	lastSync, revoked := s.Engine.GetState()
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(200)
-	json.NewEncoder(w).Encode(map[string]string{
-		"status":  "ok",
-		"message": "revocation sync triggered",
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"status":        "ok",
+		"message":       "revocation sync triggered",
+		"last_sync":     lastSync.Format(time.RFC3339),
+		"revoked_count": len(revoked),
+		"revoked_ids":   revoked,
 	})
 }
 
@@ -132,69 +215,69 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	agentID := r.Header.Get("X-AS-Agent-ID")
 	agentToken := r.Header.Get("X-AS-Agent-Token")
 
-	if agentToken == "" {
-		agentToken = os.Getenv("AS_AGENT_TOKEN")
-	}
-
-	// Resolve agent token references like <AGENTNAME>_TOKEN from the OS keychain
-	if agentToken != "" && strings.HasSuffix(strings.ToUpper(agentToken), "_TOKEN") && len(agentToken) > 6 {
-		agentName := agentToken[:len(agentToken)-6]
-		retrievedToken, err := keyring.GetAgentToken(agentName)
-		if err != nil {
-			// Fallback to lowercase agent name
-			retrievedToken, err = keyring.GetAgentToken(strings.ToLower(agentName))
-		}
-		if err != nil {
-			writeError(w, 401, fmt.Sprintf("Agent token reference %q was not found in the OS Keychain: %v", agentToken, err))
-			return
-		}
-		agentToken = retrievedToken
+	injections := parseInjections(r.Header)
+	if len(injections) == 0 {
+		writeError(w, 400, "At least one X-AS-Inject-* header is required")
+		return
 	}
 
 	identityLevel := "anonymous"
 	tokenID := ""
 	var callReqCaps *capabilities.AgentCapabilities
 
-	if agentToken != "" {
-		identityLevel = "issued"
-		tokenID = maskToken(agentToken)
-
-		// Validate token and extract capabilities
-		if s.TokenCache != nil && s.APIClient != nil {
-			cached, err := s.TokenCache.Validate(agentToken, s.APIClient)
-			if err != nil {
-				writeError(w, 401, fmt.Sprintf("Agent token validation failed: %v", err))
-				return
-			}
-			if agentID == "" {
-				agentID = cached.AgentName
-			}
-			if cached.TokenID != "" {
-				tokenID = cached.TokenID
-			}
-			callReqCaps = &cached.Capabilities
-
-			// Verify scope restrictions (Workspace and Project and Environment)
-			if cached.WorkspaceID != "" && cached.WorkspaceID != s.Engine.WorkspaceID {
-				writeError(w, 403, fmt.Sprintf("Agent '%s' is not authorized to access workspace '%s'.", agentID, s.Engine.WorkspaceID))
-				return
-			}
-			if cached.ProjectID != "" && cached.ProjectID != s.Engine.ProjectID {
-				writeError(w, 403, fmt.Sprintf("Agent '%s' is not authorized to access project '%s'.", agentID, s.Engine.ProjectID))
-				return
-			}
-			if cached.Environment != "" && !strings.EqualFold(cached.Environment, resolveEnvForAudit()) {
-				writeError(w, 403, fmt.Sprintf("Agent '%s' is not authorized to access the '%s' environment.", agentID, resolveEnvForAudit()))
-				return
-			}
-		}
-	} else if agentID != "" {
-		identityLevel = "declared"
-	}
-	injections := parseInjections(r.Header)
-	if len(injections) == 0 {
-		writeError(w, 400, "At least one X-AS-Inject-* header is required")
+	// Resolve/validate agent identity and enforce revocation + scope. This is the
+	// SAME decision logic the engine uses (Engine.resolveIdentity) — the server
+	// just maps the verdict to its own HTTP responses: a validation failure → 401,
+	// a scope/revocation block → 403. Unlike before, a block now also emits an
+	// audit record (via Engine.auditBlocked) so denials at the server layer are no
+	// longer invisible to the forensic log.
+	idr := s.Engine.resolveIdentity(CallRequest{
+		AgentID:    agentID,
+		AgentToken: agentToken,
+		Injections: injections,
+	})
+	switch idr.Outcome {
+	case identityError:
+		writeError(w, 401, idr.Err.Error())
 		return
+	case identityBlocked:
+		// Emit the same blocked-audit record the engine would, then return the
+		// server's existing 403 body ({"error": msg}) unchanged. Derive domain/
+		// path the same way the engine does (url.Parse + lowercased Hostname);
+		// best-effort, since a malformed URL would be rejected downstream anyway.
+		domain, path := "", ""
+		if pu, perr := url.Parse(targetURL); perr == nil {
+			domain = strings.ToLower(pu.Hostname())
+			path = pu.Path
+		}
+		allKeys := make([]string, 0, len(injections))
+		allStyles := make([]string, 0, len(injections))
+		for _, inj := range injections {
+			allKeys = append(allKeys, inj.SecretKey)
+			allStyles = append(allStyles, inj.Style)
+		}
+		auditReq := CallRequest{
+			TargetURL:     targetURL,
+			AgentID:       agentID,
+			IdentityLevel: "issued",
+			TokenID:       idr.ResolvedTokenID,
+		}
+		s.Engine.auditBlocked(auditReq, domain, method, path, idr.Reason, idr.Message, allKeys, allStyles)
+		writeError(w, 403, idr.Message)
+		return
+	case identityOK:
+		if idr.ResolvedToken != "" {
+			identityLevel = "issued"
+			tokenID = idr.ResolvedTokenID
+			if idr.ResolvedCapabilities != nil {
+				if agentID == "" {
+					agentID = idr.ResolvedAgentID
+				}
+				callReqCaps = idr.ResolvedCapabilities
+			}
+		} else if agentID != "" {
+			identityLevel = "declared"
+		}
 	}
 
 	// Read request body
@@ -337,33 +420,30 @@ func (s *Server) handleApprove(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// handleRotateSession handles rotating the server's session token.
+// handleRotateSession rotates the server's session token. The new token is
+// generated server-side (never trusted from the request body) and returned so
+// the CLI can persist it to the keyring.
 func (s *Server) handleRotateSession(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeError(w, http.StatusMethodNotAllowed, "POST required")
 		return
 	}
 
-	var req struct {
-		NewToken string `json:"new_token"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "Invalid JSON body")
+	// Drain the body so the request can be fully consumed regardless of payload.
+	_, _ = io.Copy(io.Discard, r.Body)
+
+	newToken, err := s.rotateSessionToken()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to generate new session token")
 		return
 	}
-
-	if req.NewToken == "" {
-		writeError(w, http.StatusBadRequest, "new_token is required")
-		return
-	}
-
-	s.SessionToken = req.NewToken
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(map[string]string{
-		"status":  "ok",
-		"message": "session token rotated successfully",
+		"status":     "ok",
+		"message":    "session token rotated successfully",
+		"new_token":  newToken,
 	})
 }
 

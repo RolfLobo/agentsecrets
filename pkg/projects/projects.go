@@ -36,24 +36,7 @@ func NewService(client *api.Client) *Service {
 
 // List returns all projects for the currently selected workspace
 func (s *Service) List() ([]Project, error) {
-	resp, err := s.API.Call("projects.list", "GET", nil, nil, nil)
-	if err != nil {
-		return nil, fmt.Errorf("list projects: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, s.API.DecodeError(resp)
-	}
-
-	var result struct {
-		Data []Project `json:"data"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return nil, fmt.Errorf("list projects: decode: %w", err)
-	}
-
-	return result.Data, nil
+	return api.CallJSON[[]Project](s.API, "projects.list", "GET", nil, nil, nil)
 }
 
 // Create creates a new project in the active workspace and binds it locally
@@ -85,29 +68,17 @@ func (s *Service) Create(name, description string) (*Project, error) {
 		data["description"] = description
 	}
 
-	resp, err := s.API.Call("projects.create", "POST", data, nil, nil)
+	resp, err := api.CallJSON[Project](s.API, "projects.create", "POST", data, nil, nil, http.StatusCreated)
 	if err != nil {
 		return nil, fmt.Errorf("create project: %w", err)
 	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusCreated {
-		return nil, s.API.DecodeError(resp)
-	}
-
-	var result struct {
-		Data Project `json:"data"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return nil, fmt.Errorf("create project: decode: %w", err)
-	}
 
 	// Bind locally
-	if err := s.bindLocally(&result.Data); err != nil {
+	if err := s.bindLocally(&resp); err != nil {
 		return nil, fmt.Errorf("create project: bind: %w", err)
 	}
 
-	return &result.Data, nil
+	return &resp, nil
 }
 
 // Use selects a project by name and updates the local .agentsecrets/project.json
@@ -122,29 +93,17 @@ func (s *Service) Use(name string) (*Project, error) {
 		"project_name": name,
 	}
 
-	resp, err := s.API.Call("projects.get", "GET", nil, params, nil)
+	resp, err := api.CallJSON[Project](s.API, "projects.get", "GET", nil, params, nil)
 	if err != nil {
 		return nil, fmt.Errorf("use project: %w", err)
 	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, s.API.DecodeError(resp)
-	}
-
-	var result struct {
-		Data Project `json:"data"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return nil, fmt.Errorf("use project: decode: %w", err)
-	}
 
 	// Update local config
-	if err := s.bindLocally(&result.Data); err != nil {
+	if err := s.bindLocally(&resp); err != nil {
 		return nil, fmt.Errorf("use project: bind: %w", err)
 	}
 
-	return &result.Data, nil
+	return &resp, nil
 }
 
 // bindLocally updates the fields in the existing .agentsecrets/project.json
@@ -202,14 +161,8 @@ func (s *Service) Update(oldName, newName, desc string) error {
 		"project_name": oldName,
 	}
 
-	resp, err := s.API.Call("projects.update", "PATCH", data, params, nil)
-	if err != nil {
+	if err := s.API.CallNoContent("projects.update", "PATCH", data, params, nil); err != nil {
 		return fmt.Errorf("update project: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return s.API.DecodeError(resp)
 	}
 
 	// Update local project config if the updated project is the currently active one
@@ -221,7 +174,9 @@ func (s *Service) Update(oldName, newName, desc string) error {
 		if desc != "" {
 			local.Description = desc
 		}
-		_ = config.SaveProjectConfig(local)
+		if err := config.SaveProjectConfig(local); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: rename succeeded on cloud but failed to update local project config: %v\n", err)
+		}
 	}
 
 	return nil
@@ -239,14 +194,8 @@ func (s *Service) Delete(name string) error {
 		"project_name": name,
 	}
 
-	resp, err := s.API.Call("projects.delete", "DELETE", nil, params, nil)
-	if err != nil {
+	if err := s.API.CallNoContent("projects.delete", "DELETE", nil, params, nil); err != nil {
 		return fmt.Errorf("delete project: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return s.API.DecodeError(resp)
 	}
 
 	// Unbind local project info if we just deleted the active one
@@ -349,7 +298,7 @@ func (s *Service) Invite(email, role string) error {
 		}
 
 		apiSecrets := []map[string]string{}
-		environments := []string{"development", "staging", "production"}
+		environments := config.ValidEnvironments
 
 		for _, env := range environments {
 			scrtResp, err := s.API.Call("secrets.list", "GET", nil, map[string]string{"project_id": project.ProjectID}, map[string]string{"environment": env})

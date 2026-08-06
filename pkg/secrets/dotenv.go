@@ -221,5 +221,6 @@ func writeLines(path string, lines []string) error {
 	if len(lines) > 0 && !strings.HasSuffix(content, "\n") {
 		content += "\n"
 	}
-	return os.WriteFile(path, []byte(content), 0644)
+	// .env files hold plaintext secret values — keep them owner-readable only.
+	return os.WriteFile(path, []byte(content), 0600)
 }

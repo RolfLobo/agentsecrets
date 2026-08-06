@@ -15,154 +15,123 @@ import (
 	"time"
 
 	"github.com/The-17/agentsecrets/pkg/api"
+	"github.com/The-17/agentsecrets/pkg/audit"
 	"github.com/The-17/agentsecrets/pkg/auth"
 	"github.com/The-17/agentsecrets/pkg/config"
 	_ "github.com/glebarez/go-sqlite"
 	"github.com/google/uuid"
 )
 
-// AuditEvent records a single proxied API call.
-// Secret KEY NAMES are logged. Secret VALUES are NEVER logged.
-type AuditEvent struct {
-	ID             string    `json:"id"`
-	Timestamp      time.Time `json:"timestamp"`
-	Environment    string    `json:"environment,omitempty"` // "development", "staging", "production"
-	SecretKeys     []string  `json:"secret_keys"`           // KEY NAMES e.g. ["STRIPE_SECRET_KEY"]
-	AgentID        string    `json:"agent_id,omitempty"`    // from agent identification
-	IdentityLevel  string    `json:"identity_level"`        // "anonymous", "declared", "issued"
-	Method         string    `json:"method"`
-	TargetURL      string    `json:"target_url"`
-	Domain         string    `json:"domain,omitempty"` // Target domain (e.g. "api.stripe.com")
-	AuthStyles     []string  `json:"auth_styles"`      // e.g. ["bearer"]
-	StatusCode     int       `json:"status_code"`
-	DurationMs     int64     `json:"duration_ms"`
-	Status         string    `json:"status"`           // "OK" or "BLOCKED"
-	Reason         string    `json:"reason,omitempty"` // "domain_not_in_allowlist" or "-"
-	Redacted       bool      `json:"redacted"`
-	ResolutionPath string    `json:"resolution_path"`       // e.g. "local proxy", "cloud"
-	CallerRole     string    `json:"caller_role,omitempty"` // e.g. "member"
-	WorkspaceID    string    `json:"workspace_id,omitempty"`
-	ProjectID      string    `json:"project_id,omitempty"`
-	TokenID        string    `json:"token_id,omitempty"`
-}
-
-type ForensicAuditEvent struct {
-	ID          string           `json:"id"`
-	Version     string           `json:"version"`
-	CreatedAt   time.Time        `json:"created_at"`
-	WorkspaceID string           `json:"workspace_id"`
-	ProjectID   string           `json:"project_id"`
-	Event       EventBlock       `json:"event"`
-	Snapshot    SnapshotBlock    `json:"snapshot"`
-	Enforcement EnforcementBlock `json:"enforcement"`
-	Resolution  ResolutionBlock  `json:"resolution"`
-	ChainHash   string           `json:"chain_hash"`
-}
-
-type EventBlock struct {
-	Type          string         `json:"type"` // "proxy_call"
-	KeyName       string         `json:"key_name"`
-	Domain        string         `json:"domain"`
-	Path          string         `json:"path"`
-	Method        string         `json:"method"`
-	StatusCode    int            `json:"status_code"`
-	Outcome       string         `json:"outcome"`
-	LatencyMs     int64          `json:"latency_ms"`
-	AgentIdentity *AgentIdentity `json:"agent_identity,omitempty"`
-	Environment   string         `json:"environment"`
-	SecContractID string         `json:"sec_contract_id,omitempty"`
-}
-
-type AgentIdentity struct {
-	TokenName       string `json:"token_name"`
-	TokenID         string `json:"token_id"`
-	IdentityLevel   string `json:"identity_level"`
-	ProcessVerified bool   `json:"process_verified"`
-}
-
-type SnapshotBlock struct {
-	CapturedAt        time.Time             `json:"captured_at"`
-	Workspace         WorkspaceSnapshot     `json:"workspace"`
-	Project           ProjectSnapshot       `json:"project"`
-	SecretsInScope    []string              `json:"secrets_in_scope"`
-	SecretsCount      int                   `json:"secrets_count"`
-	AgentCapabilities *CapabilitiesSnapshot `json:"agent_capabilities,omitempty"`
-	SecretsPolicy     *PolicySnapshot       `json:"secrets_policy,omitempty"`
-	KeychainAuth      KeychainAuthSnapshot  `json:"keychain_auth"`
-	Proxy             ProxySnapshot         `json:"proxy"`
-}
-
-type WorkspaceSnapshot struct {
-	ID             string   `json:"id"`
-	Name           string   `json:"name"`
-	Allowlist      []string `json:"allowlist"`
-	AllowlistCount int      `json:"allowlist_count"`
-}
-
-type ProjectSnapshot struct {
-	ID          string `json:"id"`
-	Name        string `json:"name"`
-	Environment string `json:"environment"`
-}
-
-type CapabilitiesSnapshot struct {
-	TokenName       string   `json:"token_name"`
-	AllowedProjects []string `json:"allowed_projects"`
-	AllowedSecrets  []string `json:"allowed_secrets"`
-	Scopes          []string `json:"scopes"`
-}
-
-type PolicySnapshot struct {
-	KeyName         string   `json:"key_name"`
-	AllowedDomains  []string `json:"allowed_domains"`
-	AllowedMethods  []string `json:"allowed_methods"`
-	ViolationAction string   `json:"violation_action"`
-	PolicyVersion   string   `json:"policy_version"`
-}
-
-type KeychainAuthSnapshot struct {
-	Authenticated       bool `json:"authenticated"`
-	ProcessHashVerified bool `json:"process_hash_verified"`
-	SessionBound        bool `json:"session_bound"`
-}
-
-type ProxySnapshot struct {
-	Version   string `json:"version"`
-	Port      int    `json:"port"`
-	Transient bool   `json:"transient"`
-}
-
-type EnforcementBlock struct {
-	Decision          string            `json:"decision"` // "permitted" | "blocked" | ...
-	DecidedBy         string            `json:"decided_by"`
-	LayersEvaluated   []EvaluationLayer `json:"layers_evaluated"`
-	FirstFailureLayer string            `json:"first_failure_layer,omitempty"`
-}
-
-type EvaluationLayer struct {
-	Layer          string `json:"layer"` // "agent_capabilities" | "workspace_allowlist" | "secrets_policy"
-	Result         string `json:"result"` // "pass" | "fail"
-	Reason         string `json:"reason"`
-	ActionRequired string `json:"action_required,omitempty"`
-}
-
-type ResolutionBlock struct {
-	CredentialInjected bool   `json:"credential_injected"`
-	InjectionStyle     string `json:"injection_style,omitempty"`
-	ResponseScanned    bool   `json:"response_scanned"`
-	RedactionTriggered bool   `json:"redaction_triggered"`
-	RedactionPattern   string `json:"redaction_pattern,omitempty"`
-	RedactedField      string `json:"redacted_field,omitempty"`
-	Replacement        string `json:"replacement,omitempty"`
-	SSRFCheckPassed    bool   `json:"ssrf_check_passed"`
-	ResponseStatus     int    `json:"response_status"`
-}
+// The audit event data types now live in pkg/audit so that consumers (pkg/log,
+// pkg/mcp, CLI exporters) can share them without importing pkg/proxy. These
+// aliases keep every existing proxy.AuditEvent / proxy.ForensicAuditEvent (etc.)
+// reference valid with zero churn — they are the SAME types, not copies.
+type (
+	AuditEvent           = audit.AuditEvent
+	ForensicAuditEvent   = audit.ForensicAuditEvent
+	EventBlock           = audit.EventBlock
+	AgentIdentity        = audit.AgentIdentity
+	SnapshotBlock        = audit.SnapshotBlock
+	WorkspaceSnapshot    = audit.WorkspaceSnapshot
+	ProjectSnapshot      = audit.ProjectSnapshot
+	CapabilitiesSnapshot = audit.CapabilitiesSnapshot
+	PolicySnapshot       = audit.PolicySnapshot
+	KeychainAuthSnapshot = audit.KeychainAuthSnapshot
+	ProxySnapshot        = audit.ProxySnapshot
+	EnforcementBlock     = audit.EnforcementBlock
+	EvaluationLayer      = audit.EvaluationLayer
+	ResolutionBlock      = audit.ResolutionBlock
+)
 
 // AuditLogger writes AuditEvents to a local SQLite database and syncs them to the cloud.
+//
+// Writes are performed asynchronously by a single background goroutine draining
+// writeCh. Using one writer preserves both insertion order and the forensic
+// hash-chain (each LogForensic reads the previous row's ID before inserting),
+// while keeping the two SQLite writes + the chain-hash SELECT off the proxy's
+// request-handling path. Close() drains outstanding writes; SyncUnpushedLogs()
+// flushes before reading so it always sees a consistent view.
 type AuditLogger struct {
 	db        *sql.DB
 	APIClient *api.Client
-	mu        sync.Mutex
+	mu        sync.Mutex // serializes the background writer against SyncUnpushedLogs
+
+	writeCh   chan func()
+	wg        sync.WaitGroup
+	closeOnce sync.Once
+	closed    chan struct{}
+}
+
+// auditWriteBuffer bounds the number of queued audit writes. Kept small so an
+// abrupt process exit can only lose a handful of not-yet-flushed events; a full
+// buffer falls back to a synchronous write rather than dropping the event.
+const auditWriteBuffer = 256
+
+// startWriter launches the single background write goroutine. It drains
+// writeCh until closed is signalled AND the queue is empty, so events enqueued
+// right before Close still land.
+func (a *AuditLogger) startWriter() {
+	a.writeCh = make(chan func(), auditWriteBuffer)
+	a.closed = make(chan struct{})
+	a.wg.Add(1)
+	go func() {
+		defer a.wg.Done()
+		for {
+			select {
+			case fn := <-a.writeCh:
+				fn()
+			case <-a.closed:
+				// Drain whatever is still queued, then exit.
+				for {
+					select {
+					case fn := <-a.writeCh:
+						fn()
+					default:
+						return
+					}
+				}
+			}
+		}
+	}()
+}
+
+// enqueue schedules fn on the background writer. If the buffer is full or the
+// logger is closing, fn runs synchronously so an audit event is never dropped.
+func (a *AuditLogger) enqueue(fn func()) {
+	select {
+	case <-a.closed:
+		fn()
+		return
+	default:
+	}
+	select {
+	case a.writeCh <- fn:
+	case <-a.closed:
+		fn()
+	default:
+		// Buffer full — write inline rather than lose the event.
+		fn()
+	}
+}
+
+// Flush blocks until all writes enqueued before this call have completed. It is
+// the synchronization barrier for same-process read-after-write consumers: the
+// proxy write path is fire-and-forget (Log/LogForensic only enqueue), so without
+// a Flush a just-logged event may not yet be visible in SQLite. Used internally
+// by SyncUnpushedLogs before it reads unsynced rows, and by callers that log then
+// immediately query the same database.
+func (a *AuditLogger) Flush() {
+	select {
+	case <-a.closed:
+		return
+	default:
+	}
+	done := make(chan struct{})
+	select {
+	case a.writeCh <- func() { close(done) }:
+		<-done
+	case <-a.closed:
+	}
 }
 
 // DefaultLogPath returns the default audit database path: ~/.agentsecrets/audit.db
@@ -298,54 +267,58 @@ func NewAuditLogger(dbPath string) (*AuditLogger, error) {
 		return nil, fmt.Errorf("failed to initialize indexes: %w", err)
 	}
 
-	return &AuditLogger{db: db}, nil
+	a := &AuditLogger{db: db}
+	a.startWriter()
+	return a, nil
 }
 
-// Log writes a single audit event to the SQLite database.
+// Log writes a single audit event to the SQLite database asynchronously.
+// Returns nil once the event is queued (or written synchronously if the
+// buffer is full / the logger is shutting down).
 func (a *AuditLogger) Log(event AuditEvent) error {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-
 	if event.ID == "" {
 		event.ID = "log_" + strings.ReplaceAll(uuid.New().String(), "-", "")
 	}
-
 	keysJSON, _ := json.Marshal(event.SecretKeys)
 	stylesJSON, _ := json.Marshal(event.AuthStyles)
 
-	query := `
-	INSERT INTO audit_events (
-		id, timestamp, environment, agent_id, identity_level, method, target_url, 
-		domain, status_code, duration_ms, status, reason, redacted, 
-		resolution_path, caller_role, workspace_id, project_id, token_id, 
-		secret_keys, auth_styles
-	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`
+	a.enqueue(func() {
+		a.mu.Lock()
+		defer a.mu.Unlock()
 
-	_, err := a.db.ExecContext(context.Background(), query,
-		event.ID,
-		event.Timestamp.UTC(), // Important standard for SQLite
-		event.Environment,
-		event.AgentID,
-		event.IdentityLevel,
-		event.Method,
-		event.TargetURL,
-		event.Domain,
-		event.StatusCode,
-		event.DurationMs,
-		event.Status,
-		event.Reason,
-		event.Redacted,
-		event.ResolutionPath,
-		event.CallerRole,
-		event.WorkspaceID,
-		event.ProjectID,
-		event.TokenID,
-		string(keysJSON),
-		string(stylesJSON),
-	)
+		query := `
+		INSERT INTO audit_events (
+			id, timestamp, environment, agent_id, identity_level, method, target_url,
+			domain, status_code, duration_ms, status, reason, redacted,
+			resolution_path, caller_role, workspace_id, project_id, token_id,
+			secret_keys, auth_styles
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		`
 
-	return err
+		_, _ = a.db.ExecContext(context.Background(), query,
+			event.ID,
+			event.Timestamp.UTC(), // Important standard for SQLite
+			event.Environment,
+			event.AgentID,
+			event.IdentityLevel,
+			event.Method,
+			event.TargetURL,
+			event.Domain,
+			event.StatusCode,
+			event.DurationMs,
+			event.Status,
+			event.Reason,
+			event.Redacted,
+			event.ResolutionPath,
+			event.CallerRole,
+			event.WorkspaceID,
+			event.ProjectID,
+			event.TokenID,
+			string(keysJSON),
+			string(stylesJSON),
+		)
+	})
+	return nil
 }
 
 // SyncUnpushedLogs reads unsynced events from the database, pushes them to the cloud API,
@@ -357,6 +330,10 @@ func (a *AuditLogger) SyncUnpushedLogs() error {
 	if !config.IsAuthenticated() {
 		return nil // Skip syncing if user has no active session
 	}
+
+	// Ensure all queued async writes have landed before we read unsynced rows,
+	// so a just-logged event isn't missed by this sync pass.
+	a.Flush()
 
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -545,14 +522,8 @@ func (a *AuditLogger) SyncUnpushedLogs() error {
 	}
 
 	// 3. POST to Cloud Backend
-	resp, err := a.APIClient.Call("audit.sync", "POST", payload, nil, nil)
-	if err != nil {
+	if err := a.APIClient.CallNoContent("audit.sync", "POST", payload, nil, nil); err != nil {
 		return fmt.Errorf("audit.sync API call failed: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode >= 300 {
-		return fmt.Errorf("audit.sync returned status: %s", resp.Status)
 	}
 
 	// 4. Update sync status for standard logs
@@ -586,8 +557,15 @@ func (a *AuditLogger) SyncUnpushedLogs() error {
 	return nil
 }
 
-// Close closes the underlying database connection.
+// Close drains any queued audit writes, stops the background writer, and closes
+// the underlying database connection. Safe to call multiple times.
 func (a *AuditLogger) Close() error {
+	a.closeOnce.Do(func() {
+		if a.closed != nil {
+			close(a.closed)
+		}
+		a.wg.Wait()
+	})
 	if a.db != nil {
 		return a.db.Close()
 	}
@@ -600,10 +578,11 @@ func (a *AuditLogger) DB() *sql.DB {
 }
 
 // LogForensic writes a forensic audit event with snapshot state and a cryptographic hash chain.
+//
+// The write (previous-ID lookup, chain-hash computation, insert) runs on the
+// single background writer goroutine, which guarantees the hash chain stays
+// correctly ordered without blocking the caller (the proxy request path).
 func (a *AuditLogger) LogForensic(event ForensicAuditEvent) error {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-
 	if event.ID == "" {
 		event.ID = "log_" + strings.ReplaceAll(uuid.New().String(), "-", "")
 	}
@@ -614,63 +593,68 @@ func (a *AuditLogger) LogForensic(event ForensicAuditEvent) error {
 		event.CreatedAt = time.Now().UTC()
 	}
 
-	// 1. Get previous entry's ID to compute the chain hash
-	prevID := "genesis_block"
-	var lastID string
-	err := a.db.QueryRowContext(context.Background(),
-		"SELECT id FROM forensic_audit_events ORDER BY created_at DESC, id DESC LIMIT 1",
-	).Scan(&lastID)
-	if err == nil && lastID != "" {
-		prevID = lastID
-	}
+	a.enqueue(func() {
+		a.mu.Lock()
+		defer a.mu.Unlock()
 
-	// 2. Compute chain hash: sha256(prevID + currentID + created_at_RFC3339)
-	tsStr := event.CreatedAt.Format(time.RFC3339Nano)
-	h := sha256.New()
-	h.Write([]byte(prevID + event.ID + tsStr))
-	event.ChainHash = fmt.Sprintf("%x", h.Sum(nil))
+		// 1. Get previous entry's ID to compute the chain hash
+		prevID := "genesis_block"
+		var lastID string
+		err := a.db.QueryRowContext(context.Background(),
+			"SELECT id FROM forensic_audit_events ORDER BY created_at DESC, id DESC LIMIT 1",
+		).Scan(&lastID)
+		if err == nil && lastID != "" {
+			prevID = lastID
+		}
 
-	// 3. Marshal nested blocks to JSON strings
-	eventJSON, _ := json.Marshal(event.Event)
-	snapshotJSON, _ := json.Marshal(event.Snapshot)
-	enforcementJSON, _ := json.Marshal(event.Enforcement)
-	resolutionJSON, _ := json.Marshal(event.Resolution)
+		// 2. Compute chain hash: sha256(prevID + currentID + created_at_RFC3339)
+		tsStr := event.CreatedAt.Format(time.RFC3339Nano)
+		h := sha256.New()
+		h.Write([]byte(prevID + event.ID + tsStr))
+		event.ChainHash = fmt.Sprintf("%x", h.Sum(nil))
 
-	var agentID, tokenID string
-	if event.Event.AgentIdentity != nil {
-		agentID = event.Event.AgentIdentity.TokenName
-		tokenID = event.Event.AgentIdentity.TokenID
-	}
+		// 3. Marshal nested blocks to JSON strings
+		eventJSON, _ := json.Marshal(event.Event)
+		snapshotJSON, _ := json.Marshal(event.Snapshot)
+		enforcementJSON, _ := json.Marshal(event.Enforcement)
+		resolutionJSON, _ := json.Marshal(event.Resolution)
 
-	// 4. Insert into DB
-	query := `
-	INSERT INTO forensic_audit_events (
-		id, version, created_at, workspace_id, project_id, environment, agent_id, 
-		token_id, domain, method, status_code, outcome, latency_ms, chain_hash,
-		event_json, snapshot_json, enforcement_json, resolution_json
-	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`
-	_, err = a.db.ExecContext(context.Background(), query,
-		event.ID,
-		event.Version,
-		event.CreatedAt.UTC(),
-		event.WorkspaceID,
-		event.ProjectID,
-		event.Event.Environment,
-		agentID,
-		tokenID,
-		event.Event.Domain,
-		event.Event.Method,
-		event.Event.StatusCode,
-		event.Event.Outcome,
-		event.Event.LatencyMs,
-		event.ChainHash,
-		string(eventJSON),
-		string(snapshotJSON),
-		string(enforcementJSON),
-		string(resolutionJSON),
-	)
-	return err
+		var agentID, tokenID string
+		if event.Event.AgentIdentity != nil {
+			agentID = event.Event.AgentIdentity.TokenName
+			tokenID = event.Event.AgentIdentity.TokenID
+		}
+
+		// 4. Insert into DB
+		query := `
+		INSERT INTO forensic_audit_events (
+			id, version, created_at, workspace_id, project_id, environment, agent_id,
+			token_id, domain, method, status_code, outcome, latency_ms, chain_hash,
+			event_json, snapshot_json, enforcement_json, resolution_json
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		`
+		_, _ = a.db.ExecContext(context.Background(), query,
+			event.ID,
+			event.Version,
+			event.CreatedAt.UTC(),
+			event.WorkspaceID,
+			event.ProjectID,
+			event.Event.Environment,
+			agentID,
+			tokenID,
+			event.Event.Domain,
+			event.Event.Method,
+			event.Event.StatusCode,
+			event.Event.Outcome,
+			event.Event.LatencyMs,
+			event.ChainHash,
+			string(eventJSON),
+			string(snapshotJSON),
+			string(enforcementJSON),
+			string(resolutionJSON),
+		)
+	})
+	return nil
 }
 
 // LogManagementEvent logs a workspace management action to the local forensic database.

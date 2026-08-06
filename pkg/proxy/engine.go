@@ -33,6 +33,43 @@ func resolveEnvForAudit() string {
 
 const redactionPlaceholder = "[REDACTED_BY_AGENTSECRETS]"
 
+// redactionRegexCache memoizes the compiled masked-pattern regex per secret
+// value. Redaction runs on every proxied response, and recompiling the same
+// pattern each time is pure overhead. Bounded so a churn of distinct secrets
+// can't grow it without limit.
+var (
+	redactionRegexCache   = map[string]*regexp.Regexp{}
+	redactionRegexCacheMu sync.Mutex
+)
+
+const redactionRegexCacheMax = 256
+
+// maskedPrefixRegex returns the compiled masked/truncated-echo pattern for a
+// secret value, or nil if the pattern is invalid. Results are cached.
+func maskedPrefixRegex(secretValue string, prefixLen int) *regexp.Regexp {
+	redactionRegexCacheMu.Lock()
+	defer redactionRegexCacheMu.Unlock()
+
+	if re, ok := redactionRegexCache[secretValue]; ok {
+		return re
+	}
+
+	escapedPrefix := regexp.QuoteMeta(secretValue[:prefixLen])
+	pattern := escapedPrefix + `[\*\.\-_#]{1,4}[^\s"'\\,}\]]{0,30}`
+	re, err := regexp.Compile(pattern)
+	if err != nil {
+		return nil
+	}
+
+	// Bound the cache: on overflow, drop it wholesale rather than track LRU —
+	// simple and adequate for a per-process cache of active secrets.
+	if len(redactionRegexCache) >= redactionRegexCacheMax {
+		redactionRegexCache = map[string]*regexp.Regexp{}
+	}
+	redactionRegexCache[secretValue] = re
+	return re
+}
+
 // redactSecretFromResponse removes all detectable forms of secretValue from body.
 //
 // APIs frequently echo credentials back in error messages — sometimes verbatim,
@@ -70,11 +107,10 @@ func redactSecretFromResponse(body []byte, secretValue string) []byte {
 		if len(secretValue) >= 16 {
 			prefixLen = 8
 		}
-		escapedPrefix := regexp.QuoteMeta(secretValue[:prefixLen])
 		// Pattern: <prefix>[mask chars][any non-whitespace/quote chars up to ~30 chars]
 		// We stop at whitespace, quote, or common JSON terminators to avoid over-redaction.
-		pattern := escapedPrefix + `[\*\.\-_#]{1,4}[^\s"'\\,}\]]{0,30}`
-		if re, err := regexp.Compile(pattern); err == nil {
+		// Compiled once per secret and cached (see maskedPrefixRegex).
+		if re := maskedPrefixRegex(secretValue, prefixLen); re != nil {
 			body = re.ReplaceAll(body, []byte(redactionPlaceholder))
 		}
 	}
@@ -258,26 +294,18 @@ func NewEngine(projectID string) (*Engine, error) {
 
 		// Keychain is empty (or failed/malformed) — fallback to cloud API
 		if eng.APIClient != nil {
-			resp, err := eng.APIClient.Call("secrets.get_policy", "GET", nil, map[string]string{
+			policy, err := api.CallJSON[capabilities.SecretPolicy](eng.APIClient, "secrets.get_policy", "GET", nil, map[string]string{
 				"project_id":  projectID,
 				"environment": resolveEnvForAudit(),
 				"key":         key,
 			}, nil)
 			if err == nil {
-				defer resp.Body.Close()
-				if resp.StatusCode == http.StatusOK {
-					var res struct {
-						Data capabilities.SecretPolicy `json:"data"`
-					}
-					if err := json.NewDecoder(resp.Body).Decode(&res); err == nil {
-						// Cache in local keyring
-						pBytes, err := json.Marshal(res.Data)
-						if err == nil {
-							_ = keyring.SetSecretPolicy(projectID, resolveEnvForAudit(), key, pBytes)
-						}
-						return &res.Data, nil
-					}
+				// Cache in local keyring
+				pBytes, err := json.Marshal(policy)
+				if err == nil {
+					_ = keyring.SetSecretPolicy(projectID, resolveEnvForAudit(), key, pBytes)
 				}
+				return &policy, nil
 			}
 		}
 
@@ -308,6 +336,153 @@ func NewEngine(projectID string) (*Engine, error) {
 	}
 
 	return eng, nil
+}
+
+// identityOutcome is the verdict from resolveIdentity.
+type identityOutcome int
+
+const (
+	// identityOK — token (if any) validated and all scope checks passed. The
+	// resolved fields on identityResult should be applied to the CallRequest.
+	identityOK identityOutcome = iota
+	// identityBlocked — a revocation or scope check failed. Reason/Message carry
+	// the block reason and human-facing text; the caller decides how to surface
+	// it (engine → logBlocked 403; server → writeError 403 + audit).
+	identityBlocked
+	// identityError — token validation itself failed (bad/expired token, API
+	// error). Err is set; caller surfaces it (engine → return err; server → 401).
+	identityError
+)
+
+// identityResult is the outcome of resolveIdentity. On identityOK the Resolved*
+// fields describe how to populate the CallRequest before enforcement; on the
+// other outcomes the relevant Reason/Message or Err is set instead.
+type identityResult struct {
+	Outcome identityOutcome
+
+	// Populated on identityOK (when a token was validated).
+	ResolvedToken        string // the concrete token after <AGENT>_TOKEN deref
+	ResolvedAgentID      string
+	ResolvedTokenID      string
+	ResolvedIdentityLevel string
+	ResolvedCapabilities *capabilities.AgentCapabilities
+
+	// Populated on identityBlocked.
+	Reason  string
+	Message string
+
+	// Populated on identityError.
+	Err error
+}
+
+// resolveIdentity performs the agent-token resolution, validation, revocation,
+// and workspace/project/environment scope checks that BOTH the engine and the
+// HTTP server need. It is a pure decision function: no audit writes, no HTTP
+// responses, no telemetry — the caller owns those side effects so each path can
+// keep its own surfacing (the engine's forensic 403 vs the server's writeError).
+//
+// It mirrors the original inline logic exactly: only tokens that are non-empty
+// AND arrive without pre-resolved capabilities are validated here (the server
+// pre-validates and hands the engine a non-nil Capabilities, which short-circuits
+// a second validation — preserved by the caller checking req.Capabilities).
+func (e *Engine) resolveIdentity(req CallRequest) identityResult {
+	token := req.AgentToken
+	if token == "" {
+		token = req.TokenID
+	}
+	if token == "" {
+		token = os.Getenv("AS_AGENT_TOKEN")
+	}
+
+	// Resolve agent token references like <AGENTNAME>_TOKEN from the OS keychain.
+	if token != "" && strings.HasSuffix(strings.ToUpper(token), "_TOKEN") && len(token) > 6 {
+		agentName := token[:len(token)-6]
+		retrievedToken, err := keyring.GetAgentToken(agentName)
+		if err != nil {
+			// Fallback to lowercase agent name
+			retrievedToken, err = keyring.GetAgentToken(strings.ToLower(agentName))
+		}
+		if err != nil {
+			return identityResult{
+				Outcome: identityError,
+				Err: fmt.Errorf("agent token reference %q was not found in the OS Keychain. Please run 'agentsecrets agent token issue %s' to create and save it in your keychain first", token, agentName),
+			}
+		}
+		token = retrievedToken
+	}
+
+	res := identityResult{Outcome: identityOK, ResolvedToken: token}
+
+	if token == "" {
+		return res
+	}
+
+	res.ResolvedIdentityLevel = "issued"
+	res.ResolvedTokenID = maskToken(token)
+
+	if e.TokenCache == nil {
+		return res
+	}
+
+	cached, err := e.TokenCache.Validate(token, e.APIClient)
+	if err != nil {
+		return identityResult{
+			Outcome: identityError,
+			Err: fmt.Errorf("agent token validation failed: %w", err),
+		}
+	}
+
+	res.ResolvedAgentID = cached.AgentName
+	if cached.TokenID != "" {
+		res.ResolvedTokenID = cached.TokenID
+	}
+	res.ResolvedCapabilities = &cached.Capabilities
+
+	// Revocation check: a revoked token ID (or the agent itself) is blocked even
+	// if its capabilities are still cached locally.
+	agentIDForMsg := req.AgentID
+	if agentIDForMsg == "" || agentIDForMsg == "cli" {
+		agentIDForMsg = cached.AgentName
+	}
+	if e.IsTokenRevoked(cached.TokenID) {
+		return identityResult{
+			Outcome: identityBlocked,
+			Reason:  "token_revoked",
+			Message: fmt.Sprintf("Agent token '%s' has been revoked and can no longer be used.", res.ResolvedTokenID),
+		}
+	}
+	if e.IsTokenRevoked(cached.AgentID) {
+		return identityResult{
+			Outcome: identityBlocked,
+			Reason:  "token_revoked",
+			Message: fmt.Sprintf("Agent '%s' has been revoked and can no longer be used.", agentIDForMsg),
+		}
+	}
+
+	// Verify scope restrictions (Workspace and Project and Environment).
+	if cached.WorkspaceID != "" && cached.WorkspaceID != e.WorkspaceID {
+		return identityResult{
+			Outcome: identityBlocked,
+			Reason:  "agent_workspace_mismatch",
+			Message: fmt.Sprintf("Agent '%s' is not authorized to access workspace '%s'.", agentIDForMsg, e.WorkspaceID),
+		}
+	}
+	if cached.ProjectID != "" && cached.ProjectID != e.ProjectID {
+		return identityResult{
+			Outcome: identityBlocked,
+			Reason:  "agent_project_mismatch",
+			Message: fmt.Sprintf("Agent '%s' is not authorized to access project '%s'.", agentIDForMsg, e.ProjectID),
+		}
+	}
+	if cached.Environment != "" && !strings.EqualFold(cached.Environment, resolveEnvForAudit()) {
+		return identityResult{
+			Outcome: identityBlocked,
+			Reason:  "agent_environment_mismatch",
+			Message: fmt.Sprintf("Agent '%s' is not authorized to access the '%s' environment.", agentIDForMsg, resolveEnvForAudit()),
+		}
+	}
+
+	return res
 }
 
 // Execute runs the full proxy pipeline: resolve secrets → inject → forward → audit.
@@ -348,45 +523,20 @@ func (e *Engine) Execute(req CallRequest) (*CallResult, error) {
 
 	targetDomain := strings.ToLower(u.Hostname())
 
-	// Initialize secretKeys and authStyles for logBlocked capture
-	secretKeys := make([]string, 0, len(req.Injections))
-	authStyles := make([]string, 0, len(req.Injections))
+	// Capture the full injection key/style lists up-front for blocked-path audit
+	// records. These are DISTINCT from the secretKeys/authStyles accumulated
+	// during injection in the tail stages — the two used to share one backing
+	// array (the old `secretKeys[:0]` reset), which was an aliasing hazard.
+	allKeys := make([]string, 0, len(req.Injections))
+	allStyles := make([]string, 0, len(req.Injections))
 	for _, inj := range req.Injections {
-		secretKeys = append(secretKeys, inj.SecretKey)
-		authStyles = append(authStyles, inj.Style)
+		allKeys = append(allKeys, inj.SecretKey)
+		allStyles = append(allStyles, inj.Style)
 	}
 
 	logBlocked := func(reason, msg string) (*CallResult, error) {
 		telemetry.RecordProxyBlocked()
-		if e.Audit != nil {
-			_ = e.Audit.Log(AuditEvent{
-				Timestamp:      time.Now().UTC(),
-				Environment:    resolveEnvForAudit(),
-				SecretKeys:     secretKeys,
-				AgentID:        req.AgentID,
-				IdentityLevel:  req.IdentityLevel,
-				TokenID:        req.TokenID,
-				Method:         method,
-				TargetURL:      req.TargetURL,
-				Domain:         targetDomain,
-				AuthStyles:     authStyles,
-				StatusCode:     403,
-				DurationMs:     0,
-				Status:         "BLOCKED",
-				Reason:         reason,
-				ResolutionPath: "local proxy",
-				WorkspaceID:    e.WorkspaceID,
-				ProjectID:      e.ProjectID,
-			})
-			enforcement := makeEnforcementBlock(reason, msg, targetDomain, method, req.AgentID, secretKeys)
-			resolution := ResolutionBlock{
-				CredentialInjected: false,
-				ResponseScanned:    false,
-				SSRFCheckPassed:    true,
-				ResponseStatus:     403,
-			}
-			e.logForensic(req, targetDomain, method, u.Path, 403, "blocked", 0, secretKeys, authStyles, enforcement, resolution)
-		}
+		e.auditBlocked(req, targetDomain, method, u.Path, reason, msg, allKeys, allStyles)
 
 		bodyJSONBytes, _ := json.Marshal(map[string]string{"error": reason, "domain": targetDomain, "message": msg})
 		headers := make(map[string][]string)
@@ -426,55 +576,33 @@ func (e *Engine) Execute(req CallRequest) (*CallResult, error) {
 		return logBlocked("non_https_blocked", "Non-HTTPS requests are strictly blocked by the proxy to prevent credential exposure. Use HTTPS instead.")
 	}
 
-	// 3. Resolve Agent Identity and enforce capabilities and workspace/project/environment scopes
-	token := req.AgentToken
-	if token == "" {
-		token = req.TokenID
-	}
-	if token == "" {
-		token = os.Getenv("AS_AGENT_TOKEN")
-	}
-
-	// Resolve agent token references like <AGENTNAME>_TOKEN from the OS keychain
-	if token != "" && strings.HasSuffix(strings.ToUpper(token), "_TOKEN") && len(token) > 6 {
-		agentName := token[:len(token)-6]
-		retrievedToken, err := keyring.GetAgentToken(agentName)
-		if err != nil {
-			// Fallback to lowercase agent name
-			retrievedToken, err = keyring.GetAgentToken(strings.ToLower(agentName))
-		}
-		if err != nil {
-			return nil, fmt.Errorf("agent token reference %q was not found in the OS Keychain. Please run 'agentsecrets agent token issue %s' to create and save it in your keychain first", token, agentName)
-		}
-		token = retrievedToken
-	}
-
-	if token != "" && req.Capabilities == nil {
-		req.IdentityLevel = "issued"
-		req.TokenID = maskToken(token)
-
-		if e.TokenCache != nil {
-			cached, err := e.TokenCache.Validate(token, e.APIClient)
-			if err != nil {
-				return nil, fmt.Errorf("agent token validation failed: %w", err)
+	// 3. Resolve Agent Identity and enforce capabilities and workspace/project/environment scopes.
+	// Shared with server.handleProxy via resolveIdentity (a pure decision fn);
+	// the engine surfaces a blocked verdict through logBlocked (forensic 403) and
+	// a validation failure through a returned error. The req.Capabilities == nil
+	// gate is preserved: the server pre-validates and passes non-nil Capabilities,
+	// which (as before) skips a second validation here.
+	if req.Capabilities == nil {
+		switch idr := e.resolveIdentity(req); idr.Outcome {
+		case identityError:
+			return nil, idr.Err
+		case identityBlocked:
+			// Telemetry parity: the original recorded a capability-violation only
+			// for the two revocation cases, never for scope mismatches.
+			if idr.Reason == "token_revoked" {
+				telemetry.RecordCapabilityViolationBlocked()
 			}
-			if req.AgentID == "" || req.AgentID == "cli" {
-				req.AgentID = cached.AgentName
-			}
-			if cached.TokenID != "" {
-				req.TokenID = cached.TokenID
-			}
-			req.Capabilities = &cached.Capabilities
-
-			// Verify scope restrictions (Workspace and Project and Environment)
-			if cached.WorkspaceID != "" && cached.WorkspaceID != e.WorkspaceID {
-				return logBlocked("agent_workspace_mismatch", fmt.Sprintf("Agent '%s' is not authorized to access workspace '%s'.", req.AgentID, e.WorkspaceID))
-			}
-			if cached.ProjectID != "" && cached.ProjectID != e.ProjectID {
-				return logBlocked("agent_project_mismatch", fmt.Sprintf("Agent '%s' is not authorized to access project '%s'.", req.AgentID, e.ProjectID))
-			}
-			if cached.Environment != "" && !strings.EqualFold(cached.Environment, resolveEnvForAudit()) {
-				return logBlocked("agent_environment_mismatch", fmt.Sprintf("Agent '%s' is not authorized to access the '%s' environment.", req.AgentID, resolveEnvForAudit()))
+			return logBlocked(idr.Reason, idr.Message)
+		case identityOK:
+			if idr.ResolvedToken != "" {
+				req.IdentityLevel = "issued"
+				req.TokenID = idr.ResolvedTokenID
+				if idr.ResolvedCapabilities != nil {
+					if req.AgentID == "" || req.AgentID == "cli" {
+						req.AgentID = idr.ResolvedAgentID
+					}
+					req.Capabilities = idr.ResolvedCapabilities
+				}
 			}
 		}
 	}
@@ -603,27 +731,83 @@ func (e *Engine) Execute(req CallRequest) (*CallResult, error) {
 		}
 	}
 
-	// Reset for normal accumulation
-	secretKeys = secretKeys[:0]
-	authStyles = authStyles[:0]
+	// --- Tail pipeline: buildAndInject → forward → redactResponse → auditSuccess ---
+	// The authorization stages above are done; from here the request is permitted.
+	// State is threaded through execContext so each stage is a named method with a
+	// single argument instead of a ~10-param signature. secretKeys/authStyles here
+	// are freshly allocated (NOT the allKeys/allStyles used by the blocked path),
+	// which removes the old shared-backing-array aliasing hazard.
+	ec := &execContext{
+		req:          req,
+		method:       method,
+		u:            u,
+		targetDomain: targetDomain,
+		hasPolicy:    hasPolicy,
+		secretKeys:   make([]string, 0, len(req.Injections)),
+		authStyles:   make([]string, 0, len(req.Injections)),
+		secretValues: make([]string, 0, len(req.Injections)),
+	}
 
-	// --- Build outbound request ---
-	bodyReader := bytes.NewReader(req.Body)
+	if res, err := e.buildAndInject(ec); res != nil || err != nil {
+		return res, err
+	}
 
-	outbound, err := http.NewRequest(method, req.TargetURL, bodyReader)
+	if res, err := e.forward(ec); res != nil || err != nil {
+		return res, err
+	}
+
+	e.redactResponse(ec)
+	e.auditSuccess(ec)
+
+	return &CallResult{
+		StatusCode: ec.result.StatusCode,
+		Headers:    ec.result.Headers,
+		Body:       ec.result.Body,
+	}, nil
+}
+
+// execContext threads per-request state through the tail pipeline stages
+// (buildAndInject → forward → redactResponse → auditSuccess). It exists so those
+// stages can be separate methods rather than one ~490-line function, without each
+// taking a long positional argument list.
+type execContext struct {
+	req          CallRequest
+	method       string
+	u            *url.URL
+	targetDomain string
+	hasPolicy    bool
+
+	// Built by buildAndInject; sent by forward.
+	outbound *http.Request
+
+	// Accumulated during buildAndInject; consumed by forward/redact/audit.
+	secretKeys   []string
+	authStyles   []string
+	secretValues []string
+
+	// Populated by forward; consumed by redactResponse/auditSuccess.
+	result   *ForwardResult
+	redacted bool
+}
+
+// buildAndInject resolves each secret (recording resolution telemetry), builds
+// the outbound request, and applies all injections in a single pass. A non-nil
+// error aborts the call — e.g. a secret that vanished between the earlier
+// presence check and here.
+func (e *Engine) buildAndInject(ec *execContext) (*CallResult, error) {
+	bodyReader := bytes.NewReader(ec.req.Body)
+
+	outbound, err := http.NewRequest(ec.method, ec.req.TargetURL, bodyReader)
 	if err != nil {
 		return nil, fmt.Errorf("failed to build request: %w", err)
 	}
 
 	// Copy any extra headers
-	for k, v := range req.Headers {
+	for k, v := range ec.req.Headers {
 		outbound.Header.Set(k, v)
 	}
 
-	// --- Resolve secrets and inject ---
-	secretValues := make([]string, 0, len(req.Injections))
-
-	for _, inj := range req.Injections {
+	for _, inj := range ec.req.Injections {
 		telemetry.RecordInjectionStyle(inj.Style)
 
 		startResolve := time.Now()
@@ -640,167 +824,231 @@ func (e *Engine) Execute(req CallRequest) (*CallResult, error) {
 
 		telemetry.RecordSecretResolved()
 
-		if err := Inject(outbound, cred, inj); err != nil {
-			return nil, fmt.Errorf("injection failed for %s (%s): %w", inj.SecretKey, inj.Style, err)
-		}
-
-		secretKeys = append(secretKeys, inj.SecretKey)
-		authStyles = append(authStyles, inj.Style)
-		secretValues = append(secretValues, cred)
+		ec.secretKeys = append(ec.secretKeys, inj.SecretKey)
+		ec.authStyles = append(ec.authStyles, inj.Style)
+		ec.secretValues = append(ec.secretValues, cred)
 	}
 
-	// --- Forward ---
-	result, err := Forward(e.Client, outbound)
+	// Apply all injections in one pass — parses/serializes the body at most
+	// once even with multiple body/form styles.
+	if err := InjectAll(outbound, ec.secretValues, ec.req.Injections); err != nil {
+		return nil, fmt.Errorf("injection failed: %w", err)
+	}
+
+	ec.outbound = outbound
+	return nil, nil
+}
+
+// forward sends the outbound request. On an SSRF-prevention error it emits the
+// blocked audit record and returns a 403 CallResult (via blockSSRF); other
+// transport errors are returned as-is. On success the ForwardResult is stashed
+// on ec for the redact/audit stages.
+func (e *Engine) forward(ec *execContext) (*CallResult, error) {
+	result, err := Forward(e.Client, ec.outbound)
 	if err == nil && result != nil {
 		telemetry.RecordProxyDuration(result.Duration.Milliseconds())
 	}
 	if err != nil {
 		if strings.Contains(err.Error(), "SSRF prevention:") {
-			telemetry.RecordProxyBlocked()
-			if e.Audit != nil {
-				_ = e.Audit.Log(AuditEvent{
-					Timestamp:      time.Now().UTC(),
-					Environment:    resolveEnvForAudit(),
-					SecretKeys:     secretKeys,
-					AgentID:        req.AgentID,
-					IdentityLevel:  req.IdentityLevel,
-					TokenID:        req.TokenID,
-					Method:         method,
-					TargetURL:      req.TargetURL,
-					Domain:         targetDomain,
-					AuthStyles:     authStyles,
-					StatusCode:     403,
-					DurationMs:     0,
-					Status:         "BLOCKED",
-					Reason:         "ssrf_protection_blocked",
-					ResolutionPath: "local proxy",
-					WorkspaceID:    e.WorkspaceID,
-					ProjectID:      e.ProjectID,
-				})
-				enforcement := EnforcementBlock{
-					Decision:          "blocked",
-					DecidedBy:         "ssrf_protection",
-					LayersEvaluated: []EvaluationLayer{
-						{
-							Layer:  "ssrf_protection",
-							Result: "fail",
-							Reason: err.Error(),
-						},
-					},
-					FirstFailureLayer: "ssrf_protection",
-				}
-				resolution := ResolutionBlock{
-					CredentialInjected: false,
-					ResponseScanned:    false,
-					SSRFCheckPassed:    false,
-					ResponseStatus:     403,
-				}
-				e.logForensic(req, targetDomain, method, u.Path, 403, "blocked", 0, secretKeys, authStyles, enforcement, resolution)
-			}
-
-			bodyJSONBytes, _ := json.Marshal(map[string]string{
-				"error":   "ssrf_protection_blocked",
-				"domain":  targetDomain,
-				"message": err.Error(),
-			})
-			headers := make(map[string][]string)
-			headers["Content-Type"] = []string{"application/json"}
-			return &CallResult{
-				StatusCode: 403,
-				Headers:    headers,
-				Body:       bodyJSONBytes,
-			}, nil
+			return e.blockSSRF(ec, err)
 		}
 		return nil, err
 	}
+	ec.result = result
+	return nil, nil
+}
 
-	// --- Redact ---
-	redacted := false
-	if len(result.Body) > 0 {
-		contentType := ""
-		if len(result.Headers["Content-Type"]) > 0 {
-			contentType = result.Headers["Content-Type"][0]
-		}
-
-		if contentType != "" && !strings.Contains(contentType, "application/json") && !strings.Contains(contentType, "text/") {
-			fmt.Fprintf(os.Stderr, "Warning: redacting unexpected content type: %s\n", contentType)
-		}
-
-		for _, val := range secretValues {
-			if val == "" {
-				continue
-			}
-			if bytes.Contains(result.Body, []byte(val)) {
-				result.Body = redactSecretFromResponse(result.Body, val)
-				redacted = true
-			}
-		}
-
-		if redacted {
-			telemetry.RecordProxyRedacted()
-			result.Headers["Content-Length"] = []string{fmt.Sprintf("%d", len(result.Body))}
-		}
-	}
-
-	// --- Audit ---
+// blockSSRF logs the blocked call and returns the 403 result for an outbound
+// request rejected by the SSRF-prevention dialer.
+func (e *Engine) blockSSRF(ec *execContext, ssrfErr error) (*CallResult, error) {
+	telemetry.RecordProxyBlocked()
 	if e.Audit != nil {
 		_ = e.Audit.Log(AuditEvent{
 			Timestamp:      time.Now().UTC(),
 			Environment:    resolveEnvForAudit(),
-			SecretKeys:     secretKeys,
-			AgentID:        req.AgentID,
-			IdentityLevel:  req.IdentityLevel,
-			TokenID:        req.TokenID,
-			Method:         method,
-			TargetURL:      req.TargetURL,
-			Domain:         targetDomain,
-			AuthStyles:     authStyles,
-			StatusCode:     result.StatusCode,
-			DurationMs:     result.Duration.Milliseconds(),
-			Status:         "OK",
-			Reason:         reasonForAudit(redacted),
-			Redacted:       redacted,
+			SecretKeys:     ec.secretKeys,
+			AgentID:        ec.req.AgentID,
+			IdentityLevel:  ec.req.IdentityLevel,
+			TokenID:        ec.req.TokenID,
+			Method:         ec.method,
+			TargetURL:      ec.req.TargetURL,
+			Domain:         ec.targetDomain,
+			AuthStyles:     ec.authStyles,
+			StatusCode:     403,
+			DurationMs:     0,
+			Status:         "BLOCKED",
+			Reason:         "ssrf_protection_blocked",
 			ResolutionPath: "local proxy",
 			WorkspaceID:    e.WorkspaceID,
 			ProjectID:      e.ProjectID,
 		})
-		outcome := "success"
-		if redacted {
-			outcome = "redacted"
+		enforcement := EnforcementBlock{
+			Decision:  "blocked",
+			DecidedBy: "ssrf_protection",
+			LayersEvaluated: []EvaluationLayer{
+				{
+					Layer:  "ssrf_protection",
+					Result: "fail",
+					Reason: ssrfErr.Error(),
+				},
+			},
+			FirstFailureLayer: "ssrf_protection",
 		}
-		enforcement := makeSuccessEnforcementBlock(targetDomain, hasPolicy)
 		resolution := ResolutionBlock{
-			CredentialInjected: true,
-			InjectionStyle:     strings.Join(authStyles, ","),
-			ResponseScanned:    true,
-			RedactionTriggered: redacted,
-			SSRFCheckPassed:    true,
-			ResponseStatus:     result.StatusCode,
+			CredentialInjected: false,
+			ResponseScanned:    false,
+			SSRFCheckPassed:    false,
+			ResponseStatus:     403,
 		}
-		if redacted {
-			resolution.RedactionPattern = redactionPlaceholder
-			resolution.Replacement = redactionPlaceholder
-		}
-		e.logForensic(req, targetDomain, method, u.Path, result.StatusCode, outcome, result.Duration.Milliseconds(), secretKeys, authStyles, enforcement, resolution)
+		e.logForensic(ec.req, ec.targetDomain, ec.method, ec.u.Path, 403, "blocked", 0, ec.secretKeys, ec.authStyles, enforcement, resolution)
 	}
 
+	bodyJSONBytes, _ := json.Marshal(map[string]string{
+		"error":   "ssrf_protection_blocked",
+		"domain":  ec.targetDomain,
+		"message": ssrfErr.Error(),
+	})
+	headers := make(map[string][]string)
+	headers["Content-Type"] = []string{"application/json"}
 	return &CallResult{
-		StatusCode: result.StatusCode,
-		Headers:    result.Headers,
-		Body:       result.Body,
+		StatusCode: 403,
+		Headers:    headers,
+		Body:       bodyJSONBytes,
 	}, nil
 }
 
-// Sync triggers a manual revocation list sync.
-func (e *Engine) Sync() {
+// redactResponse strips any echoed secret values from the response body,
+// mirroring the original inline redaction exactly: same unexpected-content-type
+// warning, same Content-Length rewrite when the body changes.
+func (e *Engine) redactResponse(ec *execContext) {
+	result := ec.result
+	if len(result.Body) == 0 {
+		return
+	}
+
+	contentType := ""
+	if len(result.Headers["Content-Type"]) > 0 {
+		contentType = result.Headers["Content-Type"][0]
+	}
+
+	if contentType != "" && !strings.Contains(contentType, "application/json") && !strings.Contains(contentType, "text/") {
+		fmt.Fprintf(os.Stderr, "Warning: redacting unexpected content type: %s\n", contentType)
+	}
+
+	for _, val := range ec.secretValues {
+		if val == "" {
+			continue
+		}
+		if bytes.Contains(result.Body, []byte(val)) {
+			result.Body = redactSecretFromResponse(result.Body, val)
+			ec.redacted = true
+		}
+	}
+
+	if ec.redacted {
+		telemetry.RecordProxyRedacted()
+		result.Headers["Content-Length"] = []string{fmt.Sprintf("%d", len(result.Body))}
+	}
+}
+
+// auditSuccess emits the success audit + forensic records for a completed call.
+func (e *Engine) auditSuccess(ec *execContext) {
+	if e.Audit == nil {
+		return
+	}
+	result := ec.result
+
+	_ = e.Audit.Log(AuditEvent{
+		Timestamp:      time.Now().UTC(),
+		Environment:    resolveEnvForAudit(),
+		SecretKeys:     ec.secretKeys,
+		AgentID:        ec.req.AgentID,
+		IdentityLevel:  ec.req.IdentityLevel,
+		TokenID:        ec.req.TokenID,
+		Method:         ec.method,
+		TargetURL:      ec.req.TargetURL,
+		Domain:         ec.targetDomain,
+		AuthStyles:     ec.authStyles,
+		StatusCode:     result.StatusCode,
+		DurationMs:     result.Duration.Milliseconds(),
+		Status:         "OK",
+		Reason:         reasonForAudit(ec.redacted),
+		Redacted:       ec.redacted,
+		ResolutionPath: "local proxy",
+		WorkspaceID:    e.WorkspaceID,
+		ProjectID:      e.ProjectID,
+	})
+	outcome := "success"
+	if ec.redacted {
+		outcome = "redacted"
+	}
+	enforcement := makeSuccessEnforcementBlock(ec.targetDomain, ec.hasPolicy)
+	resolution := ResolutionBlock{
+		CredentialInjected: true,
+		InjectionStyle:     strings.Join(ec.authStyles, ","),
+		ResponseScanned:    true,
+		RedactionTriggered: ec.redacted,
+		SSRFCheckPassed:    true,
+		ResponseStatus:     result.StatusCode,
+	}
+	if ec.redacted {
+		resolution.RedactionPattern = redactionPlaceholder
+		resolution.Replacement = redactionPlaceholder
+	}
+	e.logForensic(ec.req, ec.targetDomain, ec.method, ec.u.Path, result.StatusCode, outcome, result.Duration.Milliseconds(), ec.secretKeys, ec.authStyles, enforcement, resolution)
+}
+
+// Sync fetches the current revoked-token list from the backend and stores it.
+// This replaces the old mock which hard-coded a sample revocation ID.
+// The list is a set of revoked token IDs for the engine's workspace, fetched
+// from the API. If the fetch fails, the previously fetched list is kept so a
+// transient network failure never silently re-authorizes a revoked token.
+func (e *Engine) Sync() error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
-	e.LastSync = time.Now()
-	// Mock: Add a sample revocation ID if we don't have any, for verification
-	if len(e.RevokedIDs) == 0 {
-		e.RevokedIDs = []string{"rev_test_5k2m88"}
+	if e.APIClient == nil {
+		return fmt.Errorf("API client not available for revocation sync")
 	}
+
+	res, err := api.CallJSON[struct {
+		TokenIDs []string `json:"token_ids"`
+	}](e.APIClient, "agents.token_revoked", "GET", nil, map[string]string{
+		"workspace_id": e.WorkspaceID,
+	}, nil)
+	if err != nil {
+		return fmt.Errorf("revocation sync: %w", err)
+	}
+
+	e.RevokedIDs = res.TokenIDs
+	if e.RevokedIDs == nil {
+		e.RevokedIDs = []string{}
+	}
+	e.LastSync = time.Now()
+
+	// Purge any revoked tokens from the cache so revocation takes effect
+	// immediately, even for tokens validated within the TTL window.
+	if e.TokenCache != nil {
+		e.TokenCache.PurgeRevoked(e.RevokedIDs)
+	}
+
+	return nil
+}
+
+// IsTokenRevoked checks whether a token ID (or agent ID, for revoked agents)
+// is present in the last fetched revocation list.
+func (e *Engine) IsTokenRevoked(tokenID string) bool {
+	if tokenID == "" || len(e.RevokedIDs) == 0 {
+		return false
+	}
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	for _, id := range e.RevokedIDs {
+		if id == tokenID {
+			return true
+		}
+	}
+	return false
 }
 
 // GetState returns the current live state of the proxy engine.
@@ -847,6 +1095,44 @@ func isSecretAllowed(caps *capabilities.AgentCapabilities, key string) bool {
 	}
 
 	return true // no restrictions
+}
+
+// auditBlocked emits the standard blocked-call audit + forensic records for a
+// 403 denial. Extracted from the Execute logBlocked closure so the HTTP server
+// can emit an IDENTICAL record for scope/revocation denials it surfaces itself
+// (previously the server's writeError path logged nothing — an audit gap). Does
+// NOT record telemetry or write the HTTP response; the caller owns those.
+func (e *Engine) auditBlocked(req CallRequest, targetDomain, method, path, reason, msg string, allKeys, allStyles []string) {
+	if e.Audit == nil {
+		return
+	}
+	_ = e.Audit.Log(AuditEvent{
+		Timestamp:      time.Now().UTC(),
+		Environment:    resolveEnvForAudit(),
+		SecretKeys:     allKeys,
+		AgentID:        req.AgentID,
+		IdentityLevel:  req.IdentityLevel,
+		TokenID:        req.TokenID,
+		Method:         method,
+		TargetURL:      req.TargetURL,
+		Domain:         targetDomain,
+		AuthStyles:     allStyles,
+		StatusCode:     403,
+		DurationMs:     0,
+		Status:         "BLOCKED",
+		Reason:         reason,
+		ResolutionPath: "local proxy",
+		WorkspaceID:    e.WorkspaceID,
+		ProjectID:      e.ProjectID,
+	})
+	enforcement := makeEnforcementBlock(reason, msg, targetDomain, method, req.AgentID, allKeys)
+	resolution := ResolutionBlock{
+		CredentialInjected: false,
+		ResponseScanned:    false,
+		SSRFCheckPassed:    true,
+		ResponseStatus:     403,
+	}
+	e.logForensic(req, targetDomain, method, path, 403, "blocked", 0, allKeys, allStyles, enforcement, resolution)
 }
 
 // Forensic logging helpers
@@ -1039,7 +1325,7 @@ func (e *Engine) logForensic(
 
 	// 7. Proxy Snapshot
 	proxySnap := ProxySnapshot{
-		Version:   "3.0.1",
+		Version:   "3.1.0",
 		Port:      8765,
 		Transient: e.Transient,
 	}
@@ -1086,10 +1372,6 @@ func (e *Engine) logForensic(
 	}
 
 	_ = e.Audit.LogForensic(event)
-}
-
-func isLoopbackIP(ip net.IP) bool {
-	return ip.IsLoopback()
 }
 
 func isPrivateOrLoopbackIP(ip net.IP) bool {

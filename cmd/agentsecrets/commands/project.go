@@ -8,19 +8,11 @@ import (
 	"github.com/charmbracelet/lipgloss"
 	"github.com/spf13/cobra"
 
-	"github.com/The-17/agentsecrets/pkg/api"
 	"github.com/The-17/agentsecrets/pkg/config"
 	"github.com/The-17/agentsecrets/pkg/projects"
 	"github.com/The-17/agentsecrets/pkg/proxy"
 	"github.com/The-17/agentsecrets/pkg/ui"
 )
-
-var projectService *projects.Service
-
-// InitProjectService sets up the service for the CLI
-func InitProjectService(client *api.Client) {
-	projectService = projects.NewService(client)
-}
 
 var projectCmd = &cobra.Command{
 	Use:   "project",
@@ -88,7 +80,7 @@ func runProjectList(cmd *cobra.Command, args []string) error {
 
 	if err := ui.Spinner("Fetching projects...", func() error {
 		var e error
-		projs, e = projectService.List()
+		projs, e = app.Projects().List()
 		return e
 	}); err != nil {
 		ui.Error("Failed to list projects: " + err.Error())
@@ -177,7 +169,7 @@ func runProjectCreate(cmd *cobra.Command, args []string) error {
 
 	if err := ui.Spinner("Creating project...", func() error {
 		var e error
-		created, e = projectService.Create(name, desc)
+		created, e = app.Projects().Create(name, desc)
 		return e
 	}); err != nil {
 		ui.Error("Failed to create project: " + err.Error())
@@ -207,7 +199,7 @@ func runProjectUse(cmd *cobra.Command, args []string) error {
 
 		if err = ui.Spinner("Fetching projects...", func() error {
 			var e error
-			projs, e = projectService.List()
+			projs, e = app.Projects().List()
 			return e
 		}); err != nil {
 			ui.Error("Failed to fetch projects: " + err.Error())
@@ -239,7 +231,7 @@ func runProjectUse(cmd *cobra.Command, args []string) error {
 
 	if err = ui.Spinner(fmt.Sprintf("Selecting project '%s'...", name), func() error {
 		var e error
-		used, e = projectService.Use(name)
+		used, e = app.Projects().Use(name)
 		return e
 	}); err != nil {
 		ui.Error("Failed to use project: " + err.Error())
@@ -293,14 +285,14 @@ func runProjectUpdate(cmd *cobra.Command, args []string) error {
 	}
 
 	if err := ui.Spinner(fmt.Sprintf("Updating project '%s'...", oldName), func() error {
-		return projectService.Update(oldName, newName, desc)
+		return app.Projects().Update(oldName, newName, desc)
 	}); err != nil {
 		ui.Error("Failed to update project: " + err.Error())
 		return nil
 	}
 
 	var projectID string
-	if list, err := projectService.List(); err == nil {
+	if list, err := app.Projects().List(); err == nil {
 		for _, p := range list {
 			if p.Name == oldName || p.ID == oldName {
 				projectID = p.ID
@@ -337,7 +329,7 @@ func runProjectDelete(cmd *cobra.Command, args []string) error {
 	}
 
 	var projectID string
-	if list, err := projectService.List(); err == nil {
+	if list, err := app.Projects().List(); err == nil {
 		for _, p := range list {
 			if p.Name == name || p.ID == name {
 				projectID = p.ID
@@ -363,7 +355,7 @@ func runProjectDelete(cmd *cobra.Command, args []string) error {
 	}
 
 	if err := ui.Spinner(fmt.Sprintf("Deleting project '%s'...", name), func() error {
-		return projectService.Delete(name)
+		return app.Projects().Delete(name)
 	}); err != nil {
 		ui.Error("Failed to delete project: " + err.Error())
 		return nil
@@ -415,7 +407,7 @@ func runProjectInvite(cmd *cobra.Command, args []string) error {
 	}
 
 	if err := ui.Spinner(fmt.Sprintf("Inviting %s...", email), func() error {
-		return projectService.Invite(email, role)
+		return app.Projects().Invite(email, role)
 	}); err != nil {
 		ui.Error("Failed to invite: " + err.Error())
 		return nil
@@ -426,10 +418,7 @@ func runProjectInvite(cmd *cobra.Command, args []string) error {
 }
 
 func autocompleteProjects(cmd *cobra.Command, args []string, toComplete string) ([]string, cobra.ShellCompDirective) {
-	if projectService == nil {
-		return nil, cobra.ShellCompDirectiveNoFileComp
-	}
-	projs, err := projectService.List()
+	projs, err := app.Projects().List()
 	if err != nil {
 		return nil, cobra.ShellCompDirectiveNoFileComp
 	}

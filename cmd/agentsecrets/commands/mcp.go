@@ -60,11 +60,15 @@ func runMCPServe(cmd *cobra.Command, args []string) error {
 		fmt.Fprintf(os.Stderr, "Warning: keychain-auth initialization failed: %v\n", err)
 	}
 
-	// Share the CLI-initialized services with the MCP package to avoid code/state duplication (DRY)
-	agentmcp.SetServices(apiClient, authService, workspaceService, secretsService)
-
 	// MCP uses stdio — only JSON-RPC messages should go to stdout.
-	if err := agentmcp.Serve(Version); err != nil {
+	// Share the CLI-initialized services with the MCP server to avoid
+	// code/state duplication (DRY).
+	deps := agentmcp.Deps{
+		API:        app.API(),
+		Workspaces: app.Workspaces(),
+		Secrets:    app.Secrets(),
+	}
+	if err := agentmcp.Serve(Version, deps); err != nil {
 		fmt.Fprintf(os.Stderr, "MCP server error: %v\n", err)
 		return err
 	}

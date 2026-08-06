@@ -248,6 +248,21 @@ func DecryptFromUser(privateKey, publicKey, encrypted []byte) ([]byte, error) {
 	return decrypted, nil
 }
 
+// B64Encode is a shorthand for base64 standard encoding.
+func B64Encode(b []byte) string {
+	return base64.StdEncoding.EncodeToString(b)
+}
+
+// B64Decode decodes a base64 standard-encoded string, wrapping any error with
+// the given context message.
+func B64Decode(s, context string) ([]byte, error) {
+	b, err := base64.StdEncoding.DecodeString(s)
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", context, err)
+	}
+	return b, nil
+}
+
 // --- Internal Helpers ---
 
 func randomBytes(size int) ([]byte, error) {

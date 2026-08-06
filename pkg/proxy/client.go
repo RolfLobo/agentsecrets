@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"io"
 	"net"
@@ -117,8 +118,7 @@ func StartTransientProxy() (int, func(), error) {
 	}
 
 	server := NewServer(port, engine)
-	server.APIClient = engine.APIClient
-	server.SessionToken = sessionToken
+	server.SetSessionToken(sessionToken)
 
 	httpServer := &http.Server{
 		Handler: server.mux,
@@ -132,7 +132,11 @@ func StartTransientProxy() (int, func(), error) {
 		if engine.Audit != nil {
 			_ = engine.Audit.SyncUnpushedLogs()
 		}
-		_ = httpServer.Close()
+		// Graceful shutdown drains the in-flight request (the response may still
+		// be streaming) instead of dropping it as httpServer.Close would.
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = httpServer.Shutdown(shutdownCtx)
 		_ = listener.Close()
 	}
 

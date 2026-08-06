@@ -13,7 +13,6 @@ import (
 	"github.com/The-17/agentsecrets/pkg/config"
 	"github.com/The-17/agentsecrets/pkg/errors"
 	"github.com/The-17/agentsecrets/pkg/log"
-	"github.com/The-17/agentsecrets/pkg/projects"
 	"github.com/The-17/agentsecrets/pkg/proxy"
 	"github.com/The-17/agentsecrets/pkg/ui"
 	"github.com/spf13/cobra"
@@ -47,11 +46,11 @@ var logsCmd = &cobra.Command{
 		if err := ensureDaemonInitialized(); err != nil {
 			return err
 		}
-		if err := authService.EnsureAuth(cmd, args); err != nil {
+		if err := app.Auth().EnsureAuth(cmd, args); err != nil {
 			return err
 		}
 		var err error
-		logService, err = log.NewService(apiClient, nil)
+		logService, err = log.NewService(app.API(), nil)
 		if err != nil {
 			return fmt.Errorf("could not initialize log service: %v", err)
 		}
@@ -418,7 +417,7 @@ func queryLogs(filter log.Filter) ([]proxy.AuditEvent, error) {
 
 	// Resolve project name/slug to project UUID if provided
 	if filter.ProjectID != "" {
-		projSvc := projects.NewService(apiClient)
+		projSvc := app.Projects()
 		if list, err := projSvc.List(); err == nil {
 			for _, p := range list {
 				if strings.EqualFold(p.ID, filter.ProjectID) || strings.EqualFold(p.Name, filter.ProjectID) {

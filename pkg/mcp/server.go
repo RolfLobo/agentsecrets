@@ -18,8 +18,40 @@ import (
 	"github.com/mark3labs/mcp-go/server"
 )
 
-// NewServer creates an MCP server with the full AgentSecrets tool surface.
+// Deps holds the shared services an MCP Server uses. Any nil field is lazily
+// constructed on first use (see the get* methods), so tests and standalone
+// callers can pass a zero Deps.
+type Deps struct {
+	API        *api.Client
+	Workspaces *workspaces.Service
+	Secrets    *secrets.Service
+}
+
+// Server holds the dependencies shared across MCP tool handlers. It replaces the
+// former package-level service globals, so handler state is explicit and each
+// Server instance is self-contained.
+type Server struct {
+	apiClient        *api.Client
+	workspaceService *workspaces.Service
+	secretsService   *secrets.Service
+}
+
+// NewServer creates an MCP server with the full AgentSecrets tool surface using
+// zero dependencies (all lazily constructed). Retained for tests and callers
+// that don't share the CLI's services.
 func NewServer(version string) *server.MCPServer {
+	return newServer(version, Deps{})
+}
+
+// newServer builds the MCP server, wiring every tool handler to a method on a
+// Server constructed from deps.
+func newServer(version string, deps Deps) *server.MCPServer {
+	srv := &Server{
+		apiClient:        deps.API,
+		workspaceService: deps.Workspaces,
+		secretsService:   deps.Secrets,
+	}
+
 	s := server.NewMCPServer(
 		"AgentSecrets",
 		version,
@@ -27,43 +59,44 @@ func NewServer(version string) *server.MCPServer {
 	)
 
 	// --- Credential Operations ---
-	s.AddTool(apiCallTool(), handleAPICall)
-	s.AddTool(listKeysTool(), handleListKeys)
-	s.AddTool(checkKeyTool(), handleCheckKey)
-	s.AddTool(getCoverageTool(), handleGetCoverage)
+	s.AddTool(apiCallTool(), srv.handleAPICall)
+	s.AddTool(listKeysTool(), srv.handleListKeys)
+	s.AddTool(checkKeyTool(), srv.handleCheckKey)
+	s.AddTool(getCoverageTool(), srv.handleGetCoverage)
 
 	// --- Context Management ---
-	s.AddTool(getStatusTool(), handleGetStatus)
-	s.AddTool(getEnvironmentTool(), handleGetEnvironment)
-	s.AddTool(switchEnvironmentTool(), handleSwitchEnvironment)
-	s.AddTool(pullSecretsTool(), handlePullSecrets)
-	s.AddTool(diffSecretsTool(), handleDiffSecrets)
-	s.AddTool(diffEnvironmentsTool(), handleDiffEnvironments)
+	s.AddTool(getStatusTool(), srv.handleGetStatus)
+	s.AddTool(getEnvironmentTool(), srv.handleGetEnvironment)
+	s.AddTool(switchEnvironmentTool(), srv.handleSwitchEnvironment)
+	s.AddTool(pullSecretsTool(), srv.handlePullSecrets)
+	s.AddTool(diffSecretsTool(), srv.handleDiffSecrets)
+	s.AddTool(diffEnvironmentsTool(), srv.handleDiffEnvironments)
 
 	// --- Audit & Observability ---
-	s.AddTool(getProxyLogsTool(), handleGetProxyLogs)
-	s.AddTool(getBlockedRequestsTool(), handleGetBlockedRequests)
-	s.AddTool(getRedactionEventsTool(), handleGetRedactionEvents)
-	s.AddTool(getAuditSummaryTool(), handleGetAuditSummary)
+	s.AddTool(getProxyLogsTool(), srv.handleGetProxyLogs)
+	s.AddTool(getBlockedRequestsTool(), srv.handleGetBlockedRequests)
+	s.AddTool(getRedactionEventsTool(), srv.handleGetRedactionEvents)
+	s.AddTool(getAuditSummaryTool(), srv.handleGetAuditSummary)
 
 	// --- Agent Identity ---
-	s.AddTool(getAgentIdentityTool(), handleGetAgentIdentity)
-	s.AddTool(listAgentTokensTool(), handleListAgentTokens)
+	s.AddTool(getAgentIdentityTool(), srv.handleGetAgentIdentity)
+	s.AddTool(listAgentTokensTool(), srv.handleListAgentTokens)
 
 	// --- Allowlist ---
-	s.AddTool(checkDomainTool(), handleCheckDomain)
-	s.AddTool(getAllowlistTool(), handleGetAllowlist)
+	s.AddTool(checkDomainTool(), srv.handleCheckDomain)
+	s.AddTool(getAllowlistTool(), srv.handleGetAllowlist)
 
 	// --- Key Rotation ---
-	s.AddTool(rotateKeyTool(), handleRotateKey)
+	s.AddTool(rotateKeyTool(), srv.handleRotateKey)
 
 	return s
 }
 
-// Serve starts the MCP server on stdio (for Claude Desktop, Cursor, etc).
-func Serve(version string) error {
+// Serve starts the MCP server on stdio (for Claude Desktop, Cursor, etc), using
+// the provided shared services.
+func Serve(version string, deps Deps) error {
 	telemetry.RecordIntegration("mcp")
-	s := NewServer(version)
+	s := newServer(version, deps)
 	return server.ServeStdio(s)
 }
 
@@ -104,7 +137,7 @@ func apiCallTool() mcp.Tool {
 
 // --- Handlers ---
 
-func handleAPICall(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+func (s *Server) handleAPICall(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	args := req.GetArguments()
 
 	// Required: url
@@ -166,40 +199,25 @@ func handleAPICall(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolR
 
 // --- Shared Helpers ---
 
-var (
-	apiClient        *api.Client
-	authService      *auth.Service
-	workspaceService *workspaces.Service
-	secretsService   *secrets.Service
-)
-
-// SetServices configures the MCP package to use the CLI's shared services.
-func SetServices(api *api.Client, auth *auth.Service, ws *workspaces.Service, sec *secrets.Service) {
-	apiClient = api
-	authService = auth
-	workspaceService = ws
-	secretsService = sec
-}
-
-func getAPIClient() *api.Client {
-	if apiClient != nil {
-		return apiClient
+func (s *Server) getAPIClient() *api.Client {
+	if s.apiClient != nil {
+		return s.apiClient
 	}
 	return auth.NewAuthenticatedClient()
 }
 
-func getWorkspaceService() *workspaces.Service {
-	if workspaceService != nil {
-		return workspaceService
+func (s *Server) getWorkspaceService() *workspaces.Service {
+	if s.workspaceService != nil {
+		return s.workspaceService
 	}
-	return workspaces.NewService(getAPIClient())
+	return workspaces.NewService(s.getAPIClient())
 }
 
-func getSecretsService() *secrets.Service {
-	if secretsService != nil {
-		return secretsService
+func (s *Server) getSecretsService() *secrets.Service {
+	if s.secretsService != nil {
+		return s.secretsService
 	}
-	return secrets.NewService(getAPIClient())
+	return secrets.NewService(s.getAPIClient())
 }
 
 // jsonResult marshals v to indented JSON and returns it as a tool result.

@@ -54,7 +54,7 @@ func rotateKeyTool() mcp.Tool {
 
 // --- Handlers ---
 
-func handleSwitchEnvironment(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+func (s *Server) handleSwitchEnvironment(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	args := req.GetArguments()
 	env, _ := args["environment"].(string)
 	if env == "" {
@@ -92,7 +92,7 @@ func handleSwitchEnvironment(ctx context.Context, req mcp.CallToolRequest) (*mcp
 	})
 }
 
-func handlePullSecrets(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+func (s *Server) handlePullSecrets(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	args := req.GetArguments()
 	envParam, _ := args["environment"].(string)
 
@@ -124,14 +124,14 @@ func handlePullSecrets(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallT
 		}
 	}
 
-	svc := getSecretsService()
+	svc := s.getSecretsService()
 	if err := svc.Pull(nil); err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("pull failed: %v", err)), nil
 	}
 
 	// Sync allowlist to local keyring (matches CLI pull behavior)
 	if pc.WorkspaceID != "" {
-		wsSvc := getWorkspaceService()
+		wsSvc := s.getWorkspaceService()
 		if domainsResp, alErr := wsSvc.ListAllowlist(pc.WorkspaceID); alErr == nil {
 			var domains []string
 			for _, d := range domainsResp {
@@ -153,7 +153,7 @@ func handlePullSecrets(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallT
 	})
 }
 
-func handleRotateKey(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+func (s *Server) handleRotateKey(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	args := req.GetArguments()
 	keyName, _ := args["key_name"].(string)
 	if keyName == "" {
@@ -189,7 +189,7 @@ func handleRotateKey(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToo
 		}
 	}
 
-	svc := getSecretsService()
+	svc := s.getSecretsService()
 	if err := svc.Delete(keyName); err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("failed to delete key: %v", err)), nil
 	}

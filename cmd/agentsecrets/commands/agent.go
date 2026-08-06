@@ -12,14 +12,11 @@ import (
 	"github.com/The-17/agentsecrets/pkg/config"
 	"github.com/The-17/agentsecrets/pkg/errors"
 	"github.com/The-17/agentsecrets/pkg/keyring"
-	"github.com/The-17/agentsecrets/pkg/projects"
 	"github.com/The-17/agentsecrets/pkg/proxy"
-	"github.com/The-17/agentsecrets/pkg/secrets"
 	"github.com/The-17/agentsecrets/pkg/ui"
 )
 
 var (
-	agentService     *agents.Service
 	agentPolicyAllow []string
 	agentPolicyDeny  []string
 )
@@ -28,16 +25,7 @@ var agentCmd = &cobra.Command{
 	Use:   "agent",
 	Short: "Manage agent identities and tokens",
 	Long:  "Manage agent identities and tokens for the current workspace.\n\nAgents are named identities that can be bound to credential calls.\nEvery call through the proxy is logged with the calling agent's identity.\nIssued tokens provide cryptographically verified identity.",
-	PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
-		if err := authService.EnsureAuth(cmd, args); err != nil {
-			return err
-		}
-		// Init agent service if not already
-		if agentService == nil {
-			agentService = agents.NewService(apiClient)
-		}
-		return nil
-	},
+	PersistentPreRunE: keychainAuthMiddleware,
 }
 
 var agentRegisterCmd = &cobra.Command{
@@ -68,7 +56,7 @@ var agentRegisterCmd = &cobra.Command{
 			return err
 		}
 
-		resp, err := agentService.Register(agents.RegisterRequest{
+		resp, err := app.Agents().Register(agents.RegisterRequest{
 			Name:        name,
 			WorkspaceID: workspaceID,
 			ProjectID:   projectID,
@@ -85,7 +73,7 @@ var agentRegisterCmd = &cobra.Command{
 
 		scope := "workspace"
 		if projectID != "" {
-			projService := projects.NewService(apiClient)
+			projService := app.Projects()
 			projectsList, err := projService.List()
 			if err == nil {
 				for _, p := range projectsList {
@@ -148,7 +136,7 @@ var agentListCmd = &cobra.Command{
 
 		// Load projects to resolve IDs to Names in display
 		projectNames := make(map[string]string)
-		projService := projects.NewService(apiClient)
+		projService := app.Projects()
 		projectsList, err := projService.List()
 		if err == nil {
 			for _, p := range projectsList {
@@ -163,23 +151,23 @@ var agentListCmd = &cobra.Command{
 			if err != nil {
 				return err
 			}
-			list, err = agentService.List(workspaceID, projectID)
+			list, err = app.Agents().List(workspaceID, projectID)
 			if err != nil {
 				return fmt.Errorf("failed to list agents: %w", err)
 			}
 		} else {
 			// Fetch all agents (workspace and project-scoped) in a single fast call
-			list, err = agentService.ListAll(workspaceID)
+			list, err = app.Agents().ListAll(workspaceID)
 			if err != nil {
 				// Fallback to sequential listing if backend does not support include_projects
-				list, err = agentService.List(workspaceID, "")
+				list, err = app.Agents().List(workspaceID, "")
 				if err != nil {
 					return fmt.Errorf("failed to list agents: %w", err)
 				}
 
 				for _, p := range projectsList {
 					if p.WorkspaceID == workspaceID {
-						projAgents, err := agentService.List(workspaceID, p.ID)
+						projAgents, err := app.Agents().List(workspaceID, p.ID)
 						if err == nil {
 							list = append(list, projAgents...)
 						}
@@ -248,7 +236,7 @@ var agentTokenIssueCmd = &cobra.Command{
 			return err
 		}
 
-		resp, err := agentService.TokenIssue(workspaceID, agent.ID, agents.IssueTokenRequest{
+		resp, err := app.Agents().TokenIssue(workspaceID, agent.ID, agents.IssueTokenRequest{
 			Environment: environment,
 			Label:       label,
 			ExpiresIn:   expires,
@@ -313,7 +301,7 @@ var agentTokenListCmd = &cobra.Command{
 			return err
 		}
 
-		tokens, err := agentService.TokenList(workspaceID, agent.ID)
+		tokens, err := app.Agents().TokenList(workspaceID, agent.ID)
 		if err != nil {
 			return fmt.Errorf("failed to list tokens: %w", err)
 		}
@@ -379,7 +367,7 @@ var agentTokenRevokeCmd = &cobra.Command{
 				return err
 			}
 
-			err = agentService.TokenRevokeAll(workspaceID, agent.ID)
+			err = app.Agents().TokenRevokeAll(workspaceID, agent.ID)
 			if err != nil {
 				return fmt.Errorf("failed to revoke tokens: %w", err)
 			}
@@ -409,7 +397,7 @@ var agentTokenRevokeCmd = &cobra.Command{
 			return err
 		}
 
-		err = agentService.TokenRevoke(workspaceID, agent.ID, tokenID)
+		err = app.Agents().TokenRevoke(workspaceID, agent.ID, tokenID)
 		if err != nil {
 			return fmt.Errorf("failed to revoke token: %w", err)
 		}
@@ -451,7 +439,7 @@ var agentDeleteCmd = &cobra.Command{
 			return err
 		}
 
-		err = agentService.Delete(workspaceID, agent.ID)
+		err = app.Agents().Delete(workspaceID, agent.ID)
 		if err != nil {
 			return fmt.Errorf("failed to delete agent: %w", err)
 		}
@@ -492,22 +480,18 @@ func init() {
 	agentRegisterCmd.Flags().StringP("label", "l", "", "human label for the first token")
 	agentRegisterCmd.Flags().StringP("expires", "e", "", "token expiry (e.g. 30d, 90d)")
 	agentRegisterCmd.Flags().String("env", "", "environment for the token (development, staging, production)")
-	agentRegisterCmd.Flags().Bool("output-json", false, "output as JSON instead of formatted text") // Add this if needed later
 	agentRegisterCmd.Flags().Bool("save-token", false, "save the issued token to the OS Keychain without prompting")
 
 	// Flags for list
 	agentListCmd.Flags().StringP("project", "p", "", "filter to a specific project")
-	agentListCmd.Flags().Bool("output-json", false, "output as JSON")
 
 	// Flags for token issue
 	agentTokenIssueCmd.Flags().StringP("label", "l", "", "label for this token")
 	agentTokenIssueCmd.Flags().StringP("expires", "e", "", "token expiry (e.g. 30d, 90d)")
 	agentTokenIssueCmd.Flags().String("env", "", "environment for the token (development, staging, production)")
-	agentTokenIssueCmd.Flags().Bool("output-json", false, "output as JSON")
 	agentTokenIssueCmd.Flags().Bool("save-token", false, "save the issued token to the OS Keychain without prompting")
 
 	// Flags for token list
-	agentTokenListCmd.Flags().Bool("output-json", false, "output as JSON")
 
 	// Flags for token revoke
 	agentTokenRevokeCmd.Flags().StringP("agent", "a", "", "used with --all or specific token to identify the agent")
@@ -539,7 +523,7 @@ var agentPolicyGetCmd = &cobra.Command{
 			return err
 		}
 
-		caps, err := agentService.GetCapabilities(workspaceID, agent.ID)
+		caps, err := app.Agents().GetCapabilities(workspaceID, agent.ID)
 		if err != nil {
 			return fmt.Errorf("failed to get agent policy: %w", err)
 		}
@@ -624,7 +608,7 @@ var agentPolicySetCmd = &cobra.Command{
 			DeniedSecrets:  denied,
 		}
 
-		_, err = agentService.SetCapabilities(workspaceID, agent.ID, caps)
+		_, err = app.Agents().SetCapabilities(workspaceID, agent.ID, caps)
 		if err != nil {
 			return fmt.Errorf("failed to set agent policy: %w", err)
 		}
@@ -648,7 +632,7 @@ func validateSecretsExist(projectID string, keys []string) error {
 	knownKeys := make(map[string]bool)
 
 	// 1. Check local keyring
-	envs := []string{"development", "staging", "production"}
+	envs := config.ValidEnvironments
 	for _, env := range envs {
 		if localKeys, err := keyring.ListProjectKeyNames(projectID, env); err == nil {
 			for _, k := range localKeys {
@@ -658,7 +642,7 @@ func validateSecretsExist(projectID string, keys []string) error {
 	}
 
 	// 2. Check server-side keys
-	secService := secrets.NewService(apiClient)
+	secService := app.Secrets()
 	for _, env := range envs {
 		if remoteKeys, err := secService.ListForEnv(env); err == nil {
 			for _, k := range remoteKeys {
@@ -681,7 +665,7 @@ func resolveProjectID(workspaceID, projectNameOrID string) (string, error) {
 		return "", nil
 	}
 
-	projService := projects.NewService(apiClient)
+	projService := app.Projects()
 	projList, err := projService.List()
 	if err != nil {
 		return "", err
@@ -697,7 +681,7 @@ func resolveProjectID(workspaceID, projectNameOrID string) (string, error) {
 }
 
 func getAgentByName(workspaceID, name string) (*agents.Agent, error) {
-	agent, err := agentService.GetByName(workspaceID, name)
+	agent, err := app.Agents().GetByName(workspaceID, name)
 	if err != nil {
 		if strings.Contains(err.Error(), "not found") {
 			return nil, errors.New(errors.ErrAgentNotFound, fmt.Sprintf("agent %q not found in this workspace", name), err)

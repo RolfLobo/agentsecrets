@@ -80,6 +80,10 @@ func TestForensicLogAndChainVerification(t *testing.T) {
 		}
 	}
 
+	// LogForensic is fire-and-forget (writes run on the background writer), so
+	// block until all 10 have landed before reading them back.
+	logger.Flush()
+
 	// 2. Verify chain is OK
 	err = logSvc.VerifyChain()
 	if err != nil {

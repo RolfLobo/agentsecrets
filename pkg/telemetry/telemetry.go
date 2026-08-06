@@ -97,6 +97,15 @@ type Data struct {
 	Daily    map[string]*Day `json:"daily"`
 }
 
+// daySnapshot is the wire shape sent to telemetry.sync: every Day field
+// (promoted from the embedded pointer, so its json tags are the source of
+// truth) plus the bucket's date. Embedding keeps the payload in lockstep with
+// Day — no field list to maintain in SyncIfDue.
+type daySnapshot struct {
+	*Day
+	Date string `json:"date"`
+}
+
 var (
 	mu   sync.Mutex
 	data *Data
@@ -190,332 +199,237 @@ func currentDay() *Day {
 	return d
 }
 
-// RecordCommand increments the usage count for a CLI command.
-func RecordCommand(cmdName string) {
+// record is the single mutation primitive behind every Record* function. It
+// serializes access, loads today's bucket, applies the mutation, and persists.
+// Collapsing the lock/currentDay/save boilerplate here keeps the individual
+// Record* helpers to a single expressive line and removes 30+ copies of the
+// same three-step ritual.
+func record(mutate func(d *Day)) {
 	mu.Lock()
 	defer mu.Unlock()
-
-	d := currentDay()
-	if d.CommandExecutions == nil {
-		d.CommandExecutions = make(map[string]int)
-	}
-	d.CommandExecutions[cmdName]++
-	d.DeveloperCommands++
+	mutate(currentDay())
 	_ = save()
+}
+
+// RecordCommand increments the usage count for a CLI command.
+func RecordCommand(cmdName string) {
+	record(func(d *Day) {
+		if d.CommandExecutions == nil {
+			d.CommandExecutions = make(map[string]int)
+		}
+		d.CommandExecutions[cmdName]++
+		d.DeveloperCommands++
+	})
 }
 
 // RecordProxyCall increments the total proxy call counter.
 func RecordProxyCall() {
-	mu.Lock()
-	defer mu.Unlock()
-	currentDay().ProxyCalls++
-	_ = save()
+	record(func(d *Day) { d.ProxyCalls++ })
 }
 
 // RecordProxyBlocked increments the blocked proxy request counter.
 func RecordProxyBlocked() {
-	mu.Lock()
-	defer mu.Unlock()
-	currentDay().ProxyBlocked++
-	_ = save()
+	record(func(d *Day) { d.ProxyBlocked++ })
 }
 
 // RecordProxyRedacted increments the redacted proxy response counter.
 func RecordProxyRedacted() {
-	mu.Lock()
-	defer mu.Unlock()
-	currentDay().ProxyRedacted++
-	currentDay().ResponseRedactions++
-	_ = save()
+	record(func(d *Day) {
+		d.ProxyRedacted++
+		d.ResponseRedactions++
+	})
 }
 
 // RecordSecretResolved increments the resolved secrets count.
 func RecordSecretResolved() {
-	mu.Lock()
-	defer mu.Unlock()
-	currentDay().SecretsResolved++
-	_ = save()
+	record(func(d *Day) { d.SecretsResolved++ })
 }
 
 // RecordProxyDuration adds proxy latency to the cumulative duration.
 func RecordProxyDuration(ms int64) {
-	mu.Lock()
-	defer mu.Unlock()
-	currentDay().TotalProxyDurationMs += ms
-	_ = save()
+	record(func(d *Day) { d.TotalProxyDurationMs += ms })
 }
 
 // RecordInjectionStyle records a unique injection style used (e.g. "bearer", "header").
 func RecordInjectionStyle(style string) {
-	mu.Lock()
-	defer mu.Unlock()
-	d := currentDay()
-	for _, s := range d.InjectionStylesUsed {
-		if s == style {
-			return
+	record(func(d *Day) {
+		for _, s := range d.InjectionStylesUsed {
+			if s == style {
+				return
+			}
 		}
-	}
-	d.InjectionStylesUsed = append(d.InjectionStylesUsed, style)
-	_ = save()
+		d.InjectionStylesUsed = append(d.InjectionStylesUsed, style)
+	})
 }
 
 // RecordIntegration records a unique integration (e.g. "mcp", "env", "proxy", "exec").
 func RecordIntegration(name string) {
-	mu.Lock()
-	defer mu.Unlock()
-	d := currentDay()
-	for _, n := range d.IntegrationsActive {
-		if n == name {
-			return
+	record(func(d *Day) {
+		for _, n := range d.IntegrationsActive {
+			if n == name {
+				return
+			}
 		}
-	}
-	d.IntegrationsActive = append(d.IntegrationsActive, name)
-	_ = save()
+		d.IntegrationsActive = append(d.IntegrationsActive, name)
+	})
 }
 
 // RecordSecretCount records the current number of secrets in the project.
 func RecordSecretCount(count int) {
-	mu.Lock()
-	defer mu.Unlock()
-	currentDay().ProjectSecretCount = count
-	_ = save()
+	record(func(d *Day) { d.ProjectSecretCount = count })
 }
 
 // RecordWorkspaceMemberCount records the number of members in the workspace.
 func RecordWorkspaceMemberCount(count int) {
-	mu.Lock()
-	defer mu.Unlock()
-	currentDay().WorkspaceMemberCount = count
-	_ = save()
+	record(func(d *Day) { d.WorkspaceMemberCount = count })
 }
 
 // RecordProxyCallDaemon records a daemon proxy call.
 func RecordProxyCallDaemon() {
-	mu.Lock()
-	defer mu.Unlock()
-	currentDay().ProxyCallsDaemon++
-	_ = save()
+	record(func(d *Day) { d.ProxyCallsDaemon++ })
 }
 
 // RecordProxyCallTransient records a transient proxy call.
 func RecordProxyCallTransient() {
-	mu.Lock()
-	defer mu.Unlock()
-	currentDay().ProxyCallsTransient++
-	_ = save()
+	record(func(d *Day) { d.ProxyCallsTransient++ })
 }
 
 // RecordProxyCallMcp records a proxy call from MCP.
 func RecordProxyCallMcp() {
-	mu.Lock()
-	defer mu.Unlock()
-	currentDay().ProxyCallsMcp++
-	_ = save()
+	record(func(d *Day) { d.ProxyCallsMcp++ })
 }
 
 // RecordProxyCallDirect records a direct proxy call.
 func RecordProxyCallDirect() {
-	mu.Lock()
-	defer mu.Unlock()
-	currentDay().ProxyCallsDirect++
-	_ = save()
+	record(func(d *Day) { d.ProxyCallsDirect++ })
 }
 
 // RecordSSRFAttemptsBlocked records a blocked SSRF attempt.
 func RecordSSRFAttemptsBlocked() {
-	mu.Lock()
-	defer mu.Unlock()
-	currentDay().SSRFAttemptsBlocked++
-	_ = save()
+	record(func(d *Day) { d.SSRFAttemptsBlocked++ })
 }
 
 // RecordAllowlistViolation records an allowlist violation.
 func RecordAllowlistViolation() {
-	mu.Lock()
-	defer mu.Unlock()
-	currentDay().AllowlistViolations++
-	_ = save()
+	record(func(d *Day) { d.AllowlistViolations++ })
 }
 
 // RecordResponseRedaction records a response redaction event.
 func RecordResponseRedaction() {
-	mu.Lock()
-	defer mu.Unlock()
-	currentDay().ResponseRedactions++
-	currentDay().ProxyRedacted++
-	_ = save()
+	record(func(d *Day) {
+		d.ResponseRedactions++
+		d.ProxyRedacted++
+	})
 }
 
 // RecordProcessVerificationsFailed records a process verification failure.
 func RecordProcessVerificationsFailed() {
-	mu.Lock()
-	defer mu.Unlock()
-	currentDay().ProcessVerificationsFailed++
-	_ = save()
+	record(func(d *Day) { d.ProcessVerificationsFailed++ })
 }
 
 // RecordProductionWriteChallenge records a production write challenge.
 func RecordProductionWriteChallenge() {
-	mu.Lock()
-	defer mu.Unlock()
-	currentDay().ProductionWriteChallenges++
-	_ = save()
+	record(func(d *Day) { d.ProductionWriteChallenges++ })
 }
 
 // RecordKeychainResolutionMs adds time to cumulative keychain resolution latency.
 func RecordKeychainResolutionMs(ms int64) {
-	mu.Lock()
-	defer mu.Unlock()
-	currentDay().KeychainResolutionMs += ms
-	_ = save()
+	record(func(d *Day) { d.KeychainResolutionMs += ms })
 }
 
 // RecordSessionRefreshMs adds time to cumulative session refresh latency.
 func RecordSessionRefreshMs(ms int64) {
-	mu.Lock()
-	defer mu.Unlock()
-	currentDay().SessionRefreshMs += ms
-	_ = save()
+	record(func(d *Day) { d.SessionRefreshMs += ms })
 }
 
 // RecordInteractivePromptShown records showing an interactive prompt.
 func RecordInteractivePromptShown() {
-	mu.Lock()
-	defer mu.Unlock()
-	currentDay().InteractivePromptsShown++
-	_ = save()
+	record(func(d *Day) { d.InteractivePromptsShown++ })
 }
 
 // RecordInteractivePromptSkipped records skipping an interactive prompt.
 func RecordInteractivePromptSkipped() {
-	mu.Lock()
-	defer mu.Unlock()
-	currentDay().InteractivePromptsSkipped++
-	_ = save()
+	record(func(d *Day) { d.InteractivePromptsSkipped++ })
 }
 
 // RecordDriftDiffsDetected adds to detected drift diffs.
 func RecordDriftDiffsDetected(count int) {
-	mu.Lock()
-	defer mu.Unlock()
-	currentDay().DriftDiffsDetected += count
-	_ = save()
+	record(func(d *Day) { d.DriftDiffsDetected += count })
 }
 
 // RecordLogChainVerification records a log chain verification.
 func RecordLogChainVerification() {
-	mu.Lock()
-	defer mu.Unlock()
-	currentDay().LogChainVerifications++
-	_ = save()
+	record(func(d *Day) { d.LogChainVerifications++ })
 }
 
 // RecordTamperingDetected records a tampering alert.
 func RecordTamperingDetected() {
-	mu.Lock()
-	defer mu.Unlock()
-	currentDay().TamperingDetected++
-	_ = save()
+	record(func(d *Day) { d.TamperingDetected++ })
 }
 
 // RecordIdentityAnonymousCall records an anonymous identity proxy call.
 func RecordIdentityAnonymousCall() {
-	mu.Lock()
-	defer mu.Unlock()
-	currentDay().IdentityAnonymousCalls++
-	_ = save()
+	record(func(d *Day) { d.IdentityAnonymousCalls++ })
 }
 
 // RecordIdentityDeclaredCall records a declared identity proxy call.
 func RecordIdentityDeclaredCall() {
-	mu.Lock()
-	defer mu.Unlock()
-	currentDay().IdentityDeclaredCalls++
-	_ = save()
+	record(func(d *Day) { d.IdentityDeclaredCalls++ })
 }
 
 // RecordIdentityIssuedCall records an issued identity proxy call.
 func RecordIdentityIssuedCall() {
-	mu.Lock()
-	defer mu.Unlock()
-	currentDay().IdentityIssuedCalls++
-	_ = save()
+	record(func(d *Day) { d.IdentityIssuedCalls++ })
 }
 
 // RecordCapabilityViolationBlocked records a capability violation block.
 func RecordCapabilityViolationBlocked() {
-	mu.Lock()
-	defer mu.Unlock()
-	currentDay().CapabilityViolationsBlocked++
-	_ = save()
+	record(func(d *Day) { d.CapabilityViolationsBlocked++ })
 }
 
 // RecordProcessVerificationsPassed records a process verification pass.
 func RecordProcessVerificationsPassed() {
-	mu.Lock()
-	defer mu.Unlock()
-	currentDay().ProcessVerificationsPassed++
-	_ = save()
+	record(func(d *Day) { d.ProcessVerificationsPassed++ })
 }
 
 // RecordErrorAuth records an auth error.
 func RecordErrorAuth() {
-	mu.Lock()
-	defer mu.Unlock()
-	currentDay().ErrorsAuthCount++
-	_ = save()
+	record(func(d *Day) { d.ErrorsAuthCount++ })
 }
 
 // RecordErrorKeychain records a keychain error.
 func RecordErrorKeychain() {
-	mu.Lock()
-	defer mu.Unlock()
-	currentDay().ErrorsKeychainCount++
-	_ = save()
+	record(func(d *Day) { d.ErrorsKeychainCount++ })
 }
 
 // RecordErrorSecrets records a secrets error.
 func RecordErrorSecrets() {
-	mu.Lock()
-	defer mu.Unlock()
-	currentDay().ErrorsSecretsCount++
-	_ = save()
+	record(func(d *Day) { d.ErrorsSecretsCount++ })
 }
 
 // RecordErrorNetwork records a network error.
 func RecordErrorNetwork() {
-	mu.Lock()
-	defer mu.Unlock()
-	currentDay().ErrorsNetworkCount++
-	_ = save()
+	record(func(d *Day) { d.ErrorsNetworkCount++ })
 }
 
 // RecordErrorSystem records a system error.
 func RecordErrorSystem() {
-	mu.Lock()
-	defer mu.Unlock()
-	currentDay().ErrorsSystemCount++
-	_ = save()
+	record(func(d *Day) { d.ErrorsSystemCount++ })
 }
 
 // RecordErrorUnknown records an unknown error.
 func RecordErrorUnknown() {
-	mu.Lock()
-	defer mu.Unlock()
-	currentDay().ErrorsUnknownCount++
-	_ = save()
+	record(func(d *Day) { d.ErrorsUnknownCount++ })
 }
 
 // RecordTypo records a typo entry.
 func RecordTypo(typo string) {
-	mu.Lock()
-	defer mu.Unlock()
-	d := currentDay()
-	if d.Typos == nil {
-		d.Typos = make(map[string]int)
-	}
-	d.Typos[typo]++
-	_ = save()
+	record(func(d *Day) {
+		if d.Typos == nil {
+			d.Typos = make(map[string]int)
+		}
+		d.Typos[typo]++
+	})
 }
 
 // SyncIfDue checks if 24 hours have passed and flushes telemetry to the cloud.
@@ -563,8 +477,12 @@ func SyncIfDue(client *api.Client, cliVersion string) {
 			d.WorkspaceMemberCount = wsMemberCount
 		}
 
-		// Prepare snapshots
-		var snapshots []map[string]interface{}
+		// Prepare snapshots. Each snapshot is the Day struct marshaled directly
+		// (its json tags already define the wire format) with the bucket's date
+		// promoted alongside the embedded fields. Marshaling the struct instead
+		// of hand-copying every field keeps the wire format in lockstep with the
+		// Day definition — adding a field to Day now needs no edit here.
+		var snapshots []daySnapshot
 		var syncedDates []string
 		currentDate := today()
 
@@ -573,65 +491,7 @@ func SyncIfDue(client *api.Client, cliVersion string) {
 				// Don't send incomplete telemetry for the current day
 				continue
 			}
-			s := map[string]interface{}{
-				"date":                         date,
-				"command_executions":           dayData.CommandExecutions,
-				"proxy_calls":                  dayData.ProxyCalls,
-				"proxy_blocked":                dayData.ProxyBlocked,
-				"proxy_redacted":               dayData.ProxyRedacted,
-				"secrets_resolved":             dayData.SecretsResolved,
-				"total_proxy_duration_ms":      dayData.TotalProxyDurationMs,
-				"injection_styles_used":        dayData.InjectionStylesUsed,
-				"integrations_active":          dayData.IntegrationsActive,
-				"cli_version":                  dayData.CliVersion,
-				"os":                           dayData.OS,
-				"arch":                         dayData.Arch,
-				"active_environment":           dayData.ActiveEnvironment,
-				"project_secret_count":         dayData.ProjectSecretCount,
-				"workspace_type":               dayData.WorkspaceType,
-				"workspace_member_count":       dayData.WorkspaceMemberCount,
-				"proxy_calls_daemon":           dayData.ProxyCallsDaemon,
-				"proxy_calls_transient":        dayData.ProxyCallsTransient,
-				"proxy_calls_mcp":              dayData.ProxyCallsMcp,
-				"proxy_calls_direct":           dayData.ProxyCallsDirect,
-				"developer_commands":           dayData.DeveloperCommands,
-				"ssrf_attempts_blocked":        dayData.SSRFAttemptsBlocked,
-				"allowlist_violations":          dayData.AllowlistViolations,
-				"response_redactions":          dayData.ResponseRedactions,
-				"process_verifications_failed": dayData.ProcessVerificationsFailed,
-				"production_write_challenges":  dayData.ProductionWriteChallenges,
-				"keychain_resolution_ms":       dayData.KeychainResolutionMs,
-				"session_refresh_ms":           dayData.SessionRefreshMs,
-				"interactive_prompts_shown":    dayData.InteractivePromptsShown,
-				"interactive_prompts_skipped":  dayData.InteractivePromptsSkipped,
-				"drift_diffs_detected":         dayData.DriftDiffsDetected,
-				"log_chain_verifications":      dayData.LogChainVerifications,
-				"tampering_detected":           dayData.TamperingDetected,
-				"is_headless_node":             dayData.IsHeadlessNode,
-				"keychain_initialized":         dayData.KeychainInitialized,
-				"typos":                        dayData.Typos,
-				"identity_anonymous_calls":     dayData.IdentityAnonymousCalls,
-				"identity_declared_calls":      dayData.IdentityDeclaredCalls,
-				"identity_issued_calls":        dayData.IdentityIssuedCalls,
-				"capability_violations_blocked": dayData.CapabilityViolationsBlocked,
-				"process_verifications_passed": dayData.ProcessVerificationsPassed,
-				"errors_auth_count":            dayData.ErrorsAuthCount,
-				"errors_keychain_count":        dayData.ErrorsKeychainCount,
-				"errors_secrets_count":         dayData.ErrorsSecretsCount,
-				"errors_network_count":         dayData.ErrorsNetworkCount,
-				"errors_system_count":          dayData.ErrorsSystemCount,
-				"errors_unknown_count":         dayData.ErrorsUnknownCount,
-			}
-			if dayData.UserEmail != "" {
-				s["user_email"] = dayData.UserEmail
-			}
-			if dayData.ProjectID != "" {
-				s["project_id"] = dayData.ProjectID
-			}
-			if dayData.WorkspaceID != "" {
-				s["workspace_id"] = dayData.WorkspaceID
-			}
-			snapshots = append(snapshots, s)
+			snapshots = append(snapshots, daySnapshot{Day: dayData, Date: date})
 			syncedDates = append(syncedDates, date)
 		}
 
@@ -645,29 +505,22 @@ func SyncIfDue(client *api.Client, cliVersion string) {
 			"snapshots": snapshots,
 		}
 
-		// Temporarily override HTTP client timeout to 1.5 seconds for telemetry sync to prevent broken DNS/network hangs
-		originalTimeout := client.HTTPClient.Timeout
-		client.HTTPClient.Timeout = 1500 * time.Millisecond
-		defer func() {
-			client.HTTPClient.Timeout = originalTimeout
-		}()
+		// Use a short-timeout clone of the client for telemetry sync to prevent
+		// broken DNS/network hangs. Cloning avoids mutating the shared client's
+		// timeout, which would otherwise race with concurrent API calls.
+		syncClient := client.Clone()
+		syncClient.HTTPClient.Timeout = 1500 * time.Millisecond
 
 		// Fire off the API call synchronously to ensure it completes before CLI exits.
-		resp, err := client.Call("telemetry.sync", "POST", payload, nil, nil)
-		if err == nil && resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		if err := syncClient.CallNoContent("telemetry.sync", "POST", payload, nil, nil); err != nil {
+			fmt.Println("\n[DEBUG] Telemetry Sync Rejected by Backend:", err)
+		} else {
 			// Success! Clear only the synced daily buckets
 			for _, date := range syncedDates {
 				delete(data.Daily, date)
 			}
 			data.LastSync = time.Now()
 			_ = save()
-		} else if err == nil && resp != nil {
-			if decodeErr := client.DecodeError(resp); decodeErr != nil {
-				fmt.Println("\n[DEBUG] Telemetry Sync Rejected by Backend:", decodeErr)
-			}
-		}
-		if resp != nil {
-			resp.Body.Close()
 		}
 	}
 }

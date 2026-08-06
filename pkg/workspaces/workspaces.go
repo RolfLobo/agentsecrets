@@ -2,10 +2,11 @@
 package workspaces
 
 import (
-	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"os"
+	"strings"
 
 	"github.com/The-17/agentsecrets/pkg/api"
 	"github.com/The-17/agentsecrets/pkg/config"
@@ -47,7 +48,7 @@ func (s *Service) Create(name string) error {
 
 	resp, err := s.API.Call("workspaces.create", "POST", map[string]any{
 		"name":                    name,
-		"encrypted_workspace_key": b64Enc(encryptedWsKey),
+		"encrypted_workspace_key": crypto.B64Encode(encryptedWsKey),
 	}, nil, nil)
 	if err != nil {
 		return fmt.Errorf("create workspace: API call failed: %w", err)
@@ -80,7 +81,7 @@ func (s *Service) Create(name string) error {
 
 	cfg.Workspaces[res.Data.ID] = config.WorkspaceCacheEntry{
 		Name: name,
-		Key:  b64Enc(wsKey),
+		Key:  crypto.B64Encode(wsKey),
 		Role: res.Data.Role,
 		Type: res.Data.Type,
 	}
@@ -121,7 +122,7 @@ func (s *Service) InviteBatch(workspaceID string, emails []string, role string) 
 		return nil, fmt.Errorf("invite batch: workspace %s not found", workspaceID)
 	}
 
-	wsKey, err := b64Dec(ws.Key, "invite batch: decode ws key")
+	wsKey, err := crypto.B64Decode(ws.Key, "invite batch: decode ws key")
 	if err != nil {
 		return nil, err
 	}
@@ -158,7 +159,7 @@ func (s *Service) InviteBatch(workspaceID string, emails []string, role string) 
 				return
 			}
 
-			pk, err := b64Dec(res.Data.PublicKey, "invalid public key")
+			pk, err := crypto.B64Decode(res.Data.PublicKey, "invalid public key")
 			if err != nil {
 				ch <- keyResult{email: e, err: err}
 				return
@@ -194,7 +195,7 @@ func (s *Service) InviteBatch(workspaceID string, emails []string, role string) 
 		invites = append(invites, inviteEntry{
 			Email:                 kr.email,
 			Role:                  role,
-			EncryptedWorkspaceKey: b64Enc(encKey),
+			EncryptedWorkspaceKey: crypto.B64Encode(encKey),
 		})
 	}
 
@@ -243,101 +244,44 @@ type WorkspaceMember struct {
 
 // Members lists all members of a workspace.
 func (s *Service) Members(workspaceID string) ([]WorkspaceMember, error) {
-	resp, err := s.API.Call("workspaces.members", "GET", nil, map[string]string{"workspace_id": workspaceID}, nil)
-	if err != nil {
-		return nil, fmt.Errorf("members: API call failed: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, s.API.DecodeError(resp)
-	}
-
-	var res struct {
-		Data []WorkspaceMember `json:"data"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&res); err != nil {
-		return nil, fmt.Errorf("members: failed to parse response: %w", err)
-	}
-
-	return res.Data, nil
+	return api.CallJSON[[]WorkspaceMember](s.API, "workspaces.members", "GET", nil, map[string]string{"workspace_id": workspaceID}, nil)
 }
 
 // RemoveMember removes a member from a workspace by their user ID.
 func (s *Service) RemoveMember(workspaceID, userID string) error {
-	resp, err := s.API.Call("workspaces.remove_member", "DELETE", nil, map[string]string{
+	return s.API.CallNoContent("workspaces.remove_member", "DELETE", nil, map[string]string{
 		"workspace_id": workspaceID,
 		"user_id":      userID,
 	}, nil)
-	if err != nil {
-		return fmt.Errorf("remove member: API call failed: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNoContent {
-		return s.API.DecodeError(resp)
-	}
-
-	return nil
 }
 
 // UpdateRole updates the role of a member in a workspace.
 func (s *Service) UpdateRole(workspaceID, userID, action string) error {
-	resp, err := s.API.Call("workspaces.role_update", "POST", map[string]string{
+	return s.API.CallNoContent("workspaces.role_update", "POST", map[string]string{
 		"action": action,
 	}, map[string]string{
 		"workspace_id": workspaceID,
 		"user_id":      userID,
 	}, nil)
-	if err != nil {
-		return fmt.Errorf("update role: API call failed: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return s.API.DecodeError(resp)
-	}
-
-	return nil
 }
 
 // --- Workspace Allowlist ---
 
 // AddAllowlist adds one or more domains to the workspace allowlist.
 func (s *Service) AddAllowlist(workspaceID string, domains ...string) error {
-	resp, err := s.API.Call("workspaces.allowlist_add", "POST", map[string]interface{}{
+	return s.API.CallNoContent("workspaces.allowlist_add", "POST", map[string]interface{}{
 		"domains": domains,
 	}, map[string]string{
 		"workspace_id": workspaceID,
 	}, nil)
-	if err != nil {
-		return fmt.Errorf("add allowlist: API call failed: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusOK {
-		return s.API.DecodeError(resp)
-	}
-
-	return nil
 }
 
 // RemoveAllowlist removes a domain from the workspace allowlist.
 func (s *Service) RemoveAllowlist(workspaceID, domain string) error {
-	resp, err := s.API.Call("workspaces.allowlist_remove", "DELETE", nil, map[string]string{
+	return s.API.CallNoContent("workspaces.allowlist_remove", "DELETE", nil, map[string]string{
 		"workspace_id": workspaceID,
 		"domain":       domain,
 	}, nil)
-	if err != nil {
-		return fmt.Errorf("remove allowlist: API call failed: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusNoContent && resp.StatusCode != http.StatusOK {
-		return s.API.DecodeError(resp)
-	}
-
-	return nil
 }
 
 // AllowlistDomain represents a domain in the workspace allowlist.
@@ -349,26 +293,9 @@ type AllowlistDomain struct {
 
 // ListAllowlist retrieves the allowlist for a workspace.
 func (s *Service) ListAllowlist(workspaceID string) ([]AllowlistDomain, error) {
-	resp, err := s.API.Call("workspaces.allowlist_list", "GET", nil, map[string]string{
+	return api.CallJSON[[]AllowlistDomain](s.API, "workspaces.allowlist_list", "GET", nil, map[string]string{
 		"workspace_id": workspaceID,
 	}, nil)
-	if err != nil {
-		return nil, fmt.Errorf("list allowlist: API call failed: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, s.API.DecodeError(resp)
-	}
-
-	var res struct {
-		Data []AllowlistDomain `json:"data"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&res); err != nil {
-		return nil, fmt.Errorf("list allowlist: failed to parse response: %w", err)
-	}
-
-	return res.Data, nil
 }
 
 // AllowlistLogEntry represents an entry in the allowlist audit log.
@@ -381,40 +308,26 @@ type AllowlistLogEntry struct {
 
 // LogAllowlist retrieves the audit log for the workspace allowlist.
 func (s *Service) LogAllowlist(workspaceID string) ([]AllowlistLogEntry, error) {
-	resp, err := s.API.Call("workspaces.allowlist_log", "GET", nil, map[string]string{
+	return api.CallJSON[[]AllowlistLogEntry](s.API, "workspaces.allowlist_log", "GET", nil, map[string]string{
 		"workspace_id": workspaceID,
 	}, nil)
-	if err != nil {
-		return nil, fmt.Errorf("log allowlist: API call failed: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, s.API.DecodeError(resp)
-	}
-
-	var res struct {
-		Data []AllowlistLogEntry `json:"data"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&res); err != nil {
-		return nil, fmt.Errorf("log allowlist: failed to parse response: %w", err)
-	}
-
-	return res.Data, nil
 }
 
-// Delete deletes a workspace by its ID.
+// Delete deletes a workspace by its ID. A personal workspace can never be
+// deleted: it is the account's default namespace. This guard is enforced here
+// at the service layer — not only in the CLI command — so no caller (verb-noun
+// alias, future API consumer) can bypass it.
 func (s *Service) Delete(workspaceID string) error {
-	resp, err := s.API.Call("workspaces.delete", "DELETE", nil, map[string]string{
-		"workspace_id": workspaceID,
-	}, nil)
-	if err != nil {
-		return fmt.Errorf("delete workspace: API call failed: %w", err)
+	if cfg, err := config.LoadGlobalConfig(); err == nil && cfg != nil {
+		if ws, ok := cfg.Workspaces[workspaceID]; ok && strings.EqualFold(ws.Type, "personal") {
+			return fmt.Errorf("cannot delete your personal workspace")
+		}
 	}
-	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNoContent {
-		return s.API.DecodeError(resp)
+	if err := s.API.CallNoContent("workspaces.delete", "DELETE", nil, map[string]string{
+		"workspace_id": workspaceID,
+	}, nil); err != nil {
+		return err
 	}
 
 	// Remove it from the local global config if it's cached there
@@ -424,22 +337,10 @@ func (s *Service) Delete(workspaceID string) error {
 		if cfg.SelectedWorkspaceID == workspaceID {
 			cfg.SelectedWorkspaceID = ""
 		}
-		_ = config.SaveGlobalConfig(cfg)
+		if err := config.SaveGlobalConfig(cfg); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: workspace deleted on cloud but failed to update local config cache: %v\n", err)
+		}
 	}
 
 	return nil
-}
-
-// b64Enc is a shorthand for base64 standard encoding.
-func b64Enc(b []byte) string {
-	return base64.StdEncoding.EncodeToString(b)
-}
-
-// b64Dec decodes a base64 string, wrapping any error with the given context message.
-func b64Dec(s, context string) ([]byte, error) {
-	b, err := base64.StdEncoding.DecodeString(s)
-	if err != nil {
-		return nil, fmt.Errorf("%s: %w", context, err)
-	}
-	return b, nil
 }

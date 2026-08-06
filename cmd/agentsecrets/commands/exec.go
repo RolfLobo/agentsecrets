@@ -35,31 +35,35 @@ func NewExecCmd() *cobra.Command {
 		Short:         "Resolve secrets for OpenClaw exec provider (reads JSON from stdin, writes JSON to stdout)",
 		SilenceUsage:  true,
 		SilenceErrors: true,
-		Run:           runExec,
+		RunE:          runExec,
 	}
 }
 
-func runExec(cmd *cobra.Command, args []string) {
+// runExec implements the OpenClaw exec provider protocol. Failures return a
+// silent ExitError (the human-readable message is written to stderr in the
+// machine protocol's own format) so Execute's deferred keychainauth.Close still
+// runs; the exit code is carried by the ExitError rather than a bare os.Exit.
+func runExec(cmd *cobra.Command, args []string) error {
 	input, err := io.ReadAll(os.Stdin)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "failed to read stdin: %v\n", err)
-		os.Exit(1)
+		return &ExitError{Code: 1, Silent: true}
 	}
 
 	if len(input) == 0 {
 		fmt.Fprintln(os.Stderr, "empty stdin")
-		os.Exit(1)
+		return &ExitError{Code: 1, Silent: true}
 	}
 
 	var req ExecRequest
 	if err := json.Unmarshal(input, &req); err != nil {
 		fmt.Fprintf(os.Stderr, "invalid JSON: %v\n", err)
-		os.Exit(1)
+		return &ExitError{Code: 1, Silent: true}
 	}
 
 	if req.ProtocolVersion != 1 {
 		fmt.Fprintf(os.Stderr, "unsupported protocol version: %d\n", req.ProtocolVersion)
-		os.Exit(1)
+		return &ExitError{Code: 1, Silent: true}
 	}
 
 	resp := ExecResponse{
@@ -70,7 +74,7 @@ func runExec(cmd *cobra.Command, args []string) {
 	if len(req.IDs) == 0 {
 		out, _ := json.Marshal(resp)
 		fmt.Println(string(out))
-		os.Exit(0)
+		return nil
 	}
 
 	project, err := config.LoadProjectConfig()
@@ -79,7 +83,7 @@ func runExec(cmd *cobra.Command, args []string) {
 		globalProjectID := config.GetSelectedProjectID()
 		if globalProjectID == "" {
 			fmt.Fprintln(os.Stderr, "no project configured in current directory")
-			os.Exit(1)
+			return &ExitError{Code: 1, Silent: true}
 		}
 		project = &config.ProjectConfig{ProjectID: globalProjectID}
 	}
@@ -88,7 +92,7 @@ func runExec(cmd *cobra.Command, args []string) {
 	// exec uses DisableFlagParsing-like behavior so PersistentPreRunE may not fire.
 	if err := ensureKeychainAuthForExec(); err != nil {
 		fmt.Fprintf(os.Stderr, "keychain-auth: %v\n", err)
-		os.Exit(1)
+		return &ExitError{Code: 1, Silent: true}
 	}
 
 	for _, id := range req.IDs {
@@ -111,11 +115,11 @@ func runExec(cmd *cobra.Command, args []string) {
 	out, err := json.Marshal(resp)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "failed to serialize response: %v\n", err)
-		os.Exit(1)
+		return &ExitError{Code: 1, Silent: true}
 	}
 
 	fmt.Println(string(out))
-	os.Exit(0)
+	return nil
 }
 
 // ensureKeychainAuthForExec establishes a keychain-auth connection for the exec command.

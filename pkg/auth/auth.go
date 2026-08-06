@@ -86,14 +86,8 @@ func (s *Service) Signup(req SignupRequest) error {
 		"terms_agreement":       true,
 	}
 
-	resp, err := s.API.Call("auth.signup", "POST", data, nil, nil)
-	if err != nil {
+	if err := s.API.CallNoContent("auth.signup", "POST", data, nil, nil, http.StatusCreated); err != nil {
 		return fmt.Errorf("signup: API call failed: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusCreated {
-		return s.API.DecodeError(resp)
 	}
 
 	// Auto-login after signup — pass the keypair so we skip decryption

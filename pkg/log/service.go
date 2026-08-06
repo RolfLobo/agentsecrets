@@ -6,7 +6,6 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
-	"net/http"
 	"strings"
 	"time"
 
@@ -130,6 +129,199 @@ func mapForensicToLegacy(fe proxy.ForensicAuditEvent) proxy.AuditEvent {
 		WorkspaceID:    fe.WorkspaceID,
 		ProjectID:      fe.ProjectID,
 		TokenID:        tokenID,
+	}
+}
+
+// scanForensicRow scans the next forensic_audit_events row into a ForensicAuditEvent.
+func scanForensicRow(rows *sql.Rows) (proxy.ForensicAuditEvent, error) {
+	var ev proxy.ForensicAuditEvent
+	var eventJSON, snapshotJSON, enforcementJSON, resolutionJSON string
+	var workspaceID, projectID, environment, agentID, tokenID, domain, method, outcome, chainHash sql.NullString
+
+	err := rows.Scan(
+		&ev.ID,
+		&ev.Version,
+		&ev.CreatedAt,
+		&workspaceID,
+		&projectID,
+		&environment,
+		&agentID,
+		&tokenID,
+		&domain,
+		&method,
+		&ev.Event.StatusCode,
+		&outcome,
+		&ev.Event.LatencyMs,
+		&chainHash,
+		&eventJSON,
+		&snapshotJSON,
+		&enforcementJSON,
+		&resolutionJSON,
+	)
+	if err != nil {
+		return ev, err
+	}
+
+	if workspaceID.Valid {
+		ev.WorkspaceID = workspaceID.String
+	}
+	if projectID.Valid {
+		ev.ProjectID = projectID.String
+	}
+	if chainHash.Valid {
+		ev.ChainHash = chainHash.String
+	}
+
+	_ = json.Unmarshal([]byte(eventJSON), &ev.Event)
+	_ = json.Unmarshal([]byte(snapshotJSON), &ev.Snapshot)
+	_ = json.Unmarshal([]byte(enforcementJSON), &ev.Enforcement)
+	_ = json.Unmarshal([]byte(resolutionJSON), &ev.Resolution)
+
+	return ev, nil
+}
+
+// scanLegacyRow scans the next audit_events row into an AuditEvent.
+func scanLegacyRow(rows *sql.Rows) (proxy.AuditEvent, error) {
+	var ev proxy.AuditEvent
+	var secretKeysJSON, authStylesJSON string
+	var environment, agentID, identityLevel, method, targetURL, domain, status, reason, resolutionPath, callerRole, workspaceID, projectID, tokenID sql.NullString
+
+	err := rows.Scan(
+		&ev.ID,
+		&ev.Timestamp,
+		&environment,
+		&agentID,
+		&identityLevel,
+		&method,
+		&targetURL,
+		&domain,
+		&ev.StatusCode,
+		&ev.DurationMs,
+		&status,
+		&reason,
+		&ev.Redacted,
+		&resolutionPath,
+		&callerRole,
+		&workspaceID,
+		&projectID,
+		&tokenID,
+		&secretKeysJSON,
+		&authStylesJSON,
+	)
+	if err != nil {
+		return ev, err
+	}
+
+	if environment.Valid {
+		ev.Environment = environment.String
+	}
+	if agentID.Valid {
+		ev.AgentID = agentID.String
+	}
+	if identityLevel.Valid {
+		ev.IdentityLevel = identityLevel.String
+	}
+	if method.Valid {
+		ev.Method = method.String
+	}
+	if targetURL.Valid {
+		ev.TargetURL = targetURL.String
+	}
+	if domain.Valid {
+		ev.Domain = domain.String
+	}
+	if status.Valid {
+		ev.Status = status.String
+	}
+	if reason.Valid {
+		ev.Reason = reason.String
+	}
+	if resolutionPath.Valid {
+		ev.ResolutionPath = resolutionPath.String
+	}
+	if callerRole.Valid {
+		ev.CallerRole = callerRole.String
+	}
+	if workspaceID.Valid {
+		ev.WorkspaceID = workspaceID.String
+	}
+	if projectID.Valid {
+		ev.ProjectID = projectID.String
+	}
+	if tokenID.Valid {
+		ev.TokenID = tokenID.String
+	}
+
+	_ = json.Unmarshal([]byte(secretKeysJSON), &ev.SecretKeys)
+	if ev.SecretKeys == nil {
+		ev.SecretKeys = []string{}
+	}
+
+	_ = json.Unmarshal([]byte(authStylesJSON), &ev.AuthStyles)
+	if ev.AuthStyles == nil {
+		ev.AuthStyles = []string{}
+	}
+
+	return ev, nil
+}
+
+// apiLogRow is the JSON shape returned by the remote audit log endpoints.
+type apiLogRow struct {
+	ID             string `json:"id"`
+	Timestamp      string `json:"timestamp"`
+	AgentID        string `json:"agent_id"`
+	IdentityLevel  string `json:"identity_level"`
+	CredentialRef  string `json:"credential_ref"`
+	InjectionStyle string `json:"injection_style"`
+	TargetDomain   string `json:"target_domain"`
+	TargetURL      string `json:"target_url"`
+	Method         string `json:"method"`
+	StatusCode     int    `json:"status_code"`
+	DurationMs     int64  `json:"duration_ms"`
+	Redacted       bool   `json:"redacted"`
+	ResolutionPath string `json:"resolution_path"`
+	Error          string `json:"error"`
+}
+
+// apiRowToAuditEvent converts a remote API log row into a local AuditEvent.
+func apiRowToAuditEvent(r apiLogRow) proxy.AuditEvent {
+	var secretKeys []string
+	if r.CredentialRef != "" {
+		secretKeys = strings.Split(r.CredentialRef, ",")
+	} else {
+		secretKeys = []string{}
+	}
+
+	var authStyles []string
+	if r.InjectionStyle != "" {
+		authStyles = strings.Split(r.InjectionStyle, ",")
+	} else {
+		authStyles = []string{}
+	}
+
+	t, _ := time.Parse(time.RFC3339, r.Timestamp)
+
+	status := "OK"
+	if r.StatusCode >= 400 || r.Error != "" {
+		status = "FAILED"
+	}
+
+	return proxy.AuditEvent{
+		ID:             r.ID,
+		Timestamp:      t,
+		SecretKeys:     secretKeys,
+		AgentID:        r.AgentID,
+		IdentityLevel:  r.IdentityLevel,
+		Method:         r.Method,
+		TargetURL:      r.TargetURL,
+		Domain:         r.TargetDomain,
+		AuthStyles:     authStyles,
+		StatusCode:     r.StatusCode,
+		DurationMs:     r.DurationMs,
+		Status:         status,
+		Reason:         r.Error,
+		Redacted:       r.Redacted,
+		ResolutionPath: r.ResolutionPath,
 	}
 }
 
@@ -264,86 +456,10 @@ func (s *Service) queryLocalLegacy(f Filter) ([]proxy.AuditEvent, error) {
 
 	var results []proxy.AuditEvent
 	for rows.Next() {
-		var ev proxy.AuditEvent
-		var secretKeysJSON, authStylesJSON string
-		var environment, agentID, identityLevel, method, targetURL, domain, status, reason, resolutionPath, callerRole, workspaceID, projectID, tokenID sql.NullString
-
-		err := rows.Scan(
-			&ev.ID,
-			&ev.Timestamp,
-			&environment,
-			&agentID,
-			&identityLevel,
-			&method,
-			&targetURL,
-			&domain,
-			&ev.StatusCode,
-			&ev.DurationMs,
-			&status,
-			&reason,
-			&ev.Redacted,
-			&resolutionPath,
-			&callerRole,
-			&workspaceID,
-			&projectID,
-			&tokenID,
-			&secretKeysJSON,
-			&authStylesJSON,
-		)
+		ev, err := scanLegacyRow(rows)
 		if err != nil {
 			return nil, fmt.Errorf("scan error: %w", err)
 		}
-
-		if environment.Valid {
-			ev.Environment = environment.String
-		}
-		if agentID.Valid {
-			ev.AgentID = agentID.String
-		}
-		if identityLevel.Valid {
-			ev.IdentityLevel = identityLevel.String
-		}
-		if method.Valid {
-			ev.Method = method.String
-		}
-		if targetURL.Valid {
-			ev.TargetURL = targetURL.String
-		}
-		if domain.Valid {
-			ev.Domain = domain.String
-		}
-		if status.Valid {
-			ev.Status = status.String
-		}
-		if reason.Valid {
-			ev.Reason = reason.String
-		}
-		if resolutionPath.Valid {
-			ev.ResolutionPath = resolutionPath.String
-		}
-		if callerRole.Valid {
-			ev.CallerRole = callerRole.String
-		}
-		if workspaceID.Valid {
-			ev.WorkspaceID = workspaceID.String
-		}
-		if projectID.Valid {
-			ev.ProjectID = projectID.String
-		}
-		if tokenID.Valid {
-			ev.TokenID = tokenID.String
-		}
-
-		_ = json.Unmarshal([]byte(secretKeysJSON), &ev.SecretKeys)
-		if ev.SecretKeys == nil {
-			ev.SecretKeys = []string{}
-		}
-
-		_ = json.Unmarshal([]byte(authStylesJSON), &ev.AuthStyles)
-		if ev.AuthStyles == nil {
-			ev.AuthStyles = []string{}
-		}
-
 		results = append(results, ev)
 	}
 	return results, nil
@@ -464,49 +580,10 @@ func (s *Service) QueryLocalForensic(f Filter) ([]proxy.ForensicAuditEvent, erro
 
 	var results []proxy.ForensicAuditEvent
 	for rows.Next() {
-		var ev proxy.ForensicAuditEvent
-		var eventJSON, snapshotJSON, enforcementJSON, resolutionJSON string
-		var workspaceID, projectID, environment, agentID, tokenID, domain, method, outcome, chainHash sql.NullString
-
-		err := rows.Scan(
-			&ev.ID,
-			&ev.Version,
-			&ev.CreatedAt,
-			&workspaceID,
-			&projectID,
-			&environment,
-			&agentID,
-			&tokenID,
-			&domain,
-			&method,
-			&ev.Event.StatusCode,
-			&outcome,
-			&ev.Event.LatencyMs,
-			&chainHash,
-			&eventJSON,
-			&snapshotJSON,
-			&enforcementJSON,
-			&resolutionJSON,
-		)
+		ev, err := scanForensicRow(rows)
 		if err != nil {
 			return nil, fmt.Errorf("scan forensic error: %w", err)
 		}
-
-		if workspaceID.Valid {
-			ev.WorkspaceID = workspaceID.String
-		}
-		if projectID.Valid {
-			ev.ProjectID = projectID.String
-		}
-		if chainHash.Valid {
-			ev.ChainHash = chainHash.String
-		}
-
-		_ = json.Unmarshal([]byte(eventJSON), &ev.Event)
-		_ = json.Unmarshal([]byte(snapshotJSON), &ev.Snapshot)
-		_ = json.Unmarshal([]byte(enforcementJSON), &ev.Enforcement)
-		_ = json.Unmarshal([]byte(resolutionJSON), &ev.Resolution)
-
 		results = append(results, ev)
 	}
 	return results, nil
@@ -530,79 +607,10 @@ func (s *Service) GetLog(id string) (*proxy.AuditEvent, error) {
 	defer rows.Close()
 
 	if rows.Next() {
-		var ev proxy.AuditEvent
-		var secretKeysJSON, authStylesJSON string
-		var environment, agentID, identityLevel, method, targetURL, domain, status, reason, resolutionPath, callerRole, workspaceID, projectID, tokenID sql.NullString
-
-		err := rows.Scan(
-			&ev.ID,
-			&ev.Timestamp,
-			&environment,
-			&agentID,
-			&identityLevel,
-			&method,
-			&targetURL,
-			&domain,
-			&ev.StatusCode,
-			&ev.DurationMs,
-			&status,
-			&reason,
-			&ev.Redacted,
-			&resolutionPath,
-			&callerRole,
-			&workspaceID,
-			&projectID,
-			&tokenID,
-			&secretKeysJSON,
-			&authStylesJSON,
-		)
+		ev, err := scanLegacyRow(rows)
 		if err != nil {
 			return nil, err
 		}
-
-		if environment.Valid {
-			ev.Environment = environment.String
-		}
-		if agentID.Valid {
-			ev.AgentID = agentID.String
-		}
-		if identityLevel.Valid {
-			ev.IdentityLevel = identityLevel.String
-		}
-		if method.Valid {
-			ev.Method = method.String
-		}
-		if targetURL.Valid {
-			ev.TargetURL = targetURL.String
-		}
-		if domain.Valid {
-			ev.Domain = domain.String
-		}
-		if status.Valid {
-			ev.Status = status.String
-		}
-		if reason.Valid {
-			ev.Reason = reason.String
-		}
-		if resolutionPath.Valid {
-			ev.ResolutionPath = resolutionPath.String
-		}
-		if callerRole.Valid {
-			ev.CallerRole = callerRole.String
-		}
-		if workspaceID.Valid {
-			ev.WorkspaceID = workspaceID.String
-		}
-		if projectID.Valid {
-			ev.ProjectID = projectID.String
-		}
-		if tokenID.Valid {
-			ev.TokenID = tokenID.String
-		}
-
-		_ = json.Unmarshal([]byte(secretKeysJSON), &ev.SecretKeys)
-		_ = json.Unmarshal([]byte(authStylesJSON), &ev.AuthStyles)
-
 		return &ev, nil
 	}
 
@@ -619,49 +627,10 @@ func (s *Service) GetForensicLog(id string) (*proxy.ForensicAuditEvent, error) {
 	defer rows.Close()
 
 	if rows.Next() {
-		var ev proxy.ForensicAuditEvent
-		var eventJSON, snapshotJSON, enforcementJSON, resolutionJSON string
-		var workspaceID, projectID, environment, agentID, tokenID, domain, method, outcome, chainHash sql.NullString
-
-		err := rows.Scan(
-			&ev.ID,
-			&ev.Version,
-			&ev.CreatedAt,
-			&workspaceID,
-			&projectID,
-			&environment,
-			&agentID,
-			&tokenID,
-			&domain,
-			&method,
-			&ev.Event.StatusCode,
-			&outcome,
-			&ev.Event.LatencyMs,
-			&chainHash,
-			&eventJSON,
-			&snapshotJSON,
-			&enforcementJSON,
-			&resolutionJSON,
-		)
+		ev, err := scanForensicRow(rows)
 		if err != nil {
 			return nil, err
 		}
-
-		if workspaceID.Valid {
-			ev.WorkspaceID = workspaceID.String
-		}
-		if projectID.Valid {
-			ev.ProjectID = projectID.String
-		}
-		if chainHash.Valid {
-			ev.ChainHash = chainHash.String
-		}
-
-		_ = json.Unmarshal([]byte(eventJSON), &ev.Event)
-		_ = json.Unmarshal([]byte(snapshotJSON), &ev.Snapshot)
-		_ = json.Unmarshal([]byte(enforcementJSON), &ev.Enforcement)
-		_ = json.Unmarshal([]byte(resolutionJSON), &ev.Resolution)
-
 		return &ev, nil
 	}
 
@@ -679,49 +648,10 @@ func (s *Service) QueryChronologicalForensic() ([]proxy.ForensicAuditEvent, erro
 
 	var results []proxy.ForensicAuditEvent
 	for rows.Next() {
-		var ev proxy.ForensicAuditEvent
-		var eventJSON, snapshotJSON, enforcementJSON, resolutionJSON string
-		var workspaceID, projectID, environment, agentID, tokenID, domain, method, outcome, chainHash sql.NullString
-
-		err := rows.Scan(
-			&ev.ID,
-			&ev.Version,
-			&ev.CreatedAt,
-			&workspaceID,
-			&projectID,
-			&environment,
-			&agentID,
-			&tokenID,
-			&domain,
-			&method,
-			&ev.Event.StatusCode,
-			&outcome,
-			&ev.Event.LatencyMs,
-			&chainHash,
-			&eventJSON,
-			&snapshotJSON,
-			&enforcementJSON,
-			&resolutionJSON,
-		)
+		ev, err := scanForensicRow(rows)
 		if err != nil {
 			return nil, err
 		}
-
-		if workspaceID.Valid {
-			ev.WorkspaceID = workspaceID.String
-		}
-		if projectID.Valid {
-			ev.ProjectID = projectID.String
-		}
-		if chainHash.Valid {
-			ev.ChainHash = chainHash.String
-		}
-
-		_ = json.Unmarshal([]byte(eventJSON), &ev.Event)
-		_ = json.Unmarshal([]byte(snapshotJSON), &ev.Snapshot)
-		_ = json.Unmarshal([]byte(enforcementJSON), &ev.Enforcement)
-		_ = json.Unmarshal([]byte(resolutionJSON), &ev.Resolution)
-
 		results = append(results, ev)
 	}
 	return results, nil
@@ -796,79 +726,14 @@ func (s *Service) QueryRemote(workspaceID string, f Filter) ([]proxy.AuditEvent,
 		params["limit"] = fmt.Sprintf("%d", f.Limit)
 	}
 
-	resp, err := s.client.Call("log.list", "GET", nil, params, nil)
+	apiRows, err := api.CallJSON[[]apiLogRow](s.client, "log.list", "GET", nil, params, nil)
 	if err != nil {
 		return nil, fmt.Errorf("remote query failed: %w", err)
 	}
-	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
-		return nil, s.client.DecodeError(resp)
-	}
-
-	var apiRes struct {
-		Data []struct {
-			ID             string `json:"id"`
-			Timestamp      string `json:"timestamp"`
-			AgentID        string `json:"agent_id"`
-			IdentityLevel  string `json:"identity_level"`
-			CredentialRef  string `json:"credential_ref"`
-			InjectionStyle string `json:"injection_style"`
-			TargetDomain   string `json:"target_domain"`
-			TargetURL      string `json:"target_url"`
-			Method         string `json:"method"`
-			StatusCode     int    `json:"status_code"`
-			DurationMs     int64  `json:"duration_ms"`
-			Redacted       bool   `json:"redacted"`
-			ResolutionPath string `json:"resolution_path"`
-			Error          string `json:"error"`
-		} `json:"data"`
-	}
-
-	if err := json.NewDecoder(resp.Body).Decode(&apiRes); err != nil {
-		return nil, fmt.Errorf("failed to decode response: %w", err)
-	}
-
-	var results []proxy.AuditEvent
-	for _, r := range apiRes.Data {
-		var secretKeys []string
-		if r.CredentialRef != "" {
-			secretKeys = strings.Split(r.CredentialRef, ",")
-		} else {
-			secretKeys = []string{}
-		}
-
-		var authStyles []string
-		if r.InjectionStyle != "" {
-			authStyles = strings.Split(r.InjectionStyle, ",")
-		} else {
-			authStyles = []string{}
-		}
-
-		t, _ := time.Parse(time.RFC3339, r.Timestamp)
-
-		status := "OK"
-		if r.StatusCode >= 400 || r.Error != "" {
-			status = "FAILED"
-		}
-
-		results = append(results, proxy.AuditEvent{
-			ID:             r.ID,
-			Timestamp:      t,
-			SecretKeys:     secretKeys,
-			AgentID:        r.AgentID,
-			IdentityLevel:  r.IdentityLevel,
-			Method:         r.Method,
-			TargetURL:      r.TargetURL,
-			Domain:         r.TargetDomain,
-			AuthStyles:     authStyles,
-			StatusCode:     r.StatusCode,
-			DurationMs:     r.DurationMs,
-			Status:         status,
-			Reason:         r.Error,
-			Redacted:       r.Redacted,
-			ResolutionPath: r.ResolutionPath,
-		})
+	results := make([]proxy.AuditEvent, 0, len(apiRows))
+	for _, r := range apiRows {
+		results = append(results, apiRowToAuditEvent(r))
 	}
 
 	return results, nil
@@ -876,77 +741,12 @@ func (s *Service) QueryRemote(workspaceID string, f Filter) ([]proxy.AuditEvent,
 
 // GetRemoteLog fetches a single log entry from the remote API.
 func (s *Service) GetRemoteLog(logID string) (*proxy.AuditEvent, error) {
-	resp, err := s.client.Call("log.detail", "GET", nil, map[string]string{"log_id": logID}, nil)
+	row, err := api.CallJSON[apiLogRow](s.client, "log.detail", "GET", nil, map[string]string{"log_id": logID}, nil)
 	if err != nil {
 		return nil, fmt.Errorf("remote detail failed: %w", err)
 	}
-	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
-		return nil, s.client.DecodeError(resp)
-	}
-
-	var apiRes struct {
-		Data struct {
-			ID             string `json:"id"`
-			Timestamp      string `json:"timestamp"`
-			AgentID        string `json:"agent_id"`
-			IdentityLevel  string `json:"identity_level"`
-			CredentialRef  string `json:"credential_ref"`
-			InjectionStyle string `json:"injection_style"`
-			TargetDomain   string `json:"target_domain"`
-			TargetURL      string `json:"target_url"`
-			Method         string `json:"method"`
-			StatusCode     int    `json:"status_code"`
-			DurationMs     int64  `json:"duration_ms"`
-			Redacted       bool   `json:"redacted"`
-			ResolutionPath string `json:"resolution_path"`
-			Error          string `json:"error"`
-		} `json:"data"`
-	}
-
-	if err := json.NewDecoder(resp.Body).Decode(&apiRes); err != nil {
-		return nil, fmt.Errorf("failed to decode response: %w", err)
-	}
-
-	r := apiRes.Data
-	var secretKeys []string
-	if r.CredentialRef != "" {
-		secretKeys = strings.Split(r.CredentialRef, ",")
-	} else {
-		secretKeys = []string{}
-	}
-
-	var authStyles []string
-	if r.InjectionStyle != "" {
-		authStyles = strings.Split(r.InjectionStyle, ",")
-	} else {
-		authStyles = []string{}
-	}
-
-	t, _ := time.Parse(time.RFC3339, r.Timestamp)
-
-	status := "OK"
-	if r.StatusCode >= 400 || r.Error != "" {
-		status = "FAILED"
-	}
-
-	return &proxy.AuditEvent{
-		ID:             r.ID,
-		Timestamp:      t,
-		SecretKeys:     secretKeys,
-		AgentID:        r.AgentID,
-		IdentityLevel:  r.IdentityLevel,
-		Method:         r.Method,
-		TargetURL:      r.TargetURL,
-		Domain:         r.TargetDomain,
-		AuthStyles:     authStyles,
-		StatusCode:     r.StatusCode,
-		DurationMs:     r.DurationMs,
-		Status:         status,
-		Reason:         r.Error,
-		Redacted:       r.Redacted,
-		ResolutionPath: r.ResolutionPath,
-	}, nil
+	ev := apiRowToAuditEvent(row)
+	return &ev, nil
 }
 
