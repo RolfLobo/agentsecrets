@@ -25,6 +25,7 @@ var (
 	callQueries    []string // "api_key=SECRET_NAME"
 	callBodyFields []string // "json.path=SECRET_NAME"
 	callFormFields []string // "field=SECRET_NAME"
+	callOutput     string   // "text" (default) or "json"
 )
 
 var callCmd = &cobra.Command{
@@ -69,6 +70,7 @@ func init() {
 	callCmd.Flags().StringArrayVar(&callQueries, "query", nil, "Query injection: param=SECRET_KEY (repeatable)")
 	callCmd.Flags().StringArrayVar(&callBodyFields, "body-field", nil, "Body injection: json.path=SECRET_KEY (repeatable)")
 	callCmd.Flags().StringArrayVar(&callFormFields, "form-field", nil, "Form injection: field=SECRET_KEY (repeatable)")
+	callCmd.Flags().StringVar(&callOutput, "output", "text", "Output format: text or json")
 	_ = callCmd.MarkFlagRequired("url")
 
 	_ = callCmd.RegisterFlagCompletionFunc("bearer", autocompleteSecretKeys)
@@ -76,6 +78,12 @@ func init() {
 }
 
 func runCall(cmd *cobra.Command, args []string) error {
+	switch callOutput {
+	case "", outputText, outputJSON:
+	default:
+		return fmt.Errorf("--output must be %q or %q, got %q", outputText, outputJSON, callOutput)
+	}
+
 	// Build injections from flags
 	var injections []proxy.Injection
 
@@ -171,6 +179,7 @@ func runCall(cmd *cobra.Command, args []string) error {
 		fmt.Fprintln(os.Stderr)
 	}()
 
+	callStart := time.Now()
 	result, err := proxy.CallViaProxy(proxy.CallRequest{
 		TargetURL:  callURL,
 		Method:     callMethod,
@@ -178,8 +187,27 @@ func runCall(cmd *cobra.Command, args []string) error {
 		Injections: injections,
 		AgentToken: callToken,
 	})
+	durationMs := time.Since(callStart).Milliseconds()
 	if err != nil {
+		// CallViaProxy failed before any HTTP response (e.g. proxy unreachable).
+		if callOutput == outputJSON {
+			return emitCallJSON(callResultJSON{
+				Headers:    map[string][]string{},
+				DurationMs: durationMs,
+				Error:      err.Error(),
+			})
+		}
 		return fmt.Errorf("API call failed: %w", err)
+	}
+
+	// Structured output: emit the full envelope as a single JSON object on
+	// stdout. Header values are redacted by the engine (redactResponse) exactly
+	// like the body, so this is safe to hand to a programmatic consumer or an AI
+	// agent. Error semantics mirror text mode (a non-empty "error" is populated
+	// under the same conditions text mode prints one), so a consumer maps errors
+	// the same way whether it reads stderr or the envelope.
+	if callOutput == outputJSON {
+		return emitCallJSON(buildCallJSON(result, durationMs))
 	}
 
 	if result.StatusCode >= 400 {
@@ -208,6 +236,12 @@ func runCall(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
+// Output format values for --output.
+const (
+	outputText = "text"
+	outputJSON = "json"
+)
+
 // splitFlag parses "name=value" flag format.
 func splitFlag(s string, flagName string) (string, string, error) {
 	parts := strings.SplitN(s, "=", 2)
@@ -215,4 +249,90 @@ func splitFlag(s string, flagName string) (string, string, error) {
 		return "", "", fmt.Errorf("--%s must be in Name=SECRET_KEY format, got %q", flagName, s)
 	}
 	return parts[0], parts[1], nil
+}
+
+// callResultJSON is the stable, machine-readable envelope emitted by
+// `agentsecrets call --output json`. Every field is safe to expose: body and
+// header values are redacted upstream by the proxy engine (redactResponse), so
+// a resolved secret value can never appear here. The SDK/agent receives secret
+// key *names* only and consumes this shape; keep it backward-compatible.
+type callResultJSON struct {
+	Status     int                 `json:"status"`
+	Headers    map[string][]string `json:"headers"`
+	Body       string              `json:"body"`
+	Redacted   bool                `json:"redacted"`
+	DurationMs int64               `json:"duration_ms"`
+	Error      string              `json:"error,omitempty"`
+}
+
+// buildCallJSON converts a proxy CallResult into the JSON envelope. It mirrors
+// text mode's error semantics: a >= 400 status populates "error" (from the
+// upstream JSON error/message when present, else a generic HTTP summary) so a
+// programmatic consumer branches identically to a stderr reader.
+func buildCallJSON(result *proxy.CallResult, durationMs int64) callResultJSON {
+	headers := result.Headers
+	if headers == nil {
+		headers = map[string][]string{}
+	}
+
+	body := string(result.Body)
+
+	// The engine redacts both the body and header values, so check both — a
+	// response can carry a redacted header (e.g. an echoed Set-Cookie) with an
+	// otherwise-clean body.
+	redacted := strings.Contains(body, proxy.RedactionPlaceholder)
+	for _, vals := range headers {
+		if redacted {
+			break
+		}
+		for _, v := range vals {
+			if strings.Contains(v, proxy.RedactionPlaceholder) {
+				redacted = true
+				break
+			}
+		}
+	}
+
+	out := callResultJSON{
+		Status:     result.StatusCode,
+		Headers:    headers,
+		Body:       body,
+		Redacted:   redacted,
+		DurationMs: durationMs,
+	}
+
+	if result.StatusCode >= 400 {
+		var errData struct {
+			Error   string `json:"error"`
+			Message string `json:"message"`
+		}
+		if err := json.Unmarshal(result.Body, &errData); err == nil {
+			if msg := errData.Message; msg != "" {
+				out.Error = msg
+			} else if errData.Error != "" {
+				out.Error = errData.Error
+			}
+		}
+		if out.Error == "" {
+			out.Error = fmt.Sprintf("HTTP %d", result.StatusCode)
+		}
+	}
+
+	return out
+}
+
+// emitCallJSON writes the envelope as a single line of JSON to stdout. On a
+// >= 400 upstream status it also returns a silent coded exit so the process
+// exit status still signals failure (matching text mode) while stdout stays
+// clean, parseable JSON.
+func emitCallJSON(out callResultJSON) error {
+	enc, err := json.Marshal(out)
+	if err != nil {
+		return fmt.Errorf("failed to encode JSON output: %w", err)
+	}
+	fmt.Println(string(enc))
+	if out.Status >= 400 || out.Error != "" {
+		return &ExitError{Code: 1, Silent: true}
+	}
+	return nil
 }

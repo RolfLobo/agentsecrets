@@ -33,6 +33,11 @@ func resolveEnvForAudit() string {
 
 const redactionPlaceholder = "[REDACTED_BY_AGENTSECRETS]"
 
+// RedactionPlaceholder is the marker substituted for any redacted secret value.
+// Exported so consumers (e.g. the `call --output json` encoder) can detect
+// whether a response was redacted without duplicating the literal.
+const RedactionPlaceholder = redactionPlaceholder
+
 // redactionRegexCache memoizes the compiled masked-pattern regex per secret
 // value. Redaction runs on every proxied response, and recompiling the same
 // pattern each time is pure overhead. Bounded so a churn of distinct secrets
@@ -917,12 +922,20 @@ func (e *Engine) blockSSRF(ec *execContext, ssrfErr error) (*CallResult, error) 
 	}, nil
 }
 
-// redactResponse strips any echoed secret values from the response body,
-// mirroring the original inline redaction exactly: same unexpected-content-type
-// warning, same Content-Length rewrite when the body changes.
+// redactResponse strips any echoed secret values from the response body AND
+// response headers, mirroring the original inline body redaction exactly (same
+// unexpected-content-type warning, same Content-Length rewrite when the body
+// changes) and extending the identical detection to header values.
+//
+// Header redaction MUST live here: only the engine holds the resolved secret
+// values. Everything downstream — the CLI's CallViaProxy, the SDK, an AI agent
+// reading `--output json` — receives key *names*, never values, so none of them
+// can redact a credential an upstream API happened to reflect back in a header
+// (Set-Cookie, WWW-Authenticate, a redirect Location carrying a token, an echoed
+// X-Api-Key, …). Skipping headers here would be the one way a value leaks.
 func (e *Engine) redactResponse(ec *execContext) {
 	result := ec.result
-	if len(result.Body) == 0 {
+	if result == nil {
 		return
 	}
 
@@ -931,7 +944,8 @@ func (e *Engine) redactResponse(ec *execContext) {
 		contentType = result.Headers["Content-Type"][0]
 	}
 
-	if contentType != "" && !strings.Contains(contentType, "application/json") && !strings.Contains(contentType, "text/") {
+	if len(result.Body) > 0 && contentType != "" &&
+		!strings.Contains(contentType, "application/json") && !strings.Contains(contentType, "text/") {
 		fmt.Fprintf(os.Stderr, "Warning: redacting unexpected content type: %s\n", contentType)
 	}
 
@@ -939,9 +953,23 @@ func (e *Engine) redactResponse(ec *execContext) {
 		if val == "" {
 			continue
 		}
-		if bytes.Contains(result.Body, []byte(val)) {
+
+		// Body: strip every detectable form of the echoed value.
+		if len(result.Body) > 0 && bytes.Contains(result.Body, []byte(val)) {
 			result.Body = redactSecretFromResponse(result.Body, val)
 			ec.redacted = true
+		}
+
+		// Headers: same detection (exact + URL-encoded + masked/truncated forms)
+		// applied to each header value. Mutating slice elements in place is safe
+		// while ranging the map — no keys are added or removed.
+		for name, values := range result.Headers {
+			for i, hv := range values {
+				if strings.Contains(hv, val) {
+					result.Headers[name][i] = string(redactSecretFromResponse([]byte(hv), val))
+					ec.redacted = true
+				}
+			}
 		}
 	}
 
@@ -1325,7 +1353,7 @@ func (e *Engine) logForensic(
 
 	// 7. Proxy Snapshot
 	proxySnap := ProxySnapshot{
-		Version:   "3.1.0",
+		Version:   "3.1.1",
 		Port:      8765,
 		Transient: e.Transient,
 	}

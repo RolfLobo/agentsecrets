@@ -348,6 +348,69 @@ func TestEngineExecuteRedactBody(t *testing.T) {
 	}
 }
 
+// TestEngineExecuteRedactHeaders locks down that echoed secrets are stripped
+// from response HEADERS too — not just the body. Upstreams reflect credentials
+// in headers all the time (Set-Cookie, WWW-Authenticate, echoed API-key
+// headers, tokens in a redirect Location). Only the engine holds the resolved
+// value, so if it doesn't redact headers, the value leaks to every downstream
+// consumer (CLI text mode discards headers today, but `--output json` and the
+// SDK surface them).
+func TestEngineExecuteRedactHeaders(t *testing.T) {
+	secretValue := "sk_live_HEADER_ECHO_67890"
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Echo-Token", "Bearer "+secretValue)
+		w.Header().Set("Set-Cookie", "session="+secretValue+"; Path=/")
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(200)
+		w.Write([]byte(`{"data": "clean body"}`))
+	}))
+	defer upstream.Close()
+
+	engine := &Engine{
+		ProjectID:        "test-project",
+		ResolveAllowlist: mockAllowlist(),
+		Client:           upstream.Client(),
+		ResolveSecret:    mockResolver(map[string]string{"STRIPE_KEY": secretValue}),
+	}
+
+	result, err := engine.Execute(CallRequest{
+		TargetURL: upstream.URL + "/data",
+		Method:    "GET",
+		Injections: []Injection{
+			{Style: "bearer", SecretKey: "STRIPE_KEY"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Execute() error: %v", err)
+	}
+
+	// The clean body is untouched.
+	if got := string(result.Body); !strings.Contains(got, "clean body") {
+		t.Errorf("body = %q, want it to contain \"clean body\"", got)
+	}
+
+	// SECURITY: the secret value must not survive in ANY response header.
+	for name, values := range result.Headers {
+		for _, v := range values {
+			if strings.Contains(v, secretValue) {
+				t.Fatalf("SECURITY: secret VALUE leaked in response header %q: %q", name, v)
+			}
+		}
+	}
+
+	// Each echoing header carries the placeholder instead.
+	for _, name := range []string{"X-Echo-Token", "Set-Cookie"} {
+		vals := result.Headers[name]
+		if len(vals) == 0 {
+			t.Fatalf("expected header %q to be present in response", name)
+		}
+		if !strings.Contains(vals[0], RedactionPlaceholder) {
+			t.Errorf("header %q = %q, want it to contain %q", name, vals[0], RedactionPlaceholder)
+		}
+	}
+}
+
 func TestEngineCapabilities(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(200)
