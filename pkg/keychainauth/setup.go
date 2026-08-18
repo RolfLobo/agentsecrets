@@ -126,6 +126,26 @@ func EnsureDaemonUpToDate() error {
 	return nil
 }
 
+// findBrew locates the brew binary in PATH or standard installation directories.
+func findBrew() string {
+	if p, err := exec.LookPath("brew"); err == nil {
+		return p
+	}
+	homeDir, _ := os.UserHomeDir()
+	candidates := []string{
+		"/home/linuxbrew/.linuxbrew/bin/brew",
+		"/opt/homebrew/bin/brew",
+		"/usr/local/bin/brew",
+		filepath.Join(homeDir, ".linuxbrew", "bin", "brew"),
+	}
+	for _, c := range candidates {
+		if _, err := os.Stat(c); err == nil {
+			return c
+		}
+	}
+	return ""
+}
+
 // EnsureInstalled checks if keychain-auth is in PATH and matches the required version.
 // If not found or outdated, attempts to install it via the platform's package manager.
 // Returns the absolute path to the keychain-auth binary.
@@ -165,7 +185,10 @@ func EnsureInstalled() (string, error) {
 
 	// Check common user-local bin paths if PATH isn't set up properly
 	commonPaths := []string{
+		"/home/linuxbrew/.linuxbrew/bin/keychain-auth",
+		"/opt/homebrew/bin/keychain-auth",
 		filepath.Join(homeDir, ".local", "bin", binaryName),
+		filepath.Join(homeDir, ".linuxbrew", "bin", binaryName),
 	}
 	if runtime.GOOS != "windows" {
 		commonPaths = append(commonPaths, "/usr/local/bin/keychain-auth")
@@ -188,7 +211,7 @@ func EnsureInstalled() (string, error) {
 		return installViaBrew(alreadyPresent)
 	case "linux":
 		// Try Homebrew first (Linuxbrew), then fall back to instructions
-		if _, err := exec.LookPath("brew"); err == nil {
+		if brewPath := findBrew(); brewPath != "" {
 			return installViaBrew(alreadyPresent)
 		}
 		return "", fmt.Errorf(
@@ -221,8 +244,11 @@ func keychainAuthOnDisk() bool {
 	// Check common paths even if not in PATH
 	homeDir, _ := os.UserHomeDir()
 	candidates := []string{
+		"/home/linuxbrew/.linuxbrew/bin/keychain-auth",
+		"/opt/homebrew/bin/keychain-auth",
 		filepath.Join(homeDir, "go", "bin", "keychain-auth"),
 		filepath.Join(homeDir, ".local", "bin", "keychain-auth"),
+		filepath.Join(homeDir, ".linuxbrew", "bin", "keychain-auth"),
 		"/usr/local/bin/keychain-auth",
 	}
 	for _, p := range candidates {
@@ -238,11 +264,15 @@ func keychainAuthOnDisk() bool {
 // (needs `brew install`); `brew install` is a no-op on an already-installed
 // formula and would leave a stale daemon in place.
 func installViaBrew(alreadyPresent bool) (string, error) {
+	brewPath := findBrew()
+	if brewPath == "" {
+		return "", fmt.Errorf("brew not found")
+	}
 	var cmd *exec.Cmd
 	if alreadyPresent {
-		cmd = exec.Command("brew", "upgrade", "The-17/tap/keychain-auth")
+		cmd = exec.Command(brewPath, "upgrade", "The-17/tap/keychain-auth")
 	} else {
-		cmd = exec.Command("brew", "install", "The-17/tap/keychain-auth")
+		cmd = exec.Command(brewPath, "install", "The-17/tap/keychain-auth")
 	}
 	cmd.Env = append(os.Environ(), "HOMEBREW_NO_SANDBOX=1")
 	cmd.Stdout = os.Stdout
@@ -258,11 +288,33 @@ func installViaBrew(alreadyPresent bool) (string, error) {
 		)
 	}
 
-	// Verify the installed version now meets the requirement
-	path, err := exec.LookPath("keychain-auth")
-	if err != nil {
-		return "", fmt.Errorf("keychain-auth installed but not found in PATH: %w", err)
+	// Find the installed binary
+	homeDir, _ := os.UserHomeDir()
+	binaryName := "keychain-auth"
+	candidates := []string{
+		"/home/linuxbrew/.linuxbrew/bin/keychain-auth",
+		"/opt/homebrew/bin/keychain-auth",
+		"/usr/local/bin/keychain-auth",
+		filepath.Join(homeDir, ".linuxbrew", "bin", "keychain-auth"),
+		filepath.Join(homeDir, "go", "bin", binaryName),
+		filepath.Join(homeDir, ".local", "bin", binaryName),
 	}
+	var path string
+	for _, p := range candidates {
+		if _, err := os.Stat(p); err == nil {
+			path = p
+			break
+		}
+	}
+	if path == "" {
+		var err error
+		path, err = exec.LookPath("keychain-auth")
+		if err != nil {
+			return "", fmt.Errorf("keychain-auth installed but not found in PATH or standard directories: %w", err)
+		}
+	}
+
+	// Verify the installed version now meets the requirement
 	installedVer, verErr := queryInstalledVersion(path)
 	if verErr != nil || compareVersions(installedVer, RequiredDaemonVersion) < 0 {
 		return "", fmt.Errorf(
