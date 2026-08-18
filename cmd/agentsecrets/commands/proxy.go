@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -214,10 +215,18 @@ func runProxyStatus(cmd *cobra.Command, args []string) error {
 		ui.StatusRowDim("Last PID:", fmt.Sprintf("%d (exited)", pid))
 		proxy.RemovePIDFile()
 	} else {
-		ui.StatusRow("Proxy status:", ui.SuccessStyle.Render("running"))
-		ui.StatusRow("PID:", fmt.Sprintf("%d", pid))
-		ui.StatusRow("Port:", fmt.Sprintf("%d", port))
-		ui.StatusRow("Uptime:", formatUptime(startTime))
+		// Verify port is actively listening
+		conn, dialErr := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", port), 200*time.Millisecond)
+		if dialErr != nil {
+			ui.StatusRow("Proxy status:", ui.ErrorStyle.Render("not running"))
+			ui.StatusRowDim("Last PID:", fmt.Sprintf("%d (port %d unreachable)", pid, port))
+			proxy.RemovePIDFile()
+		} else {
+			conn.Close()
+			ui.StatusRow("Proxy status:", ui.SuccessStyle.Render("running"))
+			ui.StatusRow("PID:", fmt.Sprintf("%d", pid))
+			ui.StatusRow("Port:", fmt.Sprintf("%d", port))
+			ui.StatusRow("Uptime:", formatUptime(startTime))
 
 		// Try to fetch live metrics from /health
 		healthURL := fmt.Sprintf("http://localhost:%d/health", port)
@@ -248,6 +257,7 @@ func runProxyStatus(cmd *cobra.Command, args []string) error {
 		} else {
 			ui.StatusRowDim("Last sync:", "(proxy unreachable for status check)")
 			ui.StatusRowDim("Revoked IDs:", "(proxy unreachable for status check)")
+		}
 		}
 	}
 

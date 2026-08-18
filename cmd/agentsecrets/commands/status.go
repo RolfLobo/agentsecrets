@@ -119,11 +119,10 @@ var statusCmd = &cobra.Command{
 			ui.StatusRow("Current Project:", projectDisplay)
 
 			// Proxy status
-			pid, _, port, err := proxy.ReadPIDFile()
-			if err != nil || !proxy.IsProcessAlive(pid) {
-				ui.StatusRowDim("Proxy:", "Not running")
+			if pid, port, running := proxy.IsProxyRunning(); running {
+				ui.StatusRow("Proxy:", fmt.Sprintf("Running (port %d, PID %d)", port, pid))
 			} else {
-				ui.StatusRow("Proxy:", fmt.Sprintf("Running (port %d)", port))
+				ui.StatusRowDim("Proxy:", "Not running")
 			}
 
 			// Sync info

@@ -85,6 +85,32 @@ func IsProcessAlive(pid int) bool {
 	return err == nil
 }
 
+// IsProxyRunning checks if a proxy process is alive AND its port is actively listening.
+// If the process is dead or port unreachable, it cleans up the stale PID file and returns false.
+func IsProxyRunning() (pid int, port int, running bool) {
+	var err error
+	var startTime time.Time
+	pid, startTime, port, err = ReadPIDFile()
+	if err != nil {
+		return 0, 0, false
+	}
+	_ = startTime
+
+	if !IsProcessAlive(pid) {
+		RemovePIDFile()
+		return 0, 0, false
+	}
+
+	// Verify the port is actively listening
+	conn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", port), 200*time.Millisecond)
+	if err != nil {
+		RemovePIDFile()
+		return 0, 0, false
+	}
+	conn.Close()
+	return pid, port, true
+}
+
 // StartTransientProxy starts a proxy server in a background goroutine.
 // Returns the port it's listening on and a listener/server close function.
 func StartTransientProxy() (int, func(), error) {
@@ -145,10 +171,11 @@ func StartTransientProxy() (int, func(), error) {
 
 // CallViaProxy sends a request to the running proxy server or starts a transient one if none is running.
 func CallViaProxy(req CallRequest) (*CallResult, error) {
-	pid, _, port, err := ReadPIDFile()
+	_, port, running := IsProxyRunning()
 	var closeFunc func()
+	var err error
 
-	if err != nil || !IsProcessAlive(pid) {
+	if !running {
 		var transPort int
 		transPort, closeFunc, err = StartTransientProxy()
 		if err != nil {
