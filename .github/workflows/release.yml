@@ -50,10 +50,10 @@ jobs:
           registry-url: "https://registry.npmjs.org"
 
       - name: Update version in package.json
+        working-directory: npm
         run: |
           VERSION=${GITHUB_REF#refs/tags/v}
-          cd npm
-          npm version $VERSION --no-git-tag-version
+          npm version $VERSION --allow-same-version --no-git-tag-version
 
       - name: Publish to NPM
         working-directory: npm
