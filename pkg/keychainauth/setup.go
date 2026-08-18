@@ -56,7 +56,7 @@ func AutoSetup() error {
 // compareVersions check in EnsureInstalled and is upgraded to the latest release,
 // so a daemon binary change always reaches users rather than leaving a stale
 // daemon in place.
-const RequiredDaemonVersion = "3.2.2"
+const RequiredDaemonVersion = "3.2.3"
 
 // findBestDaemon returns the path to the highest-priority installed keychain-auth
 // binary (mirroring EnsureInstalled's search order), or "" if none is found.
