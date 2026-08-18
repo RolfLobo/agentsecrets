@@ -321,6 +321,10 @@ func EnsureRegistered(keychainAuthPath string) error {
 		return fmt.Errorf("failed to authorize binary with keychain-auth: %w\nOutput: %s", err, strings.TrimSpace(string(output)))
 	}
 
+	if requiresSudoForRegistration(keychainAuthPath) {
+		_ = exec.Command("sudo", "chmod", "644", "/etc/keychain-auth/config.json").Run()
+	}
+
 	return nil
 }
 
@@ -415,37 +419,39 @@ func startDaemonLinux(keychainAuthPath string) error {
 	if _, err := os.Stat("/run/keychain-auth"); err == nil {
 		cmd := exec.Command("systemctl", "start", "keychain-auth")
 		if err := cmd.Run(); err == nil {
-			return waitForSocket()
+			return waitForSocketPath("/run/keychain-auth/agent.sock")
 		}
 		// Fallback with sudo
 		cmd = exec.Command("sudo", "systemctl", "start", "keychain-auth")
 		cmd.Stdin = os.Stdin
 		if err := cmd.Run(); err == nil {
-			return waitForSocket()
+			return waitForSocketPath("/run/keychain-auth/agent.sock")
 		}
 	}
 
 	// Fallback to systemd user service (user-space legacy daemon)
 	cmd := exec.Command("systemctl", "--user", "start", "keychain-auth")
 	if err := cmd.Run(); err == nil {
-		return waitForSocket()
+		return waitForSocketPath(UserSocketPath())
 	}
 
 	// Try enabling and starting user service
 	cmd = exec.Command("systemctl", "--user", "enable", "--now", "keychain-auth")
 	if err := cmd.Run(); err == nil {
-		return waitForSocket()
+		return waitForSocketPath(UserSocketPath())
 	}
 
 	// Last resort: start directly
 	return startDirect(keychainAuthPath)
 }
+
 // startDirect starts keychain-auth as a background process. This is the fallback
 // when the system service manager is not configured.
 func startDirect(keychainAuthPath string) error {
-	sockPath := SocketPath()
+	sockPath := UserSocketPath()
 
 	if runtime.GOOS != "windows" {
+		_ = os.Remove(sockPath)
 		// Ensure the socket directory exists
 		if err := os.MkdirAll(filepath.Dir(sockPath), 0700); err != nil {
 			return fmt.Errorf("failed to create socket directory: %w", err)
@@ -468,7 +474,7 @@ func startDirect(keychainAuthPath string) error {
 	}
 	_ = os.MkdirAll(logDir, 0700)
 	logFile, _ := os.OpenFile(filepath.Join(logDir, "daemon.log"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
-	
+
 	cmd.Stdout = logFile
 	cmd.Stderr = logFile
 	cmd.Stdin = nil
@@ -484,12 +490,11 @@ func startDirect(keychainAuthPath string) error {
 	// Don't wait for the process — it's a daemon
 	go func() { _ = cmd.Wait() }()
 
-	return waitForSocket()
+	return waitForSocketPath(sockPath)
 }
 
-// waitForSocket polls for the socket file/named pipe to appear and be dialable, with an 8-second timeout.
-func waitForSocket() error {
-	sockPath := SocketPath()
+// waitForSocketPath polls for a specific socket file/named pipe to appear and be dialable, with an 8-second timeout.
+func waitForSocketPath(sockPath string) error {
 	for i := 0; i < 80; i++ {
 		c, err := dialCLOEXEC(sockPath)
 		if err == nil {
@@ -498,7 +503,12 @@ func waitForSocket() error {
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
-	return fmt.Errorf("keychain-auth daemon started but socket/pipe not available after 8 seconds")
+	return fmt.Errorf("keychain-auth daemon started but socket/pipe at %s not available after 8 seconds", sockPath)
+}
+
+// waitForSocket polls for the default socket file/named pipe to appear and be dialable.
+func waitForSocket() error {
+	return waitForSocketPath(SocketPath())
 }
 
 // computeHash returns the SHA-256 hash of a file in "sha256:<hex>" format.
@@ -654,8 +664,9 @@ func compareVersions(v1, v2 string) int {
 	return 0
 }
 func ensureSandboxInstalled(keychainAuthPath string) error {
-	// If system-wide configuration is already set up (even if we get permission denied), we are good
-	if _, err := os.Stat("/etc/keychain-auth/config.json"); err == nil || !os.IsNotExist(err) {
+	// Ensure config directory exists
+	if f, err := os.Open("/etc/keychain-auth/config.json"); err == nil {
+		f.Close()
 		return nil
 	}
 
@@ -667,5 +678,6 @@ func ensureSandboxInstalled(keychainAuthPath string) error {
 		return fmt.Errorf("keychain-auth system installer command failed: %w\nOutput: %s", err, string(output))
 	}
 
+	_ = exec.Command("sudo", "chmod", "644", "/etc/keychain-auth/config.json").Run()
 	return nil
 }

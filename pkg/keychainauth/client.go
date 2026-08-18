@@ -118,16 +118,29 @@ func Close() {
 // IsAvailable checks whether the keychain-auth socket file exists on disk.
 // On Windows, it attempts to dial the named pipe to check availability.
 func IsAvailable() bool {
-	if runtime.GOOS == "windows" {
-		c, err := dialCLOEXEC(SocketPath())
-		if err == nil {
-			c.Close()
+	sockPath := SocketPath()
+	c, err := dialCLOEXEC(sockPath)
+	if err == nil {
+		c.Close()
+		return true
+	}
+
+	userSock := UserSocketPath()
+	if userSock != sockPath {
+		if c2, err2 := dialCLOEXEC(userSock); err2 == nil {
+			c2.Close()
 			return true
 		}
-		return false
 	}
-	_, err := os.Stat(SocketPath())
-	return err == nil
+
+	// Clean up stale dead socket file if any
+	if runtime.GOOS != "windows" {
+		_ = os.Remove(sockPath)
+		if userSock != sockPath {
+			_ = os.Remove(userSock)
+		}
+	}
+	return false
 }
 
 // IsInitialized returns true if a connection has been successfully established.

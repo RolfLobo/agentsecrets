@@ -304,11 +304,16 @@ func ensureDaemonInitialized() error {
 		return nil
 	}
 
-	// Step 2: If keychain-auth isn't available at all, run first-time auto-setup.
+	// Step 2: If daemon is not running, try starting it. If not installed, run auto-setup.
 	if !keychainauth.IsAvailable() {
-		ensureSudoCached("keychain-auth sandbox system setup is required. Please authorize when prompted.")
-		if err := ui.Spinner("Setting up keychain-auth...", keychainauth.AutoSetup); err != nil {
-			return keychainRequiredError("keychain-auth setup", err)
+		if kcPath, err := keychainauth.EnsureInstalled(); err == nil {
+			_ = keychainauth.EnsureDaemonRunning(kcPath)
+		}
+		if !keychainauth.IsAvailable() {
+			ensureSudoCached("keychain-auth sandbox system setup is required. Please authorize when prompted.")
+			if err := ui.Spinner("Setting up keychain-auth...", keychainauth.AutoSetup); err != nil {
+				return keychainRequiredError("keychain-auth setup", err)
+			}
 		}
 	}
 
