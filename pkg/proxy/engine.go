@@ -1353,7 +1353,7 @@ func (e *Engine) logForensic(
 
 	// 7. Proxy Snapshot
 	proxySnap := ProxySnapshot{
-		Version:   "3.1.4",
+		Version:   "3.1.5",
 		Port:      8765,
 		Transient: e.Transient,
 	}

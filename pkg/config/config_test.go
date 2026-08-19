@@ -123,6 +123,7 @@ func TestConfigRoundtrip(t *testing.T) {
 		AccessToken:  "legacy-access",
 		RefreshToken: "legacy-refresh",
 	}
+	InvalidateTokenCache()
 	_ = keyring.DeleteUserTokens() // Clear from keyring first
 	if err := writeJSON(paths.TokenFile, legacyTokens, 0600); err != nil {
 		t.Fatalf("Failed to write legacy token.json: %v", err)

@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/The-17/agentsecrets/pkg/agents"
@@ -55,7 +56,7 @@ func (s *Service) BatchSet(kv map[string]string, environment string) error {
 		env = config.ResolveEnvironment()
 	}
 
-	apiSecrets := make(map[string]string)
+	apiSecrets := make(map[string]string, len(kv))
 	for k, v := range kv {
 		// 1. Encrypt for cloud
 		encryptedValue, err := crypto.EncryptSecret(v, workspaceKey)
@@ -63,14 +64,13 @@ func (s *Service) BatchSet(kv map[string]string, environment string) error {
 			return fmt.Errorf("batch set: encryption failed for %s: %w", k, err)
 		}
 		apiSecrets[k] = encryptedValue
+	}
 
-		// 2. Store in OS Keychain (for Proxy support). This is best-effort: the
-		// cloud + .env writes below are the source of truth, so a keychain miss
-		// (e.g. daemon not running) must not fail the whole set — but silently
-		// dropping it hides why the proxy later can't resolve the value, so warn.
-		if err := keyring.SetSecret(project.ProjectID, env, k, v); err != nil {
-			fmt.Fprintf(os.Stderr, "Warning: could not store %s in the OS keychain (proxy may not resolve it until next pull): %v\n", k, err)
-		}
+	// 2. Store in OS Keychain (for Proxy support) in a single batch IPC round-trip.
+	// This is best-effort: the cloud + .env writes below are the source of truth,
+	// so a keychain miss (e.g. daemon not running) must not fail the whole set — but warn.
+	if _, err := keyring.SetSecretsBatch(project.ProjectID, env, kv, nil); err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: could not store secrets in OS keychain (proxy may not resolve them until next pull): %v\n", err)
 	}
 
 	// 3. Sync to cloud (Single bulk call with dictionary)
@@ -89,10 +89,10 @@ func (s *Service) BatchSet(kv map[string]string, environment string) error {
 		return fmt.Errorf("batch set: failed to update .env: %w", err)
 	}
 
-	// Update local cache
-	s.updateCacheAfterSet(project.ProjectID, env, kv)
+	// 5. Update local cache (reuses already encrypted values, eliminating double encryption)
+	s.updateCacheAfterSetWithEncrypted(project.ProjectID, env, apiSecrets)
 
-	// Update .env.example
+	// 6. Update .env.example
 	_ = s.UpdateEnvExampleFromLocal()
 
 	return nil
@@ -565,31 +565,22 @@ func (s *Service) writeCache(projectID, env string, secrets []SecretMetadata) er
 	return os.WriteFile(path, data, 0600)
 }
 
-func (s *Service) updateCacheAfterSet(projectID, env string, kv map[string]string) {
+func (s *Service) updateCacheAfterSetWithEncrypted(projectID, env string, encryptedSecrets map[string]string) {
 	secrets, err := s.readCache(projectID, env)
 	if err != nil {
-		return
+		secrets = []SecretMetadata{}
 	}
 
-	cacheMap := make(map[string]SecretMetadata)
+	cacheMap := make(map[string]SecretMetadata, len(secrets)+len(encryptedSecrets))
 	for _, sm := range secrets {
 		cacheMap[sm.Key] = sm
 	}
 
-	workspaceKey, err := config.GetProjectWorkspaceKey()
-	if err != nil {
-		return
-	}
-
 	nowStr := time.Now().Format(time.RFC3339)
-	for k, v := range kv {
-		encrypted, err := crypto.EncryptSecret(v, workspaceKey)
-		if err != nil {
-			continue
-		}
+	for k, enc := range encryptedSecrets {
 		cacheMap[k] = SecretMetadata{
 			Key:       k,
-			Value:     encrypted,
+			Value:     enc,
 			UpdatedAt: nowStr,
 		}
 	}
@@ -599,6 +590,23 @@ func (s *Service) updateCacheAfterSet(projectID, env string, kv map[string]strin
 		updated = append(updated, sm)
 	}
 	_ = s.writeCache(projectID, env, updated)
+}
+
+func (s *Service) updateCacheAfterSet(projectID, env string, kv map[string]string) {
+	workspaceKey, err := config.GetProjectWorkspaceKey()
+	if err != nil {
+		return
+	}
+
+	encryptedSecrets := make(map[string]string, len(kv))
+	for k, v := range kv {
+		encrypted, err := crypto.EncryptSecret(v, workspaceKey)
+		if err != nil {
+			continue
+		}
+		encryptedSecrets[k] = encrypted
+	}
+	s.updateCacheAfterSetWithEncrypted(projectID, env, encryptedSecrets)
 }
 
 func (s *Service) updateCacheAfterDelete(projectID, env, key string) {
@@ -617,7 +625,7 @@ func (s *Service) updateCacheAfterDelete(projectID, env, key string) {
 }
 
 // UpdateEnvExampleFromLocal generates .env.example using locally cached key names.
-// It reads from the keyring index, requiring zero API calls.
+// It reads from the keyring index in parallel, requiring zero API calls.
 func (s *Service) UpdateEnvExampleFromLocal() error {
 	project, err := config.LoadProjectConfig()
 	if err != nil || project.ProjectID == "" {
@@ -628,14 +636,31 @@ func (s *Service) UpdateEnvExampleFromLocal() error {
 	allKeys := make(map[string]bool)
 	keyEnvs := make(map[string][]string)
 
-	for _, env := range environments {
-		keys, err := keyring.ListProjectKeyNames(project.ProjectID, env)
-		if err != nil {
-			return err
+	type envResult struct {
+		env  string
+		keys []string
+		err  error
+	}
+
+	results := make([]envResult, len(environments))
+	var wg sync.WaitGroup
+	for i, env := range environments {
+		wg.Add(1)
+		go func(idx int, e string) {
+			defer wg.Done()
+			keys, err := keyring.ListProjectKeyNames(project.ProjectID, e)
+			results[idx] = envResult{env: e, keys: keys, err: err}
+		}(i, env)
+	}
+	wg.Wait()
+
+	for _, res := range results {
+		if res.err != nil {
+			return res.err
 		}
-		for _, key := range keys {
+		for _, key := range res.keys {
 			allKeys[key] = true
-			keyEnvs[key] = append(keyEnvs[key], env)
+			keyEnvs[key] = append(keyEnvs[key], res.env)
 		}
 	}
 

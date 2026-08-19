@@ -28,7 +28,7 @@ var initCmd = &cobra.Command{
 	What happens:
 	1. Creates ~/.agentsecrets/ (global config)
 	2. Creates .agentsecrets/ (project config in current directory)
-	3. Creates .agent/workflows/api-call.md (teaches AI assistants to use AgentSecrets)
+	3. Creates .agent/workflows/agentsecrets.md (teaches AI assistants to use AgentSecrets)
 	4. Prompts to create account or login
 	5. Generates encryption keypair (for new accounts)
 	6. Stores credentials securely`,
@@ -144,6 +144,9 @@ func runInit(cmd *cobra.Command, args []string) error {
 		if err := config.InitProjectConfig(modeToUse); err != nil {
 			return fmt.Errorf("failed to initialize project config: %w", err)
 		}
+
+		// Create AI agent workflow/instruction file in current project
+		_ = writeWorkflowFile()
 
 		// If mode 2, create all .env files for standard environments
 		if modeToUse == 2 {

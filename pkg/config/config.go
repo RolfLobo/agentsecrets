@@ -20,9 +20,22 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"github.com/The-17/agentsecrets/pkg/keyring"
+)
+
+var (
+	cachedProjectConfigMu sync.RWMutex
+	cachedProjectConfig   *ProjectConfig
+	cachedProjectRoot     string
+
+	cachedTokensMu sync.RWMutex
+	cachedTokens   *TokenConfig
+
+	cachedWorkspaceKeysMu sync.RWMutex
+	cachedWorkspaceKeys   = make(map[string][]byte)
 )
 
 // GlobalConfig represents ~/.agentsecrets/config.json
@@ -202,13 +215,46 @@ func SaveGlobalConfig(config *GlobalConfig) error {
 	return writeJSON(paths.ConfigFile, config, 0600)
 }
 
+// InvalidateTokenCache clears the in-memory cached tokens.
+func InvalidateTokenCache() {
+	cachedTokensMu.Lock()
+	cachedTokens = nil
+	cachedTokensMu.Unlock()
+}
+
+// InvalidateProjectCache clears the in-memory cached project config.
+func InvalidateProjectCache() {
+	cachedProjectConfigMu.Lock()
+	cachedProjectConfig = nil
+	cachedProjectRoot = ""
+	cachedProjectConfigMu.Unlock()
+}
+
+// InvalidateWorkspaceKeyCache clears the in-memory cached workspace keys.
+func InvalidateWorkspaceKeyCache() {
+	cachedWorkspaceKeysMu.Lock()
+	cachedWorkspaceKeys = make(map[string][]byte)
+	cachedWorkspaceKeysMu.Unlock()
+}
+
 // LoadTokens reads user tokens from the secure OS keychain, falling back to ~/.agentsecrets/token.json.
 func LoadTokens() (*TokenConfig, error) {
+	cachedTokensMu.RLock()
+	if cachedTokens != nil {
+		t := *cachedTokens
+		cachedTokensMu.RUnlock()
+		return &t, nil
+	}
+	cachedTokensMu.RUnlock()
+
 	// 1. Try loading from OS keychain
 	tokensJSON, err := keyring.GetUserTokens()
 	if err == nil && tokensJSON != "" {
 		var tokens TokenConfig
 		if err := json.Unmarshal([]byte(tokensJSON), &tokens); err == nil && tokens.AccessToken != "" {
+			cachedTokensMu.Lock()
+			cachedTokens = &tokens
+			cachedTokensMu.Unlock()
 			return &tokens, nil
 		}
 	}
@@ -231,6 +277,9 @@ func LoadTokens() (*TokenConfig, error) {
 			// Purge sensitive details from token.json file but preserve file existence
 			_ = writeJSON(paths.TokenFile, &TokenConfig{}, 0600)
 		}
+		cachedTokensMu.Lock()
+		cachedTokens = &tokens
+		cachedTokensMu.Unlock()
 	}
 
 	return &tokens, nil
@@ -238,6 +287,15 @@ func LoadTokens() (*TokenConfig, error) {
 
 // SaveTokens writes user tokens to the secure OS keychain.
 func SaveTokens(tokens *TokenConfig) error {
+	cachedTokensMu.Lock()
+	if tokens != nil {
+		t := *tokens
+		cachedTokens = &t
+	} else {
+		cachedTokens = nil
+	}
+	cachedTokensMu.Unlock()
+
 	jsonData, err := json.Marshal(tokens)
 	if err != nil {
 		return fmt.Errorf("failed to serialize tokens: %w", err)
@@ -292,11 +350,25 @@ func LoadProjectConfig() (*ProjectConfig, error) {
 		return nil, fmt.Errorf("no AgentSecrets project found in this directory or any parent directory.\nRun `agentsecrets init` from your project root to initialise a project")
 	}
 
+	cachedProjectConfigMu.RLock()
+	if cachedProjectConfig != nil && cachedProjectRoot == root {
+		cfg := *cachedProjectConfig
+		cachedProjectConfigMu.RUnlock()
+		return &cfg, nil
+	}
+	cachedProjectConfigMu.RUnlock()
+
 	projectFile := filepath.Join(root, ".agentsecrets", "project.json")
 	var config ProjectConfig
 	if err := readJSON(projectFile, &config); err != nil {
 		return nil, err
 	}
+
+	cachedProjectConfigMu.Lock()
+	cachedProjectConfig = &config
+	cachedProjectRoot = root
+	cachedProjectConfigMu.Unlock()
+
 	return &config, nil
 }
 
@@ -310,6 +382,16 @@ func SaveProjectConfig(config *ProjectConfig) error {
 	if root == "" {
 		root = "."
 	}
+
+	cachedProjectConfigMu.Lock()
+	if config != nil {
+		cfg := *config
+		cachedProjectConfig = &cfg
+		cachedProjectRoot = root
+	} else {
+		cachedProjectConfig = nil
+	}
+	cachedProjectConfigMu.Unlock()
 
 	projectFile := filepath.Join(root, ".agentsecrets", "project.json")
 	return writeJSON(projectFile, config, 0644)
@@ -455,6 +537,13 @@ func StoreWorkspaceCache(workspaces map[string]WorkspaceCacheEntry) error {
 // It looks up the key in the keyring first. For backward compatibility, if not
 // found in the keyring, it falls back to the config.json entry and migrates it.
 func GetWorkspaceKey(workspaceID string) ([]byte, error) {
+	cachedWorkspaceKeysMu.RLock()
+	if key, ok := cachedWorkspaceKeys[workspaceID]; ok && len(key) > 0 {
+		cachedWorkspaceKeysMu.RUnlock()
+		return key, nil
+	}
+	cachedWorkspaceKeysMu.RUnlock()
+
 	var keyB64 string
 
 	// 1. Try loading from secure OS keychain
@@ -491,13 +580,23 @@ func GetWorkspaceKey(workspaceID string) ([]byte, error) {
 	if len(key) == 44 {
 		// Try standard base64
 		if decoded, err := base64.StdEncoding.DecodeString(string(key)); err == nil && len(decoded) == 32 {
+			cachedWorkspaceKeysMu.Lock()
+			cachedWorkspaceKeys[workspaceID] = decoded
+			cachedWorkspaceKeysMu.Unlock()
 			return decoded, nil
 		}
 		// Try URL-safe base64 (Fernet uses this)
 		if decoded, err := base64.URLEncoding.DecodeString(string(key)); err == nil && len(decoded) == 32 {
+			cachedWorkspaceKeysMu.Lock()
+			cachedWorkspaceKeys[workspaceID] = decoded
+			cachedWorkspaceKeysMu.Unlock()
 			return decoded, nil
 		}
 	}
+
+	cachedWorkspaceKeysMu.Lock()
+	cachedWorkspaceKeys[workspaceID] = key
+	cachedWorkspaceKeysMu.Unlock()
 
 	return key, nil
 }
@@ -519,6 +618,14 @@ func IsAuthenticated() bool {
 // ClearSession removes all stored credentials (logout).
 // Does NOT clear project.json.
 func ClearSession() error {
+	cachedTokensMu.Lock()
+	cachedTokens = nil
+	cachedTokensMu.Unlock()
+
+	cachedWorkspaceKeysMu.Lock()
+	cachedWorkspaceKeys = make(map[string][]byte)
+	cachedWorkspaceKeysMu.Unlock()
+
 	// 1. Purge keychain credentials
 	_ = keyring.DeleteUserTokens()
 
@@ -550,6 +657,11 @@ func ClearSession() error {
 
 // ClearProjectConfig resets the local .agentsecrets/project.json file.
 func ClearProjectConfig() error {
+	cachedProjectConfigMu.Lock()
+	cachedProjectConfig = nil
+	cachedProjectRoot = ""
+	cachedProjectConfigMu.Unlock()
+
 	root, _ := GetProjectRoot()
 	if root == "" {
 		return nil // nothing to clear
