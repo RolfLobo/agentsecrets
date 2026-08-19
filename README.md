@@ -128,6 +128,7 @@ The agent managed the entire workflow, and no credential value appeared at any s
 - **Build logs:** see the [engineering publication](https://engineering.theseventeen.co/series/building-agentsecrets) to read the story.
 - **Security:** found a vulnerability? See [SECURITY.md](SECURITY.md) for responsible disclosure.
 - **Contributing:** see [CONTRIBUTING.md](CONTRIBUTING.md) to get set up locally.
+- **Self-hosting:** the open-source server backend that powers sync, workspaces, and telemetry is at [github.com/The-17/agentsecrets-server](https://github.com/The-17/agentsecrets-server).
 
 ## License
 
