@@ -40,6 +40,10 @@ func (e *CLIError) Error() string {
 	return fmt.Sprintf("[%s] %s", e.Code, e.Message)
 }
 
+func (e *CLIError) Unwrap() error {
+	return e.Err
+}
+
 func New(code ErrorCode, message string, err error) *CLIError {
 	return &CLIError{
 		Code:    code,

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math/rand"
 	"net"
 	"net/http"
 	"net/url"
@@ -16,6 +17,9 @@ import (
 	"github.com/The-17/agentsecrets/pkg/capabilities"
 )
 
+// MaxRequestBodySize bounds the maximum request payload accepted by the proxy (10MB).
+const MaxRequestBodySize = 10 * 1024 * 1024
+
 // Server is the HTTP proxy server that wraps the Engine.
 // It listens for incoming requests with X-AS-* headers, builds
 // CallRequests, executes them through the engine, and returns responses.
@@ -23,6 +27,7 @@ type Server struct {
 	Port   int
 	Engine *Engine
 	mux    *http.ServeMux
+	wg     sync.WaitGroup
 
 	// tokenMu guards SessionToken: it is read by every request handler and
 	// written by handleRotateSession, so concurrent access must be synchronized.
@@ -93,22 +98,29 @@ func (s *Server) validateSession(next http.HandlerFunc) http.HandlerFunc {
 
 // Start begins listening and serving. It blocks until ctx is cancelled (e.g.
 // on SIGINT/SIGTERM) or the server fails to serve. On cancellation it performs
-// a graceful shutdown: it stops accepting new connections and drains in-flight
-// requests within a bounded window before returning. The background workers
-// (audit sync, revocation refresh) also stop when ctx is done, so nothing keeps
-// running after Start returns.
+// a graceful shutdown: it stops accepting new connections, drains in-flight
+// requests within a bounded window, and waits for background workers to exit
+// before returning.
 func (s *Server) Start(ctx context.Context) error {
 	addr := fmt.Sprintf("localhost:%d", s.Port)
 
 	// Launch background sync worker if audit logger is present.
 	if s.Engine.Audit != nil {
-		go runPeriodic(ctx, 60*time.Second, s.Engine.Audit.SyncUnpushedLogs)
+		s.wg.Add(1)
+		go func() {
+			defer s.wg.Done()
+			runPeriodic(ctx, 60*time.Second, s.Engine.Audit.SyncUnpushedLogs)
+		}()
 	}
 
 	// Fetch the revocation list on startup and refresh it periodically so
 	// revoked agent tokens stop working without a daemon restart.
 	_ = s.Engine.Sync()
-	go runPeriodic(ctx, 60*time.Second, s.Engine.Sync)
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+		runPeriodic(ctx, 60*time.Second, s.Engine.Sync)
+	}()
 
 	// Bind synchronously so a failed bind (port already in use) surfaces as an
 	// error from Start rather than being lost inside the serve goroutine.
@@ -131,20 +143,28 @@ func (s *Server) Start(ctx context.Context) error {
 	case <-ctx.Done():
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		return httpServer.Shutdown(shutdownCtx)
+		err := httpServer.Shutdown(shutdownCtx)
+		s.wg.Wait() // Drain background workers cleanly
+		return err
 	}
 }
 
-// runPeriodic invokes fn every interval until ctx is cancelled. The first call
-// happens after one interval (matching the original sleep-then-run cadence).
+// runPeriodic invokes fn periodically with randomized jitter (±20%) until ctx is cancelled.
 func runPeriodic(ctx context.Context, interval time.Duration, fn func() error) {
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
 	for {
+		// Apply ±20% randomized jitter to prevent thundering herd spikes across daemons
+		jitterRange := int64(interval / 5)
+		var jitter time.Duration
+		if jitterRange > 0 {
+			jitter = time.Duration(rand.Int63n(jitterRange*2) - jitterRange)
+		}
+		timer := time.NewTimer(interval + jitter)
+
 		select {
 		case <-ctx.Done():
+			timer.Stop()
 			return
-		case <-ticker.C:
+		case <-timer.C:
 			_ = fn()
 		}
 	}
@@ -280,13 +300,14 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Read request body
+	// Read request body with maximum memory limit (10MB)
 	var body []byte
 	if r.Body != nil {
+		r.Body = http.MaxBytesReader(w, r.Body, MaxRequestBodySize)
 		var err error
 		body, err = io.ReadAll(r.Body)
 		if err != nil {
-			writeError(w, 400, "Failed to read request body")
+			writeError(w, 400, fmt.Sprintf("Failed to read request body: %v", err))
 			return
 		}
 	}
@@ -300,8 +321,8 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Execute through engine
-	result, err := s.Engine.Execute(CallRequest{
+	// Execute through engine with request context
+	result, err := s.Engine.ExecuteCtx(r.Context(), CallRequest{
 		TargetURL:     targetURL,
 		Method:        method,
 		Headers:       headers,

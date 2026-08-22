@@ -109,6 +109,7 @@ func registerAliases() {
 		addAliases(agentCmd, "agents")
 		addAliases(logsCmd, "log")
 		addAliases(environmentCmd, "environments")
+		addAliases(serverCmd, "servers")
 		addAliases(workspaceAllowlistCmd, "allowlists")
 		addAliases(agentTokenCmd, "tokens")
 		addAliases(agentPolicyCmd, "policies")

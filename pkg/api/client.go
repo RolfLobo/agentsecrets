@@ -113,11 +113,30 @@ type Client struct {
 	refreshMu sync.Mutex             // guards token refresh to prevent concurrent refresh storms
 }
 
-// NewClient creates a new API client with the default base URL.
+// ResolveBaseURLFunc is an optional hook to resolve the server base URL dynamically.
+var ResolveBaseURLFunc func() string
+
+// NewClient creates a new API client with the resolved base URL.
 func NewClient(tokenFunc func() string) *Client {
 	baseURL := DefaultBaseURL
-	if envURL := os.Getenv("AGENTSECRETS_API_URL"); envURL != "" {
+	if ResolveBaseURLFunc != nil {
+		baseURL = ResolveBaseURLFunc()
+	} else if envURL := os.Getenv("AGENTSECRETS_SERVER_URL"); envURL != "" {
 		baseURL = envURL
+	} else if envURL := os.Getenv("AGENTSECRETS_API_URL"); envURL != "" {
+		baseURL = envURL
+	}
+	return &Client{
+		BaseURL:    baseURL,
+		HTTPClient: &http.Client{Timeout: 30 * time.Second},
+		getToken:   tokenFunc,
+	}
+}
+
+// NewClientWithURL creates a new API client with an explicit base URL.
+func NewClientWithURL(baseURL string, tokenFunc func() string) *Client {
+	if baseURL == "" {
+		baseURL = DefaultBaseURL
 	}
 	return &Client{
 		BaseURL:    baseURL,

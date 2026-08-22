@@ -57,3 +57,12 @@ func TestFromError(t *testing.T) {
 		t.Errorf("Expected fallback ErrUnknown, got %s", genericErr.Code)
 	}
 }
+
+func TestCLIErrorUnwrap(t *testing.T) {
+	innerErr := fmt.Errorf("underlying network failure")
+	cliErr := New(ErrConnection, "failed to connect", innerErr)
+
+	if cliErr.Unwrap() != innerErr {
+		t.Errorf("Unwrap() = %v, expected %v", cliErr.Unwrap(), innerErr)
+	}
+}

@@ -107,8 +107,9 @@ type daySnapshot struct {
 }
 
 var (
-	mu   sync.Mutex
-	data *Data
+	mu    sync.Mutex
+	data  *Data
+	dirty bool
 )
 
 func telemetryFilePath() (string, error) {
@@ -123,7 +124,11 @@ func telemetryFilePath() (string, error) {
 	return filepath.Join(dir, "telemetry.json"), nil
 }
 
-func load() error {
+func loadLocked() error {
+	if data != nil {
+		return nil
+	}
+
 	path, err := telemetryFilePath()
 	if err != nil {
 		return err
@@ -145,7 +150,10 @@ func load() error {
 	return json.Unmarshal(b, data)
 }
 
-func save() error {
+func saveLocked() error {
+	if data == nil {
+		return nil
+	}
 	path, err := telemetryFilePath()
 	if err != nil {
 		return err
@@ -157,14 +165,30 @@ func save() error {
 	return os.WriteFile(path, b, 0600)
 }
 
+// Flush persists any pending in-memory telemetry state to disk.
+func Flush() error {
+	mu.Lock()
+	defer mu.Unlock()
+	return flushLocked()
+}
+
+func flushLocked() error {
+	if !dirty || data == nil {
+		return nil
+	}
+	if err := saveLocked(); err != nil {
+		return err
+	}
+	dirty = false
+	return nil
+}
+
 func today() string {
 	return time.Now().Format("2006-01-02")
 }
 
-func currentDay() *Day {
-	// Always reload from disk to pick up changes made by other processes
-	// (e.g. CLI commands vs long-running proxy daemon sharing telemetry.json).
-	_ = load()
+func currentDayLocked() *Day {
+	_ = loadLocked()
 	if data.Daily == nil {
 		data.Daily = make(map[string]*Day)
 	}
@@ -200,15 +224,13 @@ func currentDay() *Day {
 }
 
 // record is the single mutation primitive behind every Record* function. It
-// serializes access, loads today's bucket, applies the mutation, and persists.
-// Collapsing the lock/currentDay/save boilerplate here keeps the individual
-// Record* helpers to a single expressive line and removes 30+ copies of the
-// same three-step ritual.
+// mutates in-memory state instantly under a fast mutex lock and marks dirty,
+// eliminating blocking disk I/O on hot execution paths.
 func record(mutate func(d *Day)) {
 	mu.Lock()
 	defer mu.Unlock()
-	mutate(currentDay())
-	_ = save()
+	mutate(currentDayLocked())
+	dirty = true
 }
 
 // RecordCommand increments the usage count for a CLI command.
@@ -437,22 +459,24 @@ func SyncIfDue(client *api.Client, cliVersion string) {
 	mu.Lock()
 	defer mu.Unlock()
 
+	// Ensure pending in-memory telemetry is saved to disk before CLI exits
+	defer func() { _ = flushLocked() }()
+
 	if client == nil {
 		return
 	}
 
-	// Always reload from disk to get the latest state (another process may have synced already).
-	_ = load()
+	_ = loadLocked()
 
 	if time.Since(data.LastSync) >= 24*time.Hour {
 		if len(data.Daily) == 0 {
 			data.LastSync = time.Now()
-			_ = save()
+			_ = saveLocked()
 			return
 		}
 
 		// Update metadata for today's bucket before syncing
-		d := currentDay()
+		d := currentDayLocked()
 		d.CliVersion = cliVersion
 		if ResolveEnvironmentFunc != nil {
 			d.ActiveEnvironment = ResolveEnvironmentFunc()
@@ -497,7 +521,7 @@ func SyncIfDue(client *api.Client, cliVersion string) {
 
 		if len(snapshots) == 0 {
 			data.LastSync = time.Now()
-			_ = save()
+			_ = saveLocked()
 			return
 		}
 
@@ -520,7 +544,7 @@ func SyncIfDue(client *api.Client, cliVersion string) {
 				delete(data.Daily, date)
 			}
 			data.LastSync = time.Now()
-			_ = save()
+			_ = saveLocked()
 		}
 	}
 }

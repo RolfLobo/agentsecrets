@@ -490,8 +490,16 @@ func (e *Engine) resolveIdentity(req CallRequest) identityResult {
 	return res
 }
 
-// Execute runs the full proxy pipeline: resolve secrets → inject → forward → audit.
+// Execute runs the full proxy pipeline using a background context: resolve secrets → inject → forward → audit.
 func (e *Engine) Execute(req CallRequest) (*CallResult, error) {
+	return e.ExecuteCtx(context.Background(), req)
+}
+
+// ExecuteCtx runs the full proxy pipeline with explicit context cancellation.
+func (e *Engine) ExecuteCtx(ctx context.Context, req CallRequest) (*CallResult, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	// --- Telemetry ---
 	telemetry.RecordProxyCall()
 	telemetry.RecordIntegration("proxy")
@@ -743,6 +751,7 @@ func (e *Engine) Execute(req CallRequest) (*CallResult, error) {
 	// are freshly allocated (NOT the allKeys/allStyles used by the blocked path),
 	// which removes the old shared-backing-array aliasing hazard.
 	ec := &execContext{
+		ctx:          ctx,
 		req:          req,
 		method:       method,
 		u:            u,
@@ -776,6 +785,7 @@ func (e *Engine) Execute(req CallRequest) (*CallResult, error) {
 // stages can be separate methods rather than one ~490-line function, without each
 // taking a long positional argument list.
 type execContext struct {
+	ctx          context.Context
 	req          CallRequest
 	method       string
 	u            *url.URL
@@ -802,7 +812,7 @@ type execContext struct {
 func (e *Engine) buildAndInject(ec *execContext) (*CallResult, error) {
 	bodyReader := bytes.NewReader(ec.req.Body)
 
-	outbound, err := http.NewRequest(ec.method, ec.req.TargetURL, bodyReader)
+	outbound, err := http.NewRequestWithContext(ec.ctx, ec.method, ec.req.TargetURL, bodyReader)
 	if err != nil {
 		return nil, fmt.Errorf("failed to build request: %w", err)
 	}

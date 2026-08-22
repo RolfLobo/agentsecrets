@@ -16,6 +16,7 @@ import (
 
 var forceReinit bool
 var storageMode int
+var initServerFlag string
 
 var initCmd = &cobra.Command{
 	Use:   "init",
@@ -29,19 +30,27 @@ var initCmd = &cobra.Command{
 	1. Creates ~/.agentsecrets/ (global config)
 	2. Creates .agentsecrets/ (project config in current directory)
 	3. Creates .agent/workflows/agentsecrets.md (teaches AI assistants to use AgentSecrets)
-	4. Prompts to create account or login
-	5. Generates encryption keypair (for new accounts)
-	6. Stores credentials securely`,
+	4. Prompts to select server (Cloud or Self-Hosted)
+	5. Prompts to create account or login
+	6. Generates encryption keypair (for new accounts)
+	7. Stores credentials securely`,
 	RunE: runInit,
 }
 
 func init() {
 	initCmd.Flags().BoolVarP(&forceReinit, "force", "f", false, "Skip reinitialize confirmation")
 	initCmd.Flags().IntVar(&storageMode, "storage-mode", 1, "Set storage mode (1: keychain only, 2: keychain & .env file)")
+	initCmd.Flags().StringVar(&initServerFlag, "server", "", "Custom AgentSecrets server endpoint URL")
 }
 
 func runInit(cmd *cobra.Command, args []string) error {
 	var modeToUse int
+
+	if initServerFlag != "" {
+		if err := config.SetGlobalServerURL(initServerFlag); err != nil {
+			return fmt.Errorf("invalid server URL: %w", err)
+		}
+	}
 
 	// Phase 1: Global Setup (Self-Contained)
 	if !config.GlobalConfigExists() || !config.IsAuthenticated() {
@@ -50,6 +59,32 @@ func runInit(cmd *cobra.Command, args []string) error {
 		if !config.GlobalConfigExists() {
 			if err := config.InitGlobalConfig(); err != nil {
 				return fmt.Errorf("failed to initialize global config: %w", err)
+			}
+
+			// Server target selection if not explicitly passed
+			if !cmd.Flags().Changed("server") {
+				var serverChoice string
+				err := huh.NewSelect[string]().
+					Title("Where is your AgentSecrets backend located?").
+					Options(
+						huh.NewOption("1. AgentSecrets Server (The Seventeen Engineering)", "default"),
+						huh.NewOption("2. Self-Hosted Server (Custom URL)", "selfhost"),
+					).
+					Value(&serverChoice).
+					Run()
+
+				if err == nil && serverChoice == "selfhost" {
+					var customURL string
+					_ = huh.NewInput().
+						Title("Enter your self-hosted server URL:").
+						Placeholder("http://localhost:8000 or https://secrets.internal.corp/api").
+						Value(&customURL).
+						Run()
+
+					if customURL != "" {
+						_ = config.SetGlobalServerURL(customURL)
+					}
+				}
 			}
 
 			// First-ever run: prompt for storage mode unless flag passed

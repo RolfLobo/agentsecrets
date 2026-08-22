@@ -18,6 +18,9 @@ type ForwardResult struct {
 	Duration   time.Duration
 }
 
+// MaxResponseBodySize bounds the maximum memory buffered from an upstream response (50MB).
+const MaxResponseBodySize = 50 * 1024 * 1024
+
 // Forward sends the outbound request and returns the result.
 // The caller is responsible for building the request (URL, method, headers, body).
 // This function reads and closes the upstream response body.
@@ -33,7 +36,7 @@ func Forward(client *http.Client, req *http.Request) (*ForwardResult, error) {
 	}
 	defer resp.Body.Close()
 
-	body, err := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(io.LimitReader(resp.Body, MaxResponseBodySize))
 	if err != nil {
 		return nil, fmt.Errorf("failed to read upstream response: %w", err)
 	}

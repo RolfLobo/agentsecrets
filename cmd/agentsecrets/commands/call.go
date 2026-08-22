@@ -129,10 +129,13 @@ func runCall(cmd *cobra.Command, args []string) error {
 	callDone := make(chan struct{})
 	defer close(callDone)
 	go func() {
+		timer := time.NewTimer(2 * time.Second)
+		defer timer.Stop()
+
 		select {
 		case <-callDone:
 			return // response arrived fast — nothing to show
-		case <-time.After(2 * time.Second):
+		case <-timer.C:
 		}
 
 		// Parse the domain from the URL for the approve command hint.

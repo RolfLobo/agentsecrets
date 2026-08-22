@@ -99,6 +99,14 @@ var statusCmd = &cobra.Command{
 			ui.StatusRowDim("Logged in:", "No")
 		}
 
+		// Server target info
+		target := config.ResolveServerTarget("")
+		serverType := "AgentSecrets Server (Default)"
+		if target.IsSelfHost {
+			serverType = ui.BrandStyle.Render("Self-Hosted Server (Custom URL)")
+		}
+		ui.StatusRow("Server:", fmt.Sprintf("%s (%s)", target.URL, serverType))
+
 		// Environment info
 		env, source := config.ResolveEnvironmentWithSource()
 		envDisplay := fmt.Sprintf("%s (from %s)", env, source)

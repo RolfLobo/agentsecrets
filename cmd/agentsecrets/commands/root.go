@@ -1,24 +1,25 @@
 package commands
 
 import (
-	"github.com/charmbracelet/lipgloss"
-	"github.com/spf13/cobra"
-
 	"errors"
 	"fmt"
-	"github.com/The-17/agentsecrets/pkg/config"
-	"github.com/The-17/agentsecrets/pkg/keychainauth"
-	"github.com/The-17/agentsecrets/pkg/telemetry"
-	"github.com/The-17/agentsecrets/pkg/ui"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
+
+	"github.com/The-17/agentsecrets/pkg/api"
+	"github.com/The-17/agentsecrets/pkg/config"
+	"github.com/The-17/agentsecrets/pkg/keychainauth"
+	"github.com/The-17/agentsecrets/pkg/telemetry"
+	"github.com/The-17/agentsecrets/pkg/ui"
+	"github.com/charmbracelet/lipgloss"
+	"github.com/spf13/cobra"
 )
 
 // Version is set at build time via ldflags
-var Version = "dev"
+var Version = "3.2.0"
 
 // rootCmd is the base command when called without any subcommands
 var rootCmd = &cobra.Command{
@@ -45,6 +46,9 @@ var rootCmd = &cobra.Command{
 
 func Execute() error {
 	ui.CLIVersion = Version
+	// Wire dynamic server URL resolution
+	api.ResolveBaseURLFunc = config.GetServerURL
+
 	// Ensure keychain-auth socket is closed on exit
 	defer keychainauth.Close()
 

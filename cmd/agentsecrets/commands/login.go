@@ -6,8 +6,11 @@ import (
 	"github.com/charmbracelet/huh"
 	"github.com/spf13/cobra"
 
+	"github.com/The-17/agentsecrets/pkg/config"
 	"github.com/The-17/agentsecrets/pkg/ui"
 )
+
+var loginServerFlag string
 
 var loginCmd = &cobra.Command{
 	Use:   "login",
@@ -21,8 +24,17 @@ var loginCmd = &cobra.Command{
 	4. Download and decrypt your workspace keys
 	5. Cache credentials locally for future commands`,
 	RunE: func(cmd *cobra.Command, args []string) error {
+		if loginServerFlag != "" {
+			if err := config.SetGlobalServerURL(loginServerFlag); err != nil {
+				return fmt.Errorf("invalid server URL: %w", err)
+			}
+		}
 		return performLogin()
 	},
+}
+
+func init() {
+	loginCmd.Flags().StringVar(&loginServerFlag, "server", "", "Target AgentSecrets server URL")
 }
 
 // performLogin collects credentials and logs in. Shared by login command and init flow.

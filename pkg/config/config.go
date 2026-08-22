@@ -18,8 +18,10 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -38,8 +40,12 @@ var (
 	cachedWorkspaceKeys   = make(map[string][]byte)
 )
 
+// DefaultServerURL is the default AgentSecrets Server endpoint.
+const DefaultServerURL = "https://secrets-api-orpin.vercel.app/api"
+
 // GlobalConfig represents ~/.agentsecrets/config.json
 type GlobalConfig struct {
+	ServerURL           string                         `json:"server_url,omitempty"` // Custom self-hosted server URL (empty defaults to default AgentSecrets Server)
 	Email               string                         `json:"email,omitempty"`
 	SelectedWorkspaceID string                         `json:"selected_workspace_id,omitempty"`
 	SelectedProjectID   string                         `json:"selected_project_id,omitempty"`
@@ -69,6 +75,7 @@ type TokenConfig struct {
 
 // ProjectConfig represents ./.agentsecrets/project.json
 type ProjectConfig struct {
+	ServerURL     string `json:"server_url,omitempty"` // Optional project-specific self-hosted server override
 	ProjectID     string `json:"project_id"`
 	ProjectName   string `json:"project_name"`
 	Description   string `json:"description"`
@@ -78,6 +85,127 @@ type ProjectConfig struct {
 	LastPull      string `json:"last_pull"`
 	LastPush      string `json:"last_push"`
 	StorageMode   int    `json:"storage_mode"`
+}
+
+// ServerTarget describes the resolved server and its configuration source.
+type ServerTarget struct {
+	URL        string
+	Source     string // "flag", "env", "project", "global", "default"
+	IsSelfHost bool
+}
+
+// NormalizeServerURL validates and normalizes an input server URL.
+// Ensures scheme (http/https), strips trailing slashes, and ensures standard /api route prefix.
+func NormalizeServerURL(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return DefaultServerURL
+	}
+	if !strings.HasPrefix(raw, "http://") && !strings.HasPrefix(raw, "https://") {
+		if strings.HasPrefix(raw, "localhost") || strings.HasPrefix(raw, "127.0.0.1") {
+			raw = "http://" + raw
+		} else {
+			raw = "https://" + raw
+		}
+	}
+	raw = strings.TrimRight(raw, "/")
+	u, err := url.Parse(raw)
+	if err == nil {
+		if u.Path == "" || u.Path == "/" {
+			raw = raw + "/api"
+		}
+	}
+	return raw
+}
+
+// ResolveServerTarget determines the active server URL and its source.
+func ResolveServerTarget(flagOverride string) ServerTarget {
+	if flagOverride != "" {
+		norm := NormalizeServerURL(flagOverride)
+		return ServerTarget{
+			URL:        norm,
+			Source:     "flag (--server)",
+			IsSelfHost: norm != DefaultServerURL,
+		}
+	}
+
+	if envURL := os.Getenv("AGENTSECRETS_SERVER_URL"); envURL != "" {
+		norm := NormalizeServerURL(envURL)
+		return ServerTarget{
+			URL:        norm,
+			Source:     "environment (AGENTSECRETS_SERVER_URL)",
+			IsSelfHost: norm != DefaultServerURL,
+		}
+	}
+	if envURL := os.Getenv("AGENTSECRETS_API_URL"); envURL != "" {
+		norm := NormalizeServerURL(envURL)
+		return ServerTarget{
+			URL:        norm,
+			Source:     "environment (AGENTSECRETS_API_URL)",
+			IsSelfHost: norm != DefaultServerURL,
+		}
+	}
+
+	// Check project-level config
+	if pc, err := LoadProjectConfig(); err == nil && pc != nil && pc.ServerURL != "" {
+		norm := NormalizeServerURL(pc.ServerURL)
+		return ServerTarget{
+			URL:        norm,
+			Source:     "project (.agentsecrets/project.json)",
+			IsSelfHost: norm != DefaultServerURL,
+		}
+	}
+
+	// Check global config
+	if gc, err := LoadGlobalConfig(); err == nil && gc != nil && gc.ServerURL != "" {
+		norm := NormalizeServerURL(gc.ServerURL)
+		return ServerTarget{
+			URL:        norm,
+			Source:     "global (~/.agentsecrets/config.json)",
+			IsSelfHost: norm != DefaultServerURL,
+		}
+	}
+
+	return ServerTarget{
+		URL:        DefaultServerURL,
+		Source:     "AgentSecrets Server (default)",
+		IsSelfHost: false,
+	}
+}
+
+// GetServerURL returns the active server URL.
+func GetServerURL() string {
+	return ResolveServerTarget("").URL
+}
+
+// SetGlobalServerURL updates the server URL in ~/.agentsecrets/config.json.
+func SetGlobalServerURL(serverURL string) error {
+	gc, err := LoadGlobalConfig()
+	if err != nil {
+		gc = &GlobalConfig{}
+	}
+	gc.ServerURL = NormalizeServerURL(serverURL)
+	return SaveGlobalConfig(gc)
+}
+
+// ResetGlobalServerURL resets the global server URL back to AgentSecrets Server default.
+func ResetGlobalServerURL() error {
+	gc, err := LoadGlobalConfig()
+	if err != nil {
+		return nil
+	}
+	gc.ServerURL = ""
+	return SaveGlobalConfig(gc)
+}
+
+// SetProjectServerURL updates the server URL in .agentsecrets/project.json.
+func SetProjectServerURL(serverURL string) error {
+	pc, err := LoadProjectConfig()
+	if err != nil || pc == nil {
+		return fmt.Errorf("no project config found in current directory")
+	}
+	pc.ServerURL = NormalizeServerURL(serverURL)
+	return SaveProjectConfig(pc)
 }
 
 // Paths returns the standard config file paths
@@ -210,6 +338,9 @@ func LoadGlobalConfig() (*GlobalConfig, error) {
 func SaveGlobalConfig(config *GlobalConfig) error {
 	paths, err := GetPaths()
 	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(paths.GlobalDir, 0700); err != nil {
 		return err
 	}
 	return writeJSON(paths.ConfigFile, config, 0600)

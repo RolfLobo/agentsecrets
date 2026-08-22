@@ -39,12 +39,15 @@ func NewExecCmd() *cobra.Command {
 	}
 }
 
+// MaxExecInputSize bounds the stdin JSON payload accepted by the exec command (10MB).
+const MaxExecInputSize = 10 * 1024 * 1024
+
 // runExec implements the OpenClaw exec provider protocol. Failures return a
 // silent ExitError (the human-readable message is written to stderr in the
 // machine protocol's own format) so Execute's deferred keychainauth.Close still
 // runs; the exit code is carried by the ExitError rather than a bare os.Exit.
 func runExec(cmd *cobra.Command, args []string) error {
-	input, err := io.ReadAll(os.Stdin)
+	input, err := io.ReadAll(io.LimitReader(os.Stdin, MaxExecInputSize))
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "failed to read stdin: %v\n", err)
 		return &ExitError{Code: 1, Silent: true}
@@ -95,8 +98,8 @@ func runExec(cmd *cobra.Command, args []string) error {
 		return &ExitError{Code: 1, Silent: true}
 	}
 
+	envName := config.ResolveEnvironment()
 	for _, id := range req.IDs {
-		envName := config.ResolveEnvironment()
 		val, err := keyring.GetSecret(project.ProjectID, envName, id)
 		if err != nil || val == "" {
 			if resp.Errors == nil {
