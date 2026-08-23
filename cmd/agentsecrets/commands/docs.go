@@ -44,7 +44,7 @@ func getDocsBaseURL() string {
 	if envVal := os.Getenv("AGENTSECRETS_DOCS_URL"); envVal != "" {
 		return strings.TrimSuffix(envVal, "/")
 	}
-	return "https://agentsecrets.theseventeen.co"
+	return "https://agentsecrets-website.vercel.app"
 }
 
 func runDocs(cmd *cobra.Command, args []string) error {

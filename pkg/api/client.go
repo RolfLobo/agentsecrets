@@ -432,3 +432,54 @@ func (c *Client) resolveEndpoint(key string, params map[string]string) (string, 
 
 	return path, nil
 }
+
+// WorkloadEnvResponse is the schema returned from POST /api/workloads/env/
+type WorkloadEnvResponse struct {
+	Status      string            `json:"status"`
+	WorkspaceID string            `json:"workspace_id"`
+	ProjectID   string            `json:"project_id"`
+	Environment string            `json:"environment"`
+	Secrets     map[string]string `json:"secrets"`
+}
+
+// FetchWorkloadEnv retrieves scoped project secrets over TLS using an agent workload token.
+func FetchWorkloadEnv(ctx context.Context, serverURL, token string) (map[string]string, error) {
+	if !strings.HasPrefix(token, "agt_") {
+		return nil, fmt.Errorf("invalid workload token format: token must start with 'agt_'")
+	}
+
+	targetURL := strings.TrimRight(serverURL, "/") + "/workloads/env/"
+	if !strings.Contains(serverURL, "/api") {
+		targetURL = strings.TrimRight(serverURL, "/") + "/api/workloads/env/"
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, targetURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create workload request: %w", err)
+	}
+
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("network error contacting AgentSecrets control plane: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+		return nil, fmt.Errorf("authentication failed: invalid, expired, or revoked workload token")
+	}
+
+	if resp.StatusCode >= 400 {
+		return nil, fmt.Errorf("server returned error status: %d", resp.StatusCode)
+	}
+
+	var envResp WorkloadEnvResponse
+	if err := json.NewDecoder(resp.Body).Decode(&envResp); err != nil {
+		return nil, fmt.Errorf("failed to parse workload response: %w", err)
+	}
+
+	return envResp.Secrets, nil
+}

@@ -1,6 +1,7 @@
 package commands
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/hex"
 	"fmt"
@@ -15,6 +16,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/The-17/agentsecrets/pkg/api"
 	"github.com/The-17/agentsecrets/pkg/config"
 	"github.com/The-17/agentsecrets/pkg/keychainauth"
 	"github.com/The-17/agentsecrets/pkg/keyring"
@@ -25,15 +27,16 @@ import (
 
 func NewEnvCmd() *cobra.Command {
 	return &cobra.Command{
-		Use:   "env -- <command> [args...]",
+		Use:   "env [--cloud] -- <command> [args...]",
 		Short: "Inject secrets as environment variables into a child process",
-		Long: `Resolves all secrets from the active project in the OS keychain
-		and injects them as environment variables into the specified command.
-		The command runs normally with secrets available as env vars.
+		Long: `Resolves secrets and injects them as environment variables into the specified command.
+		Supports Dual-Engine resolution:
+		- Local Engine (Default): Resolves from local OS keychain (offline, 0ms latency).
+		- Cloud Engine: Resolves from AgentSecrets Cloud over TLS via AGENTSECRETS_TOKEN or --cloud.
 		Nothing is written to disk. Secrets exist only in the child process memory.`,
-		Example: `  agentsecrets env -- stripe mcp
-		agentsecrets env -- node server.js
-		agentsecrets env -- stripe listen --forward-to localhost:3000`,
+		Example: `  agentsecrets env -- npm run dev
+		agentsecrets env --cloud -- npm run dev
+		AGENTSECRETS_TOKEN=agt_prod_... agentsecrets env -- node server.js`,
 		RunE:               runEnv,
 		DisableFlagParsing: true,
 	}
@@ -47,44 +50,87 @@ func runEnv(cmd *cobra.Command, args []string) error {
 		return cmd.Help()
 	}
 
-	// Strip leading -- if present
-	if len(args) > 0 && args[0] == "--" {
-		args = args[1:]
-	}
-	if len(args) == 0 {
-		return fmt.Errorf("no command specified. Usage: agentsecrets env -- <command> [args...]")
-	}
+	// Determine if --cloud flag is passed before --
+	useCloud := false
+	commandArgs := args
 
-	// Load active project
-	project, err := config.LoadProjectConfig()
-	if err != nil || project == nil || project.ProjectID == "" {
-		return fmt.Errorf("no active project. Run: agentsecrets project use <name>")
-	}
-
-	// Ensure keychain-auth session is established before reading secrets.
-	// env uses DisableFlagParsing so PersistentPreRunE doesn't fire.
-	if err := ensureKeychainAuthForEnv(); err != nil {
-		return err
-	}
-
-	// Resolve all secrets from keychain
-	envName := config.ResolveEnvironment()
-	secrets, err := keyring.GetAllProjectSecrets(project.ProjectID, envName)
-	if err != nil {
-		return fmt.Errorf("failed to load secrets from keychain: %w", err)
-	}
-
-	if len(secrets) == 0 {
-		ui.Warning("No secrets found in active project — running without injection")
-	} else {
-		secretKeys := make([]string, 0, len(secrets))
-		for k := range secrets {
-			secretKeys = append(secretKeys, k)
+	for i, arg := range args {
+		if arg == "--cloud" {
+			useCloud = true
+		} else if arg == "--" {
+			commandArgs = args[i+1:]
+			break
+		} else if !strings.HasPrefix(arg, "-") {
+			commandArgs = args[i:]
+			break
 		}
-		if len(secretKeys) == 1 {
-			ui.Info(fmt.Sprintf("Injecting 1 secret: %s", secretKeys[0]))
+	}
+
+	if len(commandArgs) == 0 {
+		return fmt.Errorf("no command specified. Usage: agentsecrets env [--cloud] -- <command> [args...]")
+	}
+
+	// Check environment variable triggers for Cloud Mode
+	if envVal := strings.ToLower(os.Getenv("AGENTSECRETS_USE_CLOUD")); envVal == "true" || envVal == "1" {
+		useCloud = true
+	}
+	token := os.Getenv("AGENTSECRETS_TOKEN")
+	if token != "" {
+		useCloud = true
+	}
+
+	var secrets map[string]string
+	var err error
+
+	if useCloud {
+		if token == "" {
+			return fmt.Errorf("cloud resolution active but AGENTSECRETS_TOKEN is not set. Please provide a valid workload token (agt_...)")
+		}
+
+		serverURL := os.Getenv("AGENTSECRETS_SERVER_URL")
+		if serverURL == "" {
+			serverURL = config.GetServerURL()
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+
+		secrets, err = api.FetchWorkloadEnv(ctx, serverURL, token)
+		if err != nil {
+			return fmt.Errorf("cloud resolution failed: %w", err)
+		}
+		ui.Info(fmt.Sprintf("Cloud Engine: Injected %d secrets into process memory", len(secrets)))
+	} else {
+		// Local Offline Engine Mode
+		project, err := config.LoadProjectConfig()
+		if err != nil || project == nil || project.ProjectID == "" {
+			return fmt.Errorf("no active project. Run: agentsecrets project use <name> (or pass AGENTSECRETS_TOKEN / --cloud for cloud resolution)")
+		}
+
+		// Ensure keychain-auth session is established before reading secrets.
+		if err := ensureKeychainAuthForEnv(); err != nil {
+			return err
+		}
+
+		// Resolve all secrets from local OS keychain
+		envName := config.ResolveEnvironment()
+		secrets, err = keyring.GetAllProjectSecrets(project.ProjectID, envName)
+		if err != nil {
+			return fmt.Errorf("failed to load secrets from keychain: %w", err)
+		}
+
+		if len(secrets) == 0 {
+			ui.Warning("No secrets found in active project — running without injection")
 		} else {
-			ui.Info(fmt.Sprintf("Injecting %d secrets: %s + %d more", len(secretKeys), secretKeys[0], len(secretKeys)-1))
+			secretKeys := make([]string, 0, len(secrets))
+			for k := range secrets {
+				secretKeys = append(secretKeys, k)
+			}
+			if len(secretKeys) == 1 {
+				ui.Info(fmt.Sprintf("Local Engine: Injecting 1 secret: %s", secretKeys[0]))
+			} else {
+				ui.Info(fmt.Sprintf("Local Engine: Injecting %d secrets: %s + %d more", len(secretKeys), secretKeys[0], len(secretKeys)-1))
+			}
 		}
 	}
 
@@ -95,16 +141,16 @@ func runEnv(cmd *cobra.Command, args []string) error {
 	}
 
 	// Resolve command path
-	commandPath, err := exec.LookPath(args[0])
+	commandPath, err := exec.LookPath(commandArgs[0])
 	if err != nil {
-		return fmt.Errorf("command not found: %s", args[0])
+		return fmt.Errorf("command not found: %s", commandArgs[0])
 	}
 
 	// Generate secret variants for masking
 	maskingSecrets := generateVariants(secrets)
 
 	// Build child process
-	childCmd := exec.Command(commandPath, args[1:]...)
+	childCmd := exec.Command(commandPath, commandArgs[1:]...)
 	childCmd.Env = env
 	childCmd.Stdin = os.Stdin
 	stdoutMasker := &MaskingWriter{underlying: os.Stdout, secrets: maskingSecrets}

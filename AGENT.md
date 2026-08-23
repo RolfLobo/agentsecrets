@@ -335,7 +335,7 @@ agentsecrets env -- node server.js
 
 ## Links
 
-- Website: https://agentsecrets.theseventeen.co
+- Website: https://agentsecrets-website.vercel.app
 - Deep Dive Series: https://engineering.theseventeen.co/series/building-agentsecrets
 - GitHub: https://github.com/The-17/agentsecrets
 - ClawHub: https://clawhub.ai/SteppaCodes/agentsecrets
