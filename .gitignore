@@ -39,7 +39,7 @@ Thumbs.db
 
 # Config files (local only)
 .agentsecrets/
-.agent/
+.agent/rules.md
 config.json
 
 # Build artifacts
