@@ -370,7 +370,26 @@ func EnsureRegistered(keychainAuthPath string) error {
 	}
 	output, err := cmd.CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("failed to authorize binary with keychain-auth: %w\nOutput: %s", err, strings.TrimSpace(string(output)))
+		outStr := strings.TrimSpace(string(output))
+		if strings.Contains(outStr, "unknown command \"authorize\"") || strings.Contains(outStr, "unknown command") {
+			if runtime.GOOS == "windows" {
+				return fmt.Errorf(
+					"the installed keychain-auth binary (%s) is outdated and lacks the 'authorize' command.\n\n"+
+						"Please update keychain-auth to v3.2.3 or higher:\n"+
+						"  go install github.com/The-17/keychain-auth/cmd/keychain-auth@latest\n\n"+
+						"Or download the latest Windows release from GitHub:\n"+
+						"  https://github.com/The-17/keychain-auth/releases",
+					keychainAuthPath,
+				)
+			}
+			return fmt.Errorf(
+				"the installed keychain-auth binary (%s) is outdated.\n\n"+
+					"Please update keychain-auth:\n"+
+					"  brew upgrade The-17/tap/keychain-auth",
+				keychainAuthPath,
+			)
+		}
+		return fmt.Errorf("failed to authorize binary with keychain-auth: %w\nOutput: %s", err, outStr)
 	}
 
 	if requiresSudoForRegistration(keychainAuthPath) {
@@ -690,7 +709,10 @@ func queryInstalledVersion(binPath string) (string, error) {
 //   1 if v1 > v2
 func compareVersions(v1, v2 string) int {
 	if v1 == "dev" || v1 == "vdev" {
-		return 0
+		if v2 == "dev" || v2 == "vdev" {
+			return 0
+		}
+		return -1
 	}
 	v1 = strings.TrimPrefix(v1, "v")
 	v2 = strings.TrimPrefix(v2, "v")

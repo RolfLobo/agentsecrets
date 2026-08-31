@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 )
 
@@ -74,6 +75,39 @@ func getSelfPath() string {
 
 func deniedMessage(reason reasonCode) string {
 	selfPath := getSelfPath()
+	if runtime.GOOS == "windows" {
+		switch reason {
+		case reasonUnregisteredBinary:
+			return fmt.Sprintf("This AgentSecrets binary is not yet registered/authorized with keychain-auth.\n"+
+				"Please authorize it by running:\n"+
+				"  keychain-auth authorize \"%s\" agentsecrets\n"+
+				"And then start the daemon:\n"+
+				"  keychain-auth start", selfPath)
+		case reasonHashMismatch:
+			return fmt.Sprintf("Security check failed: the AgentSecrets binary has changed since it was registered.\n"+
+				"Please re-authorize it by running:\n"+
+				"  keychain-auth authorize \"%s\" agentsecrets\n"+
+				"And then start the daemon:\n"+
+				"  keychain-auth start", selfPath)
+		case reasonActionNotInPolicy:
+			return "keychain-auth policy does not allow this operation for AgentSecrets.\n" +
+				"Check your keychain-auth configuration."
+		case reasonServiceNotAllowed:
+			return "keychain-auth policy does not allow AgentSecrets to access this service namespace.\n" +
+				"Check your keychain-auth configuration."
+		case reasonTargetNotAllowed:
+			return "keychain-auth policy does not allow access to this secret.\n" +
+				"Check your keychain-auth configuration."
+		case reasonMalformedRequest:
+			return "keychain-auth received a malformed request. This is a bug — please report it."
+		case reasonInternalError:
+			return "keychain-auth encountered an internal error. Try restarting the daemon:\n" +
+				"  keychain-auth start"
+		default:
+			return fmt.Sprintf("keychain-auth denied the request: %s", reason)
+		}
+	}
+
 	switch reason {
 	case reasonUnregisteredBinary:
 		return fmt.Sprintf("This AgentSecrets binary is not yet registered/authorized with keychain-auth.\n"+
@@ -108,6 +142,18 @@ func deniedMessage(reason reasonCode) string {
 
 func daemonNotRunningMessage(socketPath string) string {
 	selfPath := getSelfPath()
+	if runtime.GOOS == "windows" {
+		return fmt.Sprintf(`keychain-auth daemon is not running.
+
+AgentSecrets requires keychain-auth to read secrets securely.
+
+To start the keychain-auth daemon on Windows, please run:
+  keychain-auth start
+
+And then authorize this binary:
+  keychain-auth authorize "%s" agentsecrets`, selfPath)
+	}
+
 	return fmt.Sprintf(`keychain-auth daemon is not running.
 
 AgentSecrets requires keychain-auth to read secrets securely.
