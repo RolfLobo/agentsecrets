@@ -1,12 +1,15 @@
 package keychainauth
 
 import (
+	"archive/tar"
+	"compress/gzip"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -149,6 +152,9 @@ func findBrew() string {
 // EnsureInstalled checks if keychain-auth is in PATH and matches the required version.
 // If not found or outdated, attempts to install it via the platform's package manager.
 // Returns the absolute path to the keychain-auth binary.
+// EnsureInstalled checks if keychain-auth is in PATH and matches the required version.
+// If not found or outdated, attempts automated multi-tiered installation.
+// Returns the absolute path to the keychain-auth binary.
 func EnsureInstalled() (string, error) {
 	homeDir, _ := os.UserHomeDir()
 	binaryName := "keychain-auth"
@@ -156,8 +162,17 @@ func EnsureInstalled() (string, error) {
 		binaryName = "keychain-auth.exe"
 	}
 
-	// On Linux, prefer the system-wide installed binary at /usr/local/bin/keychain-auth
-	// since the system daemon service runs it.
+	agentSecretsBinPath := filepath.Join(homeDir, ".agentsecrets", "bin", binaryName)
+	goBinPath := filepath.Join(homeDir, "go", "bin", binaryName)
+
+	// 1. Check ~/.agentsecrets/bin/keychain-auth
+	if _, err := os.Stat(agentSecretsBinPath); err == nil {
+		if v, vErr := queryInstalledVersion(agentSecretsBinPath); vErr == nil && compareVersions(v, RequiredDaemonVersion) >= 0 {
+			return agentSecretsBinPath, nil
+		}
+	}
+
+	// 2. On Linux, prefer the system-wide installed binary at /usr/local/bin/keychain-auth
 	if runtime.GOOS == "linux" {
 		sysBinPath := "/usr/local/bin/keychain-auth"
 		if _, err := os.Stat(sysBinPath); err == nil {
@@ -167,23 +182,21 @@ func EnsureInstalled() (string, error) {
 		}
 	}
 
-	goBinPath := filepath.Join(homeDir, "go", "bin", binaryName)
-
-	// 1. Prefer our locally built binary in ~/go/bin
+	// 3. Check ~/go/bin
 	if _, err := os.Stat(goBinPath); err == nil {
 		if v, vErr := queryInstalledVersion(goBinPath); vErr == nil && compareVersions(v, RequiredDaemonVersion) >= 0 {
 			return goBinPath, nil
 		}
 	}
 
-	// 2. Check if already installed in PATH
+	// 4. Check if already installed in PATH
 	if path, err := exec.LookPath(binaryName); err == nil {
 		if v, vErr := queryInstalledVersion(path); vErr == nil && compareVersions(v, RequiredDaemonVersion) >= 0 {
 			return path, nil
 		}
 	}
 
-	// Check common user-local bin paths if PATH isn't set up properly
+	// 5. Check common user-local bin paths if PATH isn't set up properly
 	commonPaths := []string{
 		"/home/linuxbrew/.linuxbrew/bin/keychain-auth",
 		"/opt/homebrew/bin/keychain-auth",
@@ -201,37 +214,111 @@ func EnsureInstalled() (string, error) {
 		}
 	}
 
-	// Not installed or outdated — attempt platform-specific installation.
-	// alreadyPresent distinguishes "outdated, on disk" (needs `brew upgrade`)
-	// from "missing" (needs `brew install`); `brew install` is a no-op on an
-	// already-installed formula and would leave a stale daemon in place.
+	// Not installed or outdated — attempt platform-specific automated installation.
 	alreadyPresent := keychainAuthOnDisk()
-	switch runtime.GOOS {
-	case "darwin":
-		return installViaBrew(alreadyPresent)
-	case "linux":
-		// Try Homebrew first (Linuxbrew), then fall back to instructions
-		if brewPath := findBrew(); brewPath != "" {
-			return installViaBrew(alreadyPresent)
+
+	// Tier 1: Try Homebrew (macOS / Linuxbrew)
+	if brewPath := findBrew(); brewPath != "" {
+		if path, err := installViaBrew(alreadyPresent); err == nil {
+			return path, nil
 		}
-		return "", fmt.Errorf(
-			"keychain-auth is not installed.\n\n" +
-				"Install it with Homebrew:\n" +
-				"  brew install The-17/tap/keychain-auth\n\n" +
-				"Or download from GitHub:\n" +
-				"  https://github.com/The-17/keychain-auth/releases",
-		)
-	case "windows":
-		return "", fmt.Errorf(
-			"keychain-auth is not installed.\n\n" +
-				"Build it from source:\n" +
-				"  go install github.com/The-17/keychain-auth/cmd/keychain-auth@latest\n\n" +
-				"Or download the Windows release from GitHub:\n" +
-				"  https://github.com/The-17/keychain-auth/releases",
-		)
-	default:
-		return "", fmt.Errorf("keychain-auth is not supported on %s yet", runtime.GOOS)
 	}
+
+	// Tier 2: Try `go install` if `go` CLI is available in PATH
+	if goPath, err := exec.LookPath("go"); err == nil && goPath != "" {
+		cmd := exec.Command(goPath, "install", "github.com/The-17/keychain-auth/cmd/keychain-auth@v"+RequiredDaemonVersion)
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		if err := cmd.Run(); err == nil {
+			if _, statErr := os.Stat(goBinPath); statErr == nil {
+				if v, vErr := queryInstalledVersion(goBinPath); vErr == nil && compareVersions(v, RequiredDaemonVersion) >= 0 {
+					return goBinPath, nil
+				}
+			}
+		}
+	}
+
+	// Tier 3: Direct Download from GitHub Releases into ~/.agentsecrets/bin/
+	if path, err := downloadFromGitHub(agentSecretsBinPath); err == nil {
+		if v, vErr := queryInstalledVersion(path); vErr == nil && compareVersions(v, RequiredDaemonVersion) >= 0 {
+			return path, nil
+		}
+	}
+
+	// Fallback instructions if all automated installation tiers fail
+	return "", fmt.Errorf(
+		"keychain-auth is not installed or automated installation failed.\n\n"+
+			"Please install keychain-auth v%s or higher:\n"+
+			"  go install github.com/The-17/keychain-auth/cmd/keychain-auth@latest\n\n"+
+			"Or download from GitHub:\n"+
+			"  https://github.com/The-17/keychain-auth/releases",
+		RequiredDaemonVersion,
+	)
+}
+
+// downloadFromGitHub downloads and unpacks the required keychain-auth binary release directly from GitHub.
+func downloadFromGitHub(targetPath string) (string, error) {
+	osName := runtime.GOOS
+	archName := runtime.GOARCH
+
+	version := RequiredDaemonVersion
+	archiveExt := "tar.gz"
+	binaryName := "keychain-auth"
+	if osName == "windows" {
+		binaryName = "keychain-auth.exe"
+	}
+
+	assetName := fmt.Sprintf("keychain-auth_%s_%s_%s.%s", version, osName, archName, archiveExt)
+	downloadURL := fmt.Sprintf("https://github.com/The-17/keychain-auth/releases/download/v%s/%s", version, assetName)
+
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Get(downloadURL)
+	if err != nil {
+		return "", fmt.Errorf("http request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("github release download returned HTTP status %d for %s", resp.StatusCode, downloadURL)
+	}
+
+	targetDir := filepath.Dir(targetPath)
+	if err := os.MkdirAll(targetDir, 0755); err != nil {
+		return "", fmt.Errorf("failed to create bin directory: %w", err)
+	}
+
+	gzr, err := gzip.NewReader(resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("failed to read gzip archive: %w", err)
+	}
+	defer gzr.Close()
+
+	tr := tar.NewReader(gzr)
+	for {
+		header, err := tr.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return "", fmt.Errorf("failed reading tar stream: %w", err)
+		}
+
+		cleanName := filepath.Base(header.Name)
+		if cleanName == binaryName {
+			outFile, err := os.OpenFile(targetPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0755)
+			if err != nil {
+				return "", fmt.Errorf("failed to open output binary file: %w", err)
+			}
+			if _, err := io.Copy(outFile, tr); err != nil {
+				outFile.Close()
+				return "", fmt.Errorf("failed to write binary data: %w", err)
+			}
+			outFile.Close()
+			return targetPath, nil
+		}
+	}
+
+	return "", fmt.Errorf("binary %s not found in release archive", binaryName)
 }
 
 // keychainAuthOnDisk reports whether keychain-auth is installed anywhere (any
