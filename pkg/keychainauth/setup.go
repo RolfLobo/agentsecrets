@@ -826,8 +826,7 @@ func compareVersions(v1, v2 string) int {
 }
 func ensureSandboxInstalled(keychainAuthPath string) error {
 	// Ensure config directory exists
-	if f, err := os.Open("/etc/keychain-auth/config.json"); err == nil {
-		f.Close()
+	if _, err := os.Stat("/etc/keychain-auth/config.json"); err == nil {
 		return nil
 	}
 
