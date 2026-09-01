@@ -19,7 +19,7 @@ import (
 )
 
 // Version is set at build time via ldflags
-var Version = "3.2.1"
+var Version = "3.2.2"
 
 // rootCmd is the base command when called without any subcommands
 var rootCmd = &cobra.Command{
@@ -282,10 +282,18 @@ func recoverDaemonState(kind recoveryKind) error {
 	case recoverRegister:
 		keychainauth.Close()
 		ensureSudoCached("keychain-auth binary registration is required. Please authorize when prompted.")
-		_ = ui.Spinner("Registering agentsecrets binary with daemon...", func() error {
-			_ = keychainauth.AutoSetup()
+		if err := ui.Spinner("Registering agentsecrets binary with daemon...", func() error {
+			kcPath, err := keychainauth.EnsureInstalled()
+			if err != nil {
+				return err
+			}
+			if err := keychainauth.EnsureRegistered(kcPath); err != nil {
+				return err
+			}
 			return keychainauth.RestartDaemon()
-		})
+		}); err != nil {
+			return keychainRequiredError("keychain-auth registration", err)
+		}
 		return keychainauth.Init()
 
 	default:
