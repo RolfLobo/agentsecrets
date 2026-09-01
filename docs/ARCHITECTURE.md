@@ -238,7 +238,7 @@ There is no `Value` field. This is intentional, the struct itself cannot carry c
 
 ```json
 {
-  "api_endpoint": "https://api.agentsecrets.com",
+  "api_endpoint": "https://api.agentsecrets.tech",
   "user_email": "you@example.com",
   "current_workspace_id": "ws_abc123",
   "workspaces": {

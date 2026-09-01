@@ -59,11 +59,10 @@ func AutoSetup() error {
 // compareVersions check in EnsureInstalled and is upgraded to the latest release,
 // so a daemon binary change always reaches users rather than leaving a stale
 // daemon in place.
-const RequiredDaemonVersion = "3.2.3"
+const RequiredDaemonVersion = "3.2.5"
 
-// findBestDaemon returns the path to the highest-priority installed keychain-auth
-// binary (mirroring EnsureInstalled's search order), or "" if none is found.
-func findBestDaemon() string {
+// candidateDaemonPaths returns all standard filesystem and PATH locations where keychain-auth can reside across all operating systems.
+func candidateDaemonPaths() []string {
 	homeDir, _ := os.UserHomeDir()
 	binaryName := "keychain-auth"
 	if runtime.GOOS == "windows" {
@@ -71,21 +70,38 @@ func findBestDaemon() string {
 	}
 	candidates := []string{}
 	if runtime.GOOS == "linux" {
-		candidates = append(candidates, "/usr/local/bin/keychain-auth")
+		candidates = append(candidates, "/usr/local/bin/keychain-auth", "/usr/bin/keychain-auth")
+	} else if runtime.GOOS == "darwin" {
+		candidates = append(candidates, "/opt/homebrew/bin/keychain-auth", "/usr/local/bin/keychain-auth")
 	}
 	candidates = append(candidates,
+		filepath.Join(homeDir, ".agentsecrets", "bin", binaryName),
 		filepath.Join(homeDir, "go", "bin", binaryName),
 		filepath.Join(homeDir, ".local", "bin", binaryName),
+		filepath.Join(homeDir, ".linuxbrew", "bin", binaryName),
+		"/home/linuxbrew/.linuxbrew/bin/keychain-auth",
 	)
 	if p, err := exec.LookPath(binaryName); err == nil {
 		candidates = append(candidates, p)
 	}
-	for _, p := range candidates {
+	return candidates
+}
+
+// findBestDaemon returns the path to the highest-priority installed keychain-auth
+// binary (mirroring EnsureInstalled's search order), or "" if none is found.
+func findBestDaemon() string {
+	var firstFound string
+	for _, p := range candidateDaemonPaths() {
 		if _, err := os.Stat(p); err == nil {
-			return p
+			if firstFound == "" {
+				firstFound = p
+			}
+			if v, vErr := queryInstalledVersion(p); vErr == nil && compareVersions(v, RequiredDaemonVersion) >= 0 {
+				return p
+			}
 		}
 	}
-	return ""
+	return firstFound
 }
 
 // DaemonUpdateNeeded reports whether the installed keychain-auth binary is
@@ -114,12 +130,22 @@ func EnsureDaemonUpToDate() error {
 		return nil
 	}
 	// Install/upgrade the on-disk binary to RequiredDaemonVersion.
-	if _, err := EnsureInstalled(); err != nil {
+	kcPath, err := EnsureInstalled()
+	if err != nil {
 		return err
 	}
-	// The upgrade only swapped the file; a daemon started from the old binary is
-	// still serving. Restart it so requests hit the new code. RestartDaemon kills
-	// the old process, removes the stale socket, and starts the fresh binary.
+	// On Linux, update the system binary used by the keychain-auth systemd service
+	if runtime.GOOS == "linux" {
+		sysBinPath := "/usr/local/bin/keychain-auth"
+		if kcPath != sysBinPath {
+			cmd := exec.Command("sudo", "cp", kcPath, sysBinPath)
+			cmd.Stdin = os.Stdin
+			if err := cmd.Run(); err == nil {
+				_ = exec.Command("sudo", "chmod", "755", sysBinPath).Run()
+			}
+		}
+	}
+	// The upgrade replaced the binary; restart the daemon so the keychain-auth user service reloads it.
 	if err := RestartDaemon(); err != nil {
 		return fmt.Errorf("keychain-auth upgraded but daemon restart failed: %w", err)
 	}
@@ -150,9 +176,6 @@ func findBrew() string {
 }
 
 // EnsureInstalled checks if keychain-auth is in PATH and matches the required version.
-// If not found or outdated, attempts to install it via the platform's package manager.
-// Returns the absolute path to the keychain-auth binary.
-// EnsureInstalled checks if keychain-auth is in PATH and matches the required version.
 // If not found or outdated, attempts automated multi-tiered installation.
 // Returns the absolute path to the keychain-auth binary.
 func EnsureInstalled() (string, error) {
@@ -165,48 +188,8 @@ func EnsureInstalled() (string, error) {
 	agentSecretsBinPath := filepath.Join(homeDir, ".agentsecrets", "bin", binaryName)
 	goBinPath := filepath.Join(homeDir, "go", "bin", binaryName)
 
-	// 1. Check ~/.agentsecrets/bin/keychain-auth
-	if _, err := os.Stat(agentSecretsBinPath); err == nil {
-		if v, vErr := queryInstalledVersion(agentSecretsBinPath); vErr == nil && compareVersions(v, RequiredDaemonVersion) >= 0 {
-			return agentSecretsBinPath, nil
-		}
-	}
-
-	// 2. On Linux, prefer the system-wide installed binary at /usr/local/bin/keychain-auth
-	if runtime.GOOS == "linux" {
-		sysBinPath := "/usr/local/bin/keychain-auth"
-		if _, err := os.Stat(sysBinPath); err == nil {
-			if v, vErr := queryInstalledVersion(sysBinPath); vErr == nil && compareVersions(v, RequiredDaemonVersion) >= 0 {
-				return sysBinPath, nil
-			}
-		}
-	}
-
-	// 3. Check ~/go/bin
-	if _, err := os.Stat(goBinPath); err == nil {
-		if v, vErr := queryInstalledVersion(goBinPath); vErr == nil && compareVersions(v, RequiredDaemonVersion) >= 0 {
-			return goBinPath, nil
-		}
-	}
-
-	// 4. Check if already installed in PATH
-	if path, err := exec.LookPath(binaryName); err == nil {
-		if v, vErr := queryInstalledVersion(path); vErr == nil && compareVersions(v, RequiredDaemonVersion) >= 0 {
-			return path, nil
-		}
-	}
-
-	// 5. Check common user-local bin paths if PATH isn't set up properly
-	commonPaths := []string{
-		"/home/linuxbrew/.linuxbrew/bin/keychain-auth",
-		"/opt/homebrew/bin/keychain-auth",
-		filepath.Join(homeDir, ".local", "bin", binaryName),
-		filepath.Join(homeDir, ".linuxbrew", "bin", binaryName),
-	}
-	if runtime.GOOS != "windows" {
-		commonPaths = append(commonPaths, "/usr/local/bin/keychain-auth")
-	}
-	for _, p := range commonPaths {
+	// Check if already installed in any candidate path with required version
+	for _, p := range candidateDaemonPaths() {
 		if _, err := os.Stat(p); err == nil {
 			if v, vErr := queryInstalledVersion(p); vErr == nil && compareVersions(v, RequiredDaemonVersion) >= 0 {
 				return p, nil
@@ -214,19 +197,37 @@ func EnsureInstalled() (string, error) {
 		}
 	}
 
-	// Not installed or outdated — attempt platform-specific automated installation.
-	alreadyPresent := keychainAuthOnDisk()
-
-	// Tier 1: Try Homebrew (macOS / Linuxbrew)
-	if brewPath := findBrew(); brewPath != "" {
-		if path, err := installViaBrew(alreadyPresent); err == nil {
+	// Tier 1: Direct Download from GitHub Releases into ~/.agentsecrets/bin/ (Fastest: <500ms)
+	if path, err := downloadFromGitHub(agentSecretsBinPath); err == nil {
+		if v, vErr := queryInstalledVersion(path); vErr == nil && compareVersions(v, RequiredDaemonVersion) >= 0 {
+			// On Linux, if system daemon is installed at standard system paths, update it too
+			if runtime.GOOS == "linux" {
+				for _, sysPath := range []string{"/usr/local/bin/keychain-auth", "/usr/bin/keychain-auth"} {
+					if _, statErr := os.Stat(sysPath); statErr == nil {
+						cmd := exec.Command("sudo", "cp", path, sysPath)
+						cmd.Stdin = os.Stdin
+						_ = cmd.Run()
+						_ = exec.Command("sudo", "chmod", "755", sysPath).Run()
+						if vSys, vSysErr := queryInstalledVersion(sysPath); vSysErr == nil && compareVersions(vSys, RequiredDaemonVersion) >= 0 {
+							return sysPath, nil
+						}
+					}
+				}
+			}
 			return path, nil
 		}
 	}
 
-	// Tier 2: Try `go install` if `go` CLI is available in PATH
+	// Tier 2: Try Homebrew (macOS / Linuxbrew)
+	if brewPath := findBrew(); brewPath != "" {
+		if path, err := installViaBrew(); err == nil {
+			return path, nil
+		}
+	}
+
+	// Tier 3: Try `go install` if `go` CLI is available in PATH
 	if goPath, err := exec.LookPath("go"); err == nil && goPath != "" {
-		cmd := exec.Command(goPath, "install", "github.com/The-17/keychain-auth/cmd/keychain-auth@v"+RequiredDaemonVersion)
+		cmd := exec.Command(goPath, "install", "github.com/The-17/keychain-auth/cmd/keychain-auth@latest")
 		cmd.Stdout = os.Stdout
 		cmd.Stderr = os.Stderr
 		if err := cmd.Run(); err == nil {
@@ -235,13 +236,6 @@ func EnsureInstalled() (string, error) {
 					return goBinPath, nil
 				}
 			}
-		}
-	}
-
-	// Tier 3: Direct Download from GitHub Releases into ~/.agentsecrets/bin/
-	if path, err := downloadFromGitHub(agentSecretsBinPath); err == nil {
-		if v, vErr := queryInstalledVersion(path); vErr == nil && compareVersions(v, RequiredDaemonVersion) >= 0 {
-			return path, nil
 		}
 	}
 
@@ -321,47 +315,34 @@ func downloadFromGitHub(targetPath string) (string, error) {
 	return "", fmt.Errorf("binary %s not found in release archive", binaryName)
 }
 
-// keychainAuthOnDisk reports whether keychain-auth is installed anywhere (any
-// version), used to distinguish "outdated" from "missing" so installViaBrew
-// knows whether to `brew upgrade` (for an outdated formula) or `brew install`.
-func keychainAuthOnDisk() bool {
-	if _, err := exec.LookPath("keychain-auth"); err == nil {
+func isBrewFormulaInstalled(brewPath string) bool {
+	if brewPath == "" {
+		return false
+	}
+	if err := exec.Command(brewPath, "list", "The-17/tap/keychain-auth").Run(); err == nil {
 		return true
 	}
-	// Check common paths even if not in PATH
-	homeDir, _ := os.UserHomeDir()
-	candidates := []string{
-		"/home/linuxbrew/.linuxbrew/bin/keychain-auth",
-		"/opt/homebrew/bin/keychain-auth",
-		filepath.Join(homeDir, "go", "bin", "keychain-auth"),
-		filepath.Join(homeDir, ".local", "bin", "keychain-auth"),
-		filepath.Join(homeDir, ".linuxbrew", "bin", "keychain-auth"),
-		"/usr/local/bin/keychain-auth",
-	}
-	for _, p := range candidates {
-		if _, err := os.Stat(p); err == nil {
-			return true
-		}
-	}
-	return false
+	return exec.Command(brewPath, "list", "keychain-auth").Run() == nil
 }
 
-// installViaBrew installs or upgrades keychain-auth via Homebrew. alreadyPresent
-// distinguishes an outdated install (needs `brew upgrade`) from a missing one
-// (needs `brew install`); `brew install` is a no-op on an already-installed
-// formula and would leave a stale daemon in place.
-func installViaBrew(alreadyPresent bool) (string, error) {
+// installViaBrew installs or upgrades keychain-auth via Homebrew.
+func installViaBrew() (string, error) {
 	brewPath := findBrew()
 	if brewPath == "" {
 		return "", fmt.Errorf("brew not found")
 	}
+	alreadyPresent := isBrewFormulaInstalled(brewPath)
 	var cmd *exec.Cmd
 	if alreadyPresent {
 		cmd = exec.Command(brewPath, "upgrade", "The-17/tap/keychain-auth")
 	} else {
 		cmd = exec.Command(brewPath, "install", "The-17/tap/keychain-auth")
 	}
-	cmd.Env = append(os.Environ(), "HOMEBREW_NO_SANDBOX=1")
+	cmd.Env = append(os.Environ(),
+		"HOMEBREW_NO_AUTO_UPDATE=1",
+		"HOMEBREW_NO_ENV_HINTS=1",
+		"HOMEBREW_NO_SANDBOX=1",
+	)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 
@@ -530,10 +511,24 @@ func RestartDaemon() error {
 	if runtime.GOOS == "windows" {
 		// On Windows, kill the process by name
 		_ = exec.Command("taskkill", "/F", "/IM", "keychain-auth.exe").Run()
-	} else {
+	} else if runtime.GOOS == "linux" {
+		// On Linux, prefer systemctl restart if the system unit exists
+		if _, err := os.Stat("/etc/systemd/system/keychain-auth.service"); err == nil {
+			cmd := exec.Command("sudo", "systemctl", "restart", "keychain-auth")
+			cmd.Stdin = os.Stdin
+			if err := cmd.Run(); err == nil {
+				Close()
+				return waitForSocketPath("/run/keychain-auth/agent.sock")
+			}
+		}
 		// Kill existing daemon
 		_ = exec.Command("pkill", "-x", "keychain-auth").Run()
 		// Remove stale socket
+		sockPath := SocketPath()
+		_ = os.Remove(sockPath)
+	} else {
+		// macOS: kill existing daemon
+		_ = exec.Command("pkill", "-x", "keychain-auth").Run()
 		sockPath := SocketPath()
 		_ = os.Remove(sockPath)
 	}
@@ -541,12 +536,20 @@ func RestartDaemon() error {
 	// Wait a moment for the process to die
 	time.Sleep(200 * time.Millisecond)
 
-	// Find keychain-auth and start fresh
+	// Find keychain-auth and restart via the platform-appropriate method
 	kcPath, err := EnsureInstalled()
 	if err != nil {
 		return fmt.Errorf("keychain-auth not found: %w", err)
 	}
-	return startDirect(kcPath)
+
+	switch runtime.GOOS {
+	case "darwin":
+		return startDaemonMacOS(kcPath)
+	case "linux":
+		return startDaemonLinux(kcPath)
+	default:
+		return startDirect(kcPath)
+	}
 }
 
 // startDaemonMacOS starts keychain-auth via launchctl on macOS.
@@ -571,32 +574,74 @@ func startDaemonMacOS(keychainAuthPath string) error {
 	// Last resort: start directly
 	return startDirect(keychainAuthPath)
 }
-// startDaemonLinux starts keychain-auth via systemd on Linux.
+// isSocketDialable returns true if the specified unix socket / pipe can be connected to immediately.
+func isSocketDialable(sockPath string) bool {
+	c, err := dialCLOEXEC(sockPath)
+	if err == nil {
+		c.Close()
+		return true
+	}
+	return false
+}
+
+// startDaemonLinux starts or restarts keychain-auth via systemd on Linux.
 func startDaemonLinux(keychainAuthPath string) error {
+	sysSocket := "/run/keychain-auth/agent.sock"
+
 	// Try systemd system service first (dedicated system user sandbox daemon)
-	if _, err := os.Stat("/run/keychain-auth"); err == nil {
-		cmd := exec.Command("systemctl", "start", "keychain-auth")
+	hasSystemdUnit := false
+	if _, err := os.Stat("/etc/systemd/system/keychain-auth.service"); err == nil {
+		hasSystemdUnit = true
+	} else if _, err := os.Stat("/lib/systemd/system/keychain-auth.service"); err == nil {
+		hasSystemdUnit = true
+	} else if _, err := os.Stat("/run/keychain-auth"); err == nil {
+		hasSystemdUnit = true
+	}
+
+	if hasSystemdUnit {
+		// If system daemon socket is already active & dialable, attempt restart
+		if isSocketDialable(sysSocket) {
+			_ = exec.Command("systemctl", "restart", "keychain-auth").Run()
+			_ = exec.Command("sudo", "systemctl", "restart", "keychain-auth").Run()
+			if isSocketDialable(sysSocket) {
+				return nil
+			}
+		}
+
+		cmd := exec.Command("systemctl", "restart", "keychain-auth")
 		if err := cmd.Run(); err == nil {
-			return waitForSocketPath("/run/keychain-auth/agent.sock")
+			if err := waitForSocketPath(sysSocket); err == nil {
+				return nil
+			}
 		}
 		// Fallback with sudo
-		cmd = exec.Command("sudo", "systemctl", "start", "keychain-auth")
+		cmd = exec.Command("sudo", "systemctl", "restart", "keychain-auth")
 		cmd.Stdin = os.Stdin
 		if err := cmd.Run(); err == nil {
-			return waitForSocketPath("/run/keychain-auth/agent.sock")
+			if err := waitForSocketPath(sysSocket); err == nil {
+				return nil
+			}
+		}
+
+		if isSocketDialable(sysSocket) {
+			return nil
 		}
 	}
 
 	// Fallback to systemd user service (user-space legacy daemon)
-	cmd := exec.Command("systemctl", "--user", "start", "keychain-auth")
+	cmd := exec.Command("systemctl", "--user", "restart", "keychain-auth")
 	if err := cmd.Run(); err == nil {
-		return waitForSocketPath(UserSocketPath())
+		if err := waitForSocketPath(UserSocketPath()); err == nil {
+			return nil
+		}
 	}
 
 	// Try enabling and starting user service
 	cmd = exec.Command("systemctl", "--user", "enable", "--now", "keychain-auth")
 	if err := cmd.Run(); err == nil {
-		return waitForSocketPath(UserSocketPath())
+		if err := waitForSocketPath(UserSocketPath()); err == nil {
+			return nil
+		}
 	}
 
 	// Last resort: start directly
@@ -624,14 +669,21 @@ func startDirect(keychainAuthPath string) error {
 	if home, err := os.UserHomeDir(); err == nil {
 		if runtime.GOOS == "windows" {
 			logDir = filepath.Join(home, "AppData", "Local", "keychain-auth")
+		} else if runtime.GOOS == "darwin" {
+			logDir = filepath.Join(home, "Library", "Application Support", "keychain-auth")
 		} else {
 			logDir = filepath.Join(home, ".config", "keychain-auth")
+			// Set user XDG paths so user-mode fallback daemon on Linux writes audit logs to ~/.agentsecrets/
+			cmd.Env = append(os.Environ(),
+				"XDG_DATA_HOME="+filepath.Join(home, ".agentsecrets"),
+				"XDG_CONFIG_HOME="+filepath.Join(home, ".agentsecrets"),
+			)
 		}
 	} else {
 		logDir = os.TempDir()
 	}
 	_ = os.MkdirAll(logDir, 0700)
-	logFile, _ := os.OpenFile(filepath.Join(logDir, "daemon.log"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
+	logFile, _ := os.OpenFile(filepath.Join(logDir, "daemon.log"), os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0666)
 
 	cmd.Stdout = logFile
 	cmd.Stderr = logFile

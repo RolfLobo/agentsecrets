@@ -41,7 +41,7 @@ var (
 )
 
 // DefaultServerURL is the default AgentSecrets Server endpoint.
-const DefaultServerURL = "https://secrets-api-orpin.vercel.app/api"
+const DefaultServerURL = "https://api.agentsecrets.tech/api"
 
 // GlobalConfig represents ~/.agentsecrets/config.json
 type GlobalConfig struct {
