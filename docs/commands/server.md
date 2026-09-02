@@ -100,3 +100,11 @@ When executing any CLI command, the active server is resolved in the following o
 3. Project Config (`.agentsecrets/project.json`)
 4. Global Config (`~/.agentsecrets/config.json`)
 5. Default Server (`https://api.agentsecrets.tech/api`)
+
+---
+
+## Official Documentation
+
+For complete server deployment and self-hosting guides, visit:
+👉 **[Server & Self-Hosting Guide](https://docs.agentsecrets.tech/cli/server)**
+👉 **[Self-Hosting Deployment Architecture](https://docs.agentsecrets.tech/api/self-hosting)**

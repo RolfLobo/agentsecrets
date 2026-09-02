@@ -5,12 +5,14 @@
 ## Subcommands
 
 ```
-agentsecrets secrets list
-agentsecrets secrets set <KEY=value> [KEY=value...]
-agentsecrets secrets delete <KEY>
-agentsecrets secrets pull [--force]
-agentsecrets secrets push
-agentsecrets secrets diff
+agentsecrets secrets list [--project <name>] [--env <env>]
+agentsecrets secrets get <KEY> [--env <env>]
+agentsecrets secrets set <KEY=value> [KEY=value...] [--env <env>]
+agentsecrets secrets delete <KEY> [--env <env>]
+agentsecrets secrets pull [--force] [--env <env>]
+agentsecrets secrets push [--env <env>]
+agentsecrets secrets diff [--env <env>]
+agentsecrets secrets policy <KEY>
 ```
 
 ---
@@ -158,12 +160,41 @@ Deletes the key from:
 Prompts for confirmation before deleting.
 
 ---
+ 
+## agentsecrets secrets get
+
+Fetch and decrypt a specific secret value from the local OS keychain for debugging.
+
+```bash
+agentsecrets secrets get STRIPE_KEY
+agentsecrets secrets get DATABASE_URL --env staging
+```
+
+---
+
+## agentsecrets secrets policy
+
+Inspect or configure secret-level access policies (domain constraints, allowed HTTP methods, required approvals).
+
+```bash
+agentsecrets secrets policy STRIPE_KEY
+```
+
+---
 
 ## Storage Modes
 
 | Mode | Where `pull` writes | Where `push` reads from |
 |---|---|---|
 | `1` — Keychain | OS keychain | OS keychain |
-| `2` — Standard | `.env` file (plaintext) | `.env` file |
+| `2` — Standard | `.env` file (plaintext, `0600` permissions) | `.env` file |
 
-The storage mode is set during `agentsecrets init` and stored in `.agentsecrets/project.json`. You can check it with `agentsecrets status`.
+The storage mode is set during `agentsecrets init` and stored in `.agentsecrets/project.json`.
+
+---
+
+## Official Documentation
+
+For complete secrets management workflows and policy guides, visit:
+👉 **[Secrets Management Guide](https://docs.agentsecrets.tech/secrets/managing)**
+👉 **[Secret Policies Reference](https://docs.agentsecrets.tech/concepts/secret-policies)**
