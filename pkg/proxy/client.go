@@ -11,7 +11,6 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"syscall"
 	"time"
 
 	"github.com/The-17/agentsecrets/pkg/config"
@@ -74,19 +73,12 @@ func ReadPIDFile() (pid int, startTime time.Time, port int, err error) {
 	return pid, time.Unix(ts, 0), port, nil
 }
 
-// IsProcessAlive checks if a process with the given PID is running.
-func IsProcessAlive(pid int) bool {
-	p, err := os.FindProcess(pid)
-	if err != nil {
-		return false
-	}
-	// On Unix, FindProcess always succeeds; send signal 0 to probe.
-	err = p.Signal(syscall.Signal(0))
-	return err == nil
-}
-
-// IsProxyRunning checks if a proxy process is alive AND its port is actively listening.
-// If the process is dead or port unreachable, it cleans up the stale PID file and returns false.
+// IsProxyRunning checks if a proxy process is alive AND responsive.
+// It verifies the PID file, process liveness, and performs an HTTP /health check
+// (falling back to a TCP dial).
+// IMPORTANT: Read-only queries must NEVER delete the PID file on probe failure.
+// Removing the PID file is strictly reserved for the server's own shutdown or
+// explicit stop commands.
 func IsProxyRunning() (pid int, port int, running bool) {
 	var err error
 	var startTime time.Time
@@ -97,14 +89,22 @@ func IsProxyRunning() (pid int, port int, running bool) {
 	_ = startTime
 
 	if !IsProcessAlive(pid) {
-		RemovePIDFile()
 		return 0, 0, false
 	}
 
-	// Verify the port is actively listening
-	conn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", port), 200*time.Millisecond)
+	// 1. Authoritative check: probe HTTP /health endpoint with 500ms timeout
+	healthClient := &http.Client{Timeout: 500 * time.Millisecond}
+	resp, err := healthClient.Get(fmt.Sprintf("http://127.0.0.1:%d/health", port))
+	if err == nil {
+		resp.Body.Close()
+		if resp.StatusCode == http.StatusOK {
+			return pid, port, true
+		}
+	}
+
+	// 2. Fallback check: TCP dial with 500ms timeout
+	conn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", port), 500*time.Millisecond)
 	if err != nil {
-		RemovePIDFile()
 		return 0, 0, false
 	}
 	conn.Close()

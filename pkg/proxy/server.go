@@ -102,7 +102,7 @@ func (s *Server) validateSession(next http.HandlerFunc) http.HandlerFunc {
 // requests within a bounded window, and waits for background workers to exit
 // before returning.
 func (s *Server) Start(ctx context.Context) error {
-	addr := fmt.Sprintf("localhost:%d", s.Port)
+	addr := fmt.Sprintf("127.0.0.1:%d", s.Port)
 
 	// Launch background sync worker if audit logger is present.
 	if s.Engine.Audit != nil {
