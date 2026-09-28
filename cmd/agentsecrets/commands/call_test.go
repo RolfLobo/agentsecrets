@@ -165,3 +165,13 @@ func TestEmitCallJSONErrorZeroStatus(t *testing.T) {
 		t.Errorf("err = %v, want *ExitError", err)
 	}
 }
+
+func TestCallCmdHasRunE(t *testing.T) {
+	if callCmd.RunE == nil {
+		t.Fatal("callCmd.RunE is nil! The command will dump help text instead of executing.")
+	}
+	if !callCmd.SilenceUsage {
+		t.Error("callCmd.SilenceUsage should be true to prevent dumping usage on request failure")
+	}
+}
+

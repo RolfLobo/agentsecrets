@@ -36,8 +36,21 @@ var callCmd = &cobra.Command{
 	printed or exposed to your AI assistant.
 
 	Examples:
+	# Bearer token (most common)
+	agentsecrets call --url https://api.stripe.com/v1/balance --bearer STRIPE_KEY
+
+	# POST with body
+	agentsecrets call --url https://api.stripe.com/v1/charges \
+		--method POST --bearer STRIPE_KEY \
+		--body '{"amount":1000,"currency":"usd","source":"tok_visa"}'
+
+	# Custom header
+	agentsecrets call --url https://api.example.com/data \
+		--header X-API-Key=MY_KEY
 `,
-	Aliases: []string{"calls"},
+	Aliases:      []string{"calls"},
+	SilenceUsage: true,
+	RunE:         runCall,
 }
 
 func init() {
