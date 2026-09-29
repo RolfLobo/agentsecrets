@@ -3,7 +3,6 @@ package commands
 import (
 	"encoding/json"
 	"fmt"
-	"net/url"
 	"os"
 	"strings"
 	"time"
@@ -135,46 +134,6 @@ func runCall(cmd *cobra.Command, args []string) error {
 	if callBody != "" {
 		body = []byte(callBody)
 	}
-
-	// If the proxy holds the connection waiting for a policy approval, show a
-	// hint in THIS terminal after 2 seconds so the user knows what's happening
-	// and what to do — without having to switch terminals.
-	callDone := make(chan struct{})
-	defer close(callDone)
-	go func() {
-		timer := time.NewTimer(2 * time.Second)
-		defer timer.Stop()
-
-		select {
-		case <-callDone:
-			return // response arrived fast — nothing to show
-		case <-timer.C:
-		}
-
-		// Parse the domain from the URL for the approve command hint.
-		domain := ""
-		if u, err := url.Parse(callURL); err == nil {
-			domain = u.Hostname()
-		}
-		method := strings.ToUpper(callMethod)
-		if method == "" {
-			method = "GET"
-		}
-
-		fmt.Fprintln(os.Stderr)
-		fmt.Fprintln(os.Stderr, ui.WarningStyle.Render("⏳ Waiting for approval..."))
-		fmt.Fprintln(os.Stderr, ui.DimStyle.Render("   A secret policy requires manual approval for this request."))
-		fmt.Fprintln(os.Stderr, ui.DimStyle.Render("   → Check the proxy terminal and respond to the prompt there, or run:"))
-		fmt.Fprintln(os.Stderr)
-		for _, inj := range injections {
-			if domain != "" {
-				fmt.Fprintf(os.Stderr, "     %s\n",
-					ui.BrandStyle.Render(fmt.Sprintf("agentsecrets proxy approve %s %s %s", inj.SecretKey, method, domain)),
-				)
-			}
-		}
-		fmt.Fprintln(os.Stderr)
-	}()
 
 	callStart := time.Now()
 	result, err := proxy.CallViaProxy(proxy.CallRequest{

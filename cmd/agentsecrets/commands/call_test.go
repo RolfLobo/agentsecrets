@@ -175,3 +175,18 @@ func TestCallCmdHasRunE(t *testing.T) {
 	}
 }
 
+func TestCallCmdValidation(t *testing.T) {
+	callBearer = ""
+	callBasic = ""
+	callHeaders = nil
+	callQueries = nil
+	callBodyFields = nil
+	callFormFields = nil
+
+	err := runCall(callCmd, nil)
+	if err == nil {
+		t.Fatal("expected error when running call without injection flags, got nil")
+	}
+}
+
+
